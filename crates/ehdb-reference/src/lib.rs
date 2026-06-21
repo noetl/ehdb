@@ -307,7 +307,7 @@ mod tests {
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
         SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
     };
-    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectRef};
+    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef};
     use ehdb_stream::{RetentionPolicy, Subject};
     use ehdb_system::{
         EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -380,6 +380,7 @@ mod tests {
             path: ObjectPath::new(path).unwrap(),
             len: 4096,
             digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            placement: ObjectPlacement::local_dev(),
         }
     }
 

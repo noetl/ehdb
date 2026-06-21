@@ -6,7 +6,7 @@ use ehdb_core::{
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
-use ehdb_storage::{ObjectDigest, ObjectPath, ObjectRef};
+use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef};
 use ehdb_stream::{InMemoryStreamLog, RetentionPolicy, StreamConfig, Subject};
 use ehdb_system::{
     BindSystemLibrary, EnvironmentName, InMemorySystemLibraryCatalog, ModuleDigest,
@@ -62,6 +62,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
         .unwrap(),
         len: 4096,
         digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        placement: ObjectPlacement::local_dev(),
     };
     let snapshot = catalog
         .commit_snapshot(CommitSnapshot {
