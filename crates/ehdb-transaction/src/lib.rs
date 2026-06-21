@@ -7,9 +7,9 @@ use std::{
 
 use ehdb_core::{
     ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result,
-    StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
+    SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
 };
-use ehdb_storage::ObjectPath;
+use ehdb_storage::{ObjectPath, ObjectRef};
 use ehdb_stream::{RetentionPolicy, Subject};
 use ehdb_system::{
     EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -48,6 +48,12 @@ pub enum CatalogMutation {
         table_id: TableId,
         table_name: TableName,
         schema: TableSchema,
+    },
+    CommitSnapshot {
+        table_id: TableId,
+        snapshot_id: SnapshotId,
+        parent_snapshot: Option<SnapshotId>,
+        files: Vec<ObjectRef>,
     },
 }
 

@@ -1,12 +1,12 @@
-use ehdb_catalog::{CreateTable, InMemoryCatalog};
+use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
 use ehdb_core::{
     ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
-    StreamName, TableName, TableSchema, TenantId, TransactionId,
+    SnapshotId, StreamName, TableName, TableSchema, TenantId, TransactionId,
 };
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
-use ehdb_storage::ObjectPath;
+use ehdb_storage::{ObjectDigest, ObjectPath, ObjectRef};
 use ehdb_stream::{InMemoryStreamLog, RetentionPolicy, StreamConfig, Subject};
 use ehdb_system::{
     BindSystemLibrary, EnvironmentName, InMemorySystemLibraryCatalog, ModuleDigest,
@@ -55,6 +55,38 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             })],
         })
         .unwrap();
+    let snapshot_file = ObjectRef {
+        path: ObjectPath::new(
+            "tenant-a/system/tables/tenant-a_system_executions/snapshots/snapshot-0001/part-000.arrow",
+        )
+        .unwrap(),
+        len: 4096,
+        digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+    };
+    let snapshot = catalog
+        .commit_snapshot(CommitSnapshot {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            table_id: table.id.clone(),
+            snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+            parent_snapshot: None,
+            files: vec![snapshot_file.clone()],
+            transaction_id: TransactionId::new("txn-0002").unwrap(),
+        })
+        .unwrap();
+    let snapshot_tx = transactions
+        .append(CommitTransaction {
+            transaction_id: TransactionId::new("txn-0002").unwrap(),
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![Mutation::Catalog(CatalogMutation::CommitSnapshot {
+                table_id: table.id.clone(),
+                snapshot_id: snapshot.id.clone(),
+                parent_snapshot: snapshot.parent.clone(),
+                files: snapshot.files.clone(),
+            })],
+        })
+        .unwrap();
 
     let stream_name = StreamName::new("execution-events").unwrap();
     streams
@@ -80,12 +112,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             &stream_name,
             Subject::new("noetl.execution.playbook.completed").unwrap(),
             b"{\"execution_id\":\"exec-1\"}".to_vec(),
-            TransactionId::new("txn-0002").unwrap(),
+            TransactionId::new("txn-0003").unwrap(),
         )
         .unwrap();
     let stream_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0002").unwrap(),
+            transaction_id: TransactionId::new("txn-0003").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![Mutation::Stream(StreamMutation::Publish {
@@ -104,7 +136,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             namespace: namespace.clone(),
             source_uri: "artifact://exec-1/result.md".to_string(),
             content_type: "text/markdown".to_string(),
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
         })
         .unwrap();
     let chunk = retrieval
@@ -114,7 +146,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             ordinal: 0,
             text: "EHDB stores NoETL lineage with retrieval metadata.".to_string(),
             checksum: "sha256-test".to_string(),
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
         })
         .unwrap();
     let embedding = retrieval
@@ -123,12 +155,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             model_id: EmbeddingModelId::new("embedding-model").unwrap(),
             dimensions: 3,
             vector: vec![0.1, 0.2, 0.3],
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
         })
         .unwrap();
     let retrieval_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -168,7 +200,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
                 .unwrap(),
             byte_len: 512,
             capabilities: vec![SystemCapability::EhdbCatalogWrite],
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
         })
         .unwrap();
     system
@@ -180,12 +212,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             path: system_path.clone(),
             revision: system_revision,
             digest: system_digest.clone(),
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
         })
         .unwrap();
     let system_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -212,8 +244,9 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
 
     assert_eq!(
         transactions.replay(None),
-        vec![catalog_tx, stream_tx, retrieval_tx, system_tx]
+        vec![catalog_tx, snapshot_tx, stream_tx, retrieval_tx, system_tx]
     );
+    assert_eq!(catalog.snapshot_count(), 1);
     assert_eq!(system_library.plugin_ref().entry, "run");
     assert_eq!(
         retrieval

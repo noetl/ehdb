@@ -1,4 +1,4 @@
-use ehdb_catalog::{CreateTable, InMemoryCatalog};
+use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
 use ehdb_core::{EhdbError, Result};
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
@@ -110,6 +110,23 @@ impl ReferenceDatabase {
                 }
                 Ok(())
             }
+            CatalogMutation::CommitSnapshot {
+                table_id,
+                snapshot_id,
+                parent_snapshot,
+                files,
+            } => self
+                .catalog
+                .commit_snapshot(CommitSnapshot {
+                    tenant: record.tenant.clone(),
+                    namespace: record.namespace.clone(),
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    parent_snapshot: parent_snapshot.clone(),
+                    files: files.clone(),
+                    transaction_id: record.transaction_id.clone(),
+                })
+                .map(|_| ()),
         }
     }
 
@@ -288,9 +305,9 @@ mod tests {
 
     use ehdb_core::{
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
-        StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
+        SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
     };
-    use ehdb_storage::ObjectPath;
+    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectRef};
     use ehdb_stream::{RetentionPolicy, Subject};
     use ehdb_system::{
         EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -341,21 +358,49 @@ mod tests {
         }
     }
 
+    fn commit_snapshot_commit(transaction_id: &str) -> CommitTransaction {
+        let (tenant, namespace) = ids();
+        CommitTransaction {
+            transaction_id: TransactionId::new(transaction_id).unwrap(),
+            tenant,
+            namespace,
+            mutations: vec![Mutation::Catalog(CatalogMutation::CommitSnapshot {
+                table_id: TableId::new("tenant-a_system_executions").unwrap(),
+                snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                parent_snapshot: None,
+                files: vec![object_ref(
+                    "tenant-a/system/tables/tenant-a_system_executions/snapshots/snapshot-0001/part-000.arrow",
+                )],
+            })],
+        }
+    }
+
+    fn object_ref(path: &str) -> ObjectRef {
+        ObjectRef {
+            path: ObjectPath::new(path).unwrap(),
+            len: 4096,
+            digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        }
+    }
+
     #[test]
     fn local_runtime_appends_and_rebuilds_state_after_reopen() {
         let path = temp_log_path("runtime-restart");
         let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
         let record = runtime.append(create_table_commit("txn-0001")).unwrap();
+        runtime.append(commit_snapshot_commit("txn-0002")).unwrap();
 
         assert_eq!(record.sequence.value(), 1);
         assert_eq!(runtime.state().catalog.table_count(), 1);
-        assert_eq!(runtime.replay().len(), 1);
+        assert_eq!(runtime.state().catalog.snapshot_count(), 1);
+        assert_eq!(runtime.replay().len(), 2);
         assert_eq!(runtime.path(), path.as_path());
         drop(runtime);
 
         let reopened = LocalReferenceRuntime::open(&path).unwrap();
         assert_eq!(reopened.state().catalog.table_count(), 1);
-        assert_eq!(reopened.replay().len(), 1);
+        assert_eq!(reopened.state().catalog.snapshot_count(), 1);
+        assert_eq!(reopened.replay().len(), 2);
 
         fs::remove_file(path).unwrap();
     }
@@ -395,6 +440,8 @@ mod tests {
         )
         .unwrap()])
         .unwrap();
+        let table_id = TableId::new("tenant-a_system_executions").unwrap();
+        let snapshot_id = SnapshotId::new("snapshot-0001").unwrap();
         let stream = StreamName::new("execution-events").unwrap();
         let consumer = ConsumerName::new("materializer").unwrap();
         let document = DocumentId::new("doc-001").unwrap();
@@ -409,7 +456,7 @@ mod tests {
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![Mutation::Catalog(CatalogMutation::CreateTable {
-                table_id: TableId::new("tenant-a_system_executions").unwrap(),
+                table_id: table_id.clone(),
                 table_name: TableName::new("executions").unwrap(),
                 schema,
             })],
@@ -417,6 +464,20 @@ mod tests {
         .unwrap();
         log.append(CommitTransaction {
             transaction_id: TransactionId::new("txn-0002").unwrap(),
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![Mutation::Catalog(CatalogMutation::CommitSnapshot {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                parent_snapshot: None,
+                files: vec![object_ref(
+                    "tenant-a/system/tables/tenant-a_system_executions/snapshots/snapshot-0001/part-000.arrow",
+                )],
+            })],
+        })
+        .unwrap();
+        log.append(CommitTransaction {
+            transaction_id: TransactionId::new("txn-0003").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -438,7 +499,7 @@ mod tests {
         })
         .unwrap();
         log.append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -464,7 +525,7 @@ mod tests {
         })
         .unwrap();
         log.append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -497,6 +558,15 @@ mod tests {
         reference.apply_records(&records).unwrap();
 
         assert_eq!(reference.catalog.table_count(), 1);
+        assert_eq!(reference.catalog.snapshot_count(), 1);
+        assert_eq!(
+            reference
+                .catalog
+                .latest_snapshot(&tenant, &namespace, &table_id)
+                .unwrap()
+                .id,
+            snapshot_id
+        );
         assert_eq!(
             reference
                 .streams
