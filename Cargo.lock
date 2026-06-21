@@ -218,6 +218,7 @@ dependencies = [
  "ehdb-core",
  "ehdb-storage",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

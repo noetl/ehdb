@@ -66,6 +66,12 @@ These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries
 once the metadata, stream, and NoETL integration contracts stabilize.
 
+`ehdb-system` includes `LocalJsonlSystemLibraryCatalog`, a reference
+append-only journal for system WASM library manifests and bindings. It
+persists publish and bind operations, then rebuilds immutable manifests
+and environment/channel bindings on open so hot-replacement state
+survives restart.
+
 ## System WASM Libraries
 
 `ehdb-system` models NoETL system playbook functionality as compiled
@@ -85,6 +91,8 @@ That lets `kind`, `gke-prod`, `azure-dev`, or tenant-specific
 environments run different implementations smoothly. A stable channel
 can be rebound to a new digest/revision for a hot fix without changing
 the Rust crate version or forcing every caller to chase semver bumps.
+The local JSONL journal preserves those rebinding decisions across
+restart for the developer loop.
 
 ## Developer Loop
 
