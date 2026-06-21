@@ -5,6 +5,7 @@ members = [
     "crates/ehdb-retrieval",
     "crates/ehdb-storage",
     "crates/ehdb-stream",
+    "crates/ehdb-system",
     "crates/ehdb-transaction",
 ]
 resolver = "2"
@@ -21,7 +22,9 @@ criterion = "0.5"
 ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
 ehdb-retrieval = { path = "crates/ehdb-retrieval" }
+ehdb-storage = { path = "crates/ehdb-storage" }
 ehdb-stream = { path = "crates/ehdb-stream" }
+ehdb-system = { path = "crates/ehdb-system" }
 ehdb-transaction = { path = "crates/ehdb-transaction" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

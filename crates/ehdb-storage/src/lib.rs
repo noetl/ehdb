@@ -3,8 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ehdb_core::{EhdbError, Result};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectPath(String);
 
 impl ObjectPath {
@@ -29,7 +30,7 @@ impl ObjectPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRef {
     pub path: ObjectPath,
     pub len: u64,

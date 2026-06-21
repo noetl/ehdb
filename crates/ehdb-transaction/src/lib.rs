@@ -9,6 +9,9 @@ use ehdb_core::{
     ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result,
     StreamName, TableId, TableName, TenantId, TransactionId,
 };
+use ehdb_system::{
+    EnvironmentName, ModuleDigest, ReleaseChannel, SystemLibraryPath, SystemLibraryRevision,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -33,6 +36,7 @@ pub enum Mutation {
     Catalog(CatalogMutation),
     Stream(StreamMutation),
     Retrieval(RetrievalMutation),
+    System(SystemMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +81,22 @@ pub enum RetrievalMutation {
         chunk_id: ChunkId,
         model_id: EmbeddingModelId,
         dimensions: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemMutation {
+    PublishLibrary {
+        path: SystemLibraryPath,
+        revision: SystemLibraryRevision,
+        digest: ModuleDigest,
+    },
+    BindLibrary {
+        path: SystemLibraryPath,
+        environment: EnvironmentName,
+        channel: ReleaseChannel,
+        revision: SystemLibraryRevision,
+        digest: ModuleDigest,
     },
 }
 
@@ -296,6 +316,10 @@ mod tests {
         ))
     }
 
+    fn digest(suffix: char) -> ModuleDigest {
+        ModuleDigest::new(format!("sha256:{}{}", "b".repeat(63), suffix)).unwrap()
+    }
+
     #[test]
     fn appends_and_replays_transactions_in_order() {
         let (tenant, namespace) = ids();
@@ -365,6 +389,39 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn records_system_library_publish_and_binding_mutations() {
+        let (tenant, namespace) = ids();
+        let mut log = InMemoryTransactionLog::default();
+        let path = SystemLibraryPath::new("system/catalog/bootstrap").unwrap();
+        let revision = SystemLibraryRevision::new(1).unwrap();
+        let digest = digest('1');
+
+        let record = log
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-0001").unwrap(),
+                tenant,
+                namespace,
+                mutations: vec![
+                    Mutation::System(SystemMutation::PublishLibrary {
+                        path: path.clone(),
+                        revision,
+                        digest: digest.clone(),
+                    }),
+                    Mutation::System(SystemMutation::BindLibrary {
+                        path,
+                        environment: EnvironmentName::new("kind").unwrap(),
+                        channel: ReleaseChannel::stable(),
+                        revision,
+                        digest,
+                    }),
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(log.replay(None), vec![record]);
     }
 
     #[test]
