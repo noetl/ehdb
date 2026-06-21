@@ -217,7 +217,9 @@ dependencies = [
 name = "ehdb-catalog"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ehdb-core",
+ "ehdb-storage",
 ]
 
 [[package]]

@@ -92,6 +92,19 @@ This is the local reference boundary for catalog-addressable data files.
 Production cloud object APIs remain adapter details behind the EHDB
 storage layer.
 
+## Catalog Snapshots
+
+`ehdb-catalog` stores immutable table snapshot metadata over
+content-checked object references. A snapshot carries a snapshot ID,
+optional parent snapshot, object file references, and the committing
+transaction ID. The in-memory reference catalog rejects missing tables,
+empty file sets, duplicate snapshots, and parent-chain mismatches.
+
+`CatalogMutation::CommitSnapshot` makes snapshot metadata replayable
+through the transaction log, and `ehdb-reference` rebuilds latest table
+snapshot state from replay alongside catalog tables, streams, retrieval
+metadata, and system library bindings.
+
 ## Replay Reference
 
 `ehdb-reference` applies replayed `TransactionRecord` values to the
@@ -139,6 +152,7 @@ cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench --workspace --no-run
+cargo bench -p ehdb-catalog --bench snapshots
 cargo bench -p ehdb-storage --bench local_store
 cargo bench -p ehdb-reference --bench local_runtime
 cargo bench -p ehdb-transaction --bench reference_models
@@ -148,12 +162,13 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~14.8 ms |
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~640 us |
-| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.17 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~476 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~454 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~452 ms |
+| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~2.06 ms |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~16.9 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~656 us |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.37 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~491 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~508 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~534 ms |
 
 ## Design
 
