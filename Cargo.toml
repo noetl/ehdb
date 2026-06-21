@@ -2,7 +2,10 @@
 members = [
     "crates/ehdb-catalog",
     "crates/ehdb-core",
+    "crates/ehdb-retrieval",
     "crates/ehdb-storage",
+    "crates/ehdb-stream",
+    "crates/ehdb-transaction",
 ]
 resolver = "2"
 
@@ -14,4 +17,9 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 arrow-schema = "53"
+criterion = "0.5"
+ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
+ehdb-retrieval = { path = "crates/ehdb-retrieval" }
+ehdb-stream = { path = "crates/ehdb-stream" }
+ehdb-transaction = { path = "crates/ehdb-transaction" }

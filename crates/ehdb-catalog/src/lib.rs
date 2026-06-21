@@ -132,4 +132,18 @@ mod tests {
 
         assert!(matches!(error, EhdbError::AlreadyExists(_)));
     }
+
+    #[test]
+    fn missing_table_is_not_found() {
+        let catalog = InMemoryCatalog::default();
+        let error = catalog
+            .get_table(
+                &TenantId::new("tenant-a").unwrap(),
+                &NamespaceName::new("system").unwrap(),
+                &TableName::new("executions").unwrap(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::NotFound(_)));
+    }
 }
