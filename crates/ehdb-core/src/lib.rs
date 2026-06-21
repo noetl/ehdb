@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, EhdbError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EhdbError {
     InvalidIdentifier(String),
+    InvalidState(String),
     AlreadyExists(String),
     NotFound(String),
     Storage(String),
@@ -16,6 +17,7 @@ impl fmt::Display for EhdbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EhdbError::InvalidIdentifier(value) => write!(f, "invalid identifier: {value}"),
+            EhdbError::InvalidState(value) => write!(f, "invalid state: {value}"),
             EhdbError::AlreadyExists(value) => write!(f, "already exists: {value}"),
             EhdbError::NotFound(value) => write!(f, "not found: {value}"),
             EhdbError::Storage(value) => write!(f, "storage error: {value}"),
@@ -56,6 +58,11 @@ identifier_type!(TableName);
 identifier_type!(TableId);
 identifier_type!(SnapshotId);
 identifier_type!(TransactionId);
+identifier_type!(StreamName);
+identifier_type!(ConsumerName);
+identifier_type!(DocumentId);
+identifier_type!(ChunkId);
+identifier_type!(EmbeddingModelId);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSchema {

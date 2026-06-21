@@ -23,7 +23,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-retrieval"
+version = "0.1.0"
+dependencies = [
+ "ehdb-core",
+]
+
+[[package]]
 name = "ehdb-storage"
+version = "0.1.0"
+dependencies = [
+ "ehdb-core",
+]
+
+[[package]]
+name = "ehdb-stream"
 version = "0.1.0"
 dependencies = [
  "ehdb-core",

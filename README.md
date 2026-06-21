@@ -34,11 +34,13 @@ ClickHouse.
 crates/
 |-- ehdb-core      # identifiers, errors, Arrow schema helpers
 |-- ehdb-catalog   # catalog model and reference in-memory catalog
-`-- ehdb-storage   # object-store traits and local reference adapter
+|-- ehdb-storage   # object-store traits and local reference adapter
+|-- ehdb-stream    # stream logs, durable consumers, replay cursors
+`-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
 ```
 
-Future workspace areas include EHDB-native stream logs, retrieval/RAG
-metadata, analytical read paths, and NoETL integration surfaces.
+Future workspace areas include analytical read paths, service APIs, and
+NoETL integration surfaces.
 
 ## Developer Loop
 
