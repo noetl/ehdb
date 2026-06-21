@@ -36,11 +36,25 @@ crates/
 |-- ehdb-catalog   # catalog model and reference in-memory catalog
 |-- ehdb-storage   # object-store traits and local reference adapter
 |-- ehdb-stream    # stream logs, durable consumers, replay cursors
-`-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
+|-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
+`-- ehdb-transaction # transaction records, replay, local durable log
 ```
 
 Future workspace areas include analytical read paths, service APIs, and
 NoETL integration surfaces.
+
+## Local Durability
+
+`ehdb-transaction` includes `LocalJsonlTransactionLog`, a reference
+append-only transaction log for the local developer loop and
+crash/restart tests. It writes one serialized `TransactionRecord` per
+line, calls `sync_data` after each append, and rebuilds replay state on
+open using the same duplicate transaction ID and sequence checks as the
+in-memory log.
+
+This is not the production consensus layer. Raft/Paxos integration
+belongs behind the transaction-log boundary once the metadata and NoETL
+integration contracts stabilize.
 
 ## Developer Loop
 
@@ -56,8 +70,9 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~466 us |
-| `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~843 us |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~489 us |
+| `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~1.04 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~456 ms |
 
 ## Design
 

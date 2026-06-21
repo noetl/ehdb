@@ -184,6 +184,7 @@ name = "ehdb-core"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "serde",
 ]
 
 [[package]]
@@ -216,6 +217,8 @@ dependencies = [
  "ehdb-core",
  "ehdb-retrieval",
  "ehdb-stream",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

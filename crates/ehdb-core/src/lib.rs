@@ -1,6 +1,7 @@
 use std::fmt;
 
 pub use arrow_schema::DataType;
+use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, EhdbError>;
 
@@ -29,7 +30,7 @@ impl std::error::Error for EhdbError {}
 
 macro_rules! identifier_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         pub struct $name(String);
 
         impl $name {
