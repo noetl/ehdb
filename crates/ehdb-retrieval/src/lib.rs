@@ -70,7 +70,7 @@ struct DocumentKey {
     id: DocumentId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InMemoryRetrievalCatalog {
     documents: BTreeMap<DocumentKey, Document>,
     chunks: BTreeMap<ChunkId, Chunk>,

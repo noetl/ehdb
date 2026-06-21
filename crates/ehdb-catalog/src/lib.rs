@@ -30,7 +30,7 @@ pub struct CreateTable {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InMemoryCatalog {
     tables: BTreeMap<TableKey, CatalogTable>,
 }

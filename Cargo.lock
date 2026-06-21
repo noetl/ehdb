@@ -194,6 +194,7 @@ dependencies = [
 name = "ehdb-reference"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ehdb-catalog",
  "ehdb-core",
  "ehdb-retrieval",

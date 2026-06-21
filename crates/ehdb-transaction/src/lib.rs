@@ -251,6 +251,10 @@ impl LocalJsonlTransactionLog {
         Ok(record)
     }
 
+    pub fn preview_record(&self, request: CommitTransaction) -> Result<TransactionRecord> {
+        self.inner.build_record(request)
+    }
+
     pub fn replay(&self, after: Option<TransactionSequence>) -> Vec<TransactionRecord> {
         self.inner.replay(after)
     }
