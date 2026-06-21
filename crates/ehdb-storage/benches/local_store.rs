@@ -1,5 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ehdb_storage::{ImmutableObjectStore, LocalObjectStore, ObjectPath};
+use ehdb_storage::{
+    CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore, LocalObjectStore,
+    ObjectPath, ObjectPlacement, PlacementPolicy, PlacementTarget,
+};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -33,6 +36,41 @@ fn bench_local_store_put_verified_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_placement_policy_validate(c: &mut Criterion) {
+    c.bench_function("placement_policy_validate_1000", |b| {
+        b.iter(|| {
+            for index in 0..1000 {
+                let shard = DataGravityShard::new(format!("tenant-a-system-{index}")).unwrap();
+                let policy = PlacementPolicy::new(
+                    3,
+                    vec![
+                        PlacementTarget::primary(ObjectPlacement::new(
+                            GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1"))
+                                .unwrap(),
+                            shard.clone(),
+                        )),
+                        PlacementTarget::replica(ObjectPlacement::new(
+                            GeoLocation::new(
+                                CloudProvider::Gcp,
+                                "us-central1",
+                                Some("us-central1-a"),
+                            )
+                            .unwrap(),
+                            shard.clone(),
+                        )),
+                        PlacementTarget::replica(ObjectPlacement::new(
+                            GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
+                            shard,
+                        )),
+                    ],
+                )
+                .unwrap();
+                black_box(policy);
+            }
+        })
+    });
+}
+
 fn temp_root(name: &str) -> std::path::PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -45,5 +83,9 @@ fn temp_root(name: &str) -> std::path::PathBuf {
     ))
 }
 
-criterion_group!(benches, bench_local_store_put_verified_get);
+criterion_group!(
+    benches,
+    bench_local_store_put_verified_get,
+    bench_placement_policy_validate
+);
 criterion_main!(benches);
