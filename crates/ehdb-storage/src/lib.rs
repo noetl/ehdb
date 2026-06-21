@@ -126,4 +126,11 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn rejects_unsafe_object_paths() {
+        assert!(ObjectPath::new("../secret").is_err());
+        assert!(ObjectPath::new("/absolute/path").is_err());
+        assert!(ObjectPath::new("tenant a/object").is_err());
+    }
 }

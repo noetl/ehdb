@@ -306,4 +306,146 @@ mod tests {
 
         assert!(matches!(error, EhdbError::InvalidState(_)));
     }
+
+    #[test]
+    fn rejects_duplicate_document_chunk_and_embedding() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let document = register_doc(&mut catalog);
+        assert!(matches!(
+            catalog
+                .register_document(RegisterDocument {
+                    id: document.id.clone(),
+                    tenant: document.tenant.clone(),
+                    namespace: document.namespace.clone(),
+                    source_uri: document.source_uri.clone(),
+                    content_type: document.content_type.clone(),
+                    transaction_id: TransactionId::new("txn-0004").unwrap(),
+                })
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+
+        let chunk = catalog
+            .register_chunk(RegisterChunk {
+                id: ChunkId::new("chunk-001").unwrap(),
+                document_id: document.id,
+                ordinal: 0,
+                text: "duplicate checks".to_string(),
+                checksum: "sha256-jkl".to_string(),
+                transaction_id: TransactionId::new("txn-0002").unwrap(),
+            })
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .register_chunk(RegisterChunk {
+                    id: chunk.id.clone(),
+                    document_id: chunk.document_id.clone(),
+                    ordinal: 1,
+                    text: "duplicate chunk".to_string(),
+                    checksum: "sha256-mno".to_string(),
+                    transaction_id: TransactionId::new("txn-0005").unwrap(),
+                })
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+
+        let model_id = EmbeddingModelId::new("model-a").unwrap();
+        catalog
+            .register_embedding(RegisterEmbedding {
+                chunk_id: chunk.id.clone(),
+                model_id: model_id.clone(),
+                dimensions: 2,
+                vector: vec![0.1, 0.2],
+                transaction_id: TransactionId::new("txn-0003").unwrap(),
+            })
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .register_embedding(RegisterEmbedding {
+                    chunk_id: chunk.id,
+                    model_id,
+                    dimensions: 2,
+                    vector: vec![0.1, 0.2],
+                    transaction_id: TransactionId::new("txn-0006").unwrap(),
+                })
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn tenant_namespace_filtering_isolates_results() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+        let namespace = NamespaceName::new("knowledge").unwrap();
+
+        let doc_a = catalog
+            .register_document(RegisterDocument {
+                id: DocumentId::new("doc-a").unwrap(),
+                tenant: tenant_a.clone(),
+                namespace: namespace.clone(),
+                source_uri: "artifact://tenant-a/doc.md".to_string(),
+                content_type: "text/markdown".to_string(),
+                transaction_id: TransactionId::new("txn-0001").unwrap(),
+            })
+            .unwrap();
+        let doc_b = catalog
+            .register_document(RegisterDocument {
+                id: DocumentId::new("doc-b").unwrap(),
+                tenant: tenant_b.clone(),
+                namespace: namespace.clone(),
+                source_uri: "artifact://tenant-b/doc.md".to_string(),
+                content_type: "text/markdown".to_string(),
+                transaction_id: TransactionId::new("txn-0002").unwrap(),
+            })
+            .unwrap();
+
+        for (id, document_id, txn) in [
+            ("chunk-a", doc_a.id, "txn-0003"),
+            ("chunk-b", doc_b.id, "txn-0004"),
+        ] {
+            catalog
+                .register_chunk(RegisterChunk {
+                    id: ChunkId::new(id).unwrap(),
+                    document_id,
+                    ordinal: 0,
+                    text: "shared retrieval phrase".to_string(),
+                    checksum: format!("sha256-{id}"),
+                    transaction_id: TransactionId::new(txn).unwrap(),
+                })
+                .unwrap();
+        }
+
+        let matches = catalog.find_chunks_containing(&tenant_a, &namespace, "retrieval");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, ChunkId::new("chunk-a").unwrap());
+    }
+
+    #[test]
+    fn missing_document_or_embedding_returns_not_found() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let missing_doc = DocumentId::new("missing-doc").unwrap();
+        let missing_chunk = ChunkId::new("missing-chunk").unwrap();
+        let model = EmbeddingModelId::new("model-a").unwrap();
+
+        assert!(matches!(
+            catalog
+                .register_chunk(RegisterChunk {
+                    id: ChunkId::new("chunk-001").unwrap(),
+                    document_id: missing_doc,
+                    ordinal: 0,
+                    text: "missing document".to_string(),
+                    checksum: "sha256-missing".to_string(),
+                    transaction_id: TransactionId::new("txn-0001").unwrap(),
+                })
+                .unwrap_err(),
+            EhdbError::NotFound(_)
+        ));
+        assert!(matches!(
+            catalog.embedding(&missing_chunk, &model).unwrap_err(),
+            EhdbError::NotFound(_)
+        ));
+    }
 }

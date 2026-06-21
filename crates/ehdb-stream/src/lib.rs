@@ -189,7 +189,7 @@ impl InMemoryStreamLog {
         Ok(state
             .records
             .iter()
-            .filter(|(sequence, _)| after.map_or(true, |cursor| **sequence > cursor))
+            .filter(|(sequence, _)| after.is_none_or(|cursor| **sequence > cursor))
             .map(|(_, record)| record.clone())
             .collect())
     }
@@ -232,7 +232,7 @@ impl InMemoryStreamLog {
 
         if consumer_state
             .acked_sequence
-            .map_or(false, |acked| sequence < acked)
+            .is_some_and(|acked| sequence < acked)
         {
             return Err(EhdbError::InvalidState(format!(
                 "cannot move consumer {} cursor backwards from {} to {}",
@@ -415,5 +415,84 @@ mod tests {
             log.replay(&tenant, &namespace, &stream, None).unwrap(),
             vec![retained]
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_stream_and_consumer() {
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let mut log = InMemoryStreamLog::default();
+        let config = StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        };
+
+        log.create_stream(config.clone()).unwrap();
+        assert!(matches!(
+            log.create_stream(config).unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+
+        log.create_consumer(&tenant, &namespace, &stream, consumer.clone())
+            .unwrap();
+        assert!(matches!(
+            log.create_consumer(&tenant, &namespace, &stream, consumer)
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn ack_cannot_move_consumer_cursor_backwards() {
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let mut log = InMemoryStreamLog::default();
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        log.create_consumer(&tenant, &namespace, &stream, consumer.clone())
+            .unwrap();
+
+        let first = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"first".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        let second = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"second".to_vec(),
+                TransactionId::new("txn-0002").unwrap(),
+            )
+            .unwrap();
+
+        log.ack(&tenant, &namespace, &stream, &consumer, second.sequence)
+            .unwrap();
+        let error = log
+            .ack(&tenant, &namespace, &stream, &consumer, first.sequence)
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_subjects() {
+        assert!(Subject::new("noetl.event").is_ok());
+        assert!(Subject::new("noetl event").is_err());
+        assert!(Subject::new("").is_err());
     }
 }

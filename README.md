@@ -47,7 +47,17 @@ NoETL integration surfaces.
 ```bash
 cargo fmt --all
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo bench --workspace --no-run
+cargo bench -p ehdb-transaction --bench reference_models
 ```
+
+Current reference benchmark baseline on the initial local models:
+
+| Benchmark | Workload | Baseline |
+|---|---|---|
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~466 us |
+| `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~843 us |
 
 ## Design
 
