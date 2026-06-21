@@ -135,7 +135,7 @@ impl StreamState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InMemoryStreamLog {
     streams: BTreeMap<StreamKey, StreamState>,
 }

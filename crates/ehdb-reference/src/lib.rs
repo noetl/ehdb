@@ -6,15 +6,55 @@ use ehdb_retrieval::{
 use ehdb_stream::{InMemoryStreamLog, StreamConfig, StreamSequence};
 use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
 use ehdb_transaction::{
-    CatalogMutation, Mutation, RetrievalMutation, StreamMutation, SystemMutation, TransactionRecord,
+    CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
+    StreamMutation, SystemMutation, TransactionRecord,
 };
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
     pub catalog: InMemoryCatalog,
     pub streams: InMemoryStreamLog,
     pub retrieval: InMemoryRetrievalCatalog,
     pub system: InMemorySystemLibraryCatalog,
+}
+
+#[derive(Debug)]
+pub struct LocalReferenceRuntime {
+    log: LocalJsonlTransactionLog,
+    state: ReferenceDatabase,
+}
+
+impl LocalReferenceRuntime {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let log = LocalJsonlTransactionLog::open(path)?;
+        let mut state = ReferenceDatabase::default();
+        let records = log.replay(None);
+        state.apply_records(&records)?;
+        Ok(Self { log, state })
+    }
+
+    pub fn append(&mut self, request: CommitTransaction) -> Result<TransactionRecord> {
+        let mut next_state = self.state.clone();
+        let preview = self.log.preview_record(request.clone())?;
+        next_state.apply_record(&preview)?;
+
+        let record = self.log.append(request)?;
+        self.state = next_state;
+        Ok(record)
+    }
+
+    pub fn replay(&self) -> Vec<TransactionRecord> {
+        self.log.replay(None)
+    }
+
+    pub fn state(&self) -> &ReferenceDatabase {
+        &self.state
+    }
+
+    pub fn path(&self) -> &Path {
+        self.log.path()
+    }
 }
 
 impl ReferenceDatabase {
@@ -241,6 +281,11 @@ impl ReferenceDatabase {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use ehdb_core::{
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
         StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
@@ -263,6 +308,80 @@ mod tests {
             TenantId::new("tenant-a").unwrap(),
             NamespaceName::new("system").unwrap(),
         )
+    }
+
+    fn temp_log_path(test_name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ehdb-reference-{test_name}-{}-{suffix}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn create_table_commit(transaction_id: &str) -> CommitTransaction {
+        let (tenant, namespace) = ids();
+        CommitTransaction {
+            transaction_id: TransactionId::new(transaction_id).unwrap(),
+            tenant,
+            namespace,
+            mutations: vec![Mutation::Catalog(CatalogMutation::CreateTable {
+                table_id: TableId::new("tenant-a_system_executions").unwrap(),
+                table_name: TableName::new("executions").unwrap(),
+                schema: TableSchema::new(vec![ColumnSchema::new(
+                    "execution_id",
+                    DataType::Utf8,
+                    false,
+                )
+                .unwrap()])
+                .unwrap(),
+            })],
+        }
+    }
+
+    #[test]
+    fn local_runtime_appends_and_rebuilds_state_after_reopen() {
+        let path = temp_log_path("runtime-restart");
+        let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
+        let record = runtime.append(create_table_commit("txn-0001")).unwrap();
+
+        assert_eq!(record.sequence.value(), 1);
+        assert_eq!(runtime.state().catalog.table_count(), 1);
+        assert_eq!(runtime.replay().len(), 1);
+        assert_eq!(runtime.path(), path.as_path());
+        drop(runtime);
+
+        let reopened = LocalReferenceRuntime::open(&path).unwrap();
+        assert_eq!(reopened.state().catalog.table_count(), 1);
+        assert_eq!(reopened.replay().len(), 1);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_runtime_does_not_append_invalid_projected_commit() {
+        let path = temp_log_path("runtime-invalid");
+        let (tenant, namespace) = ids();
+        let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
+        let error = runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-0001").unwrap(),
+                tenant,
+                namespace,
+                mutations: vec![Mutation::Stream(StreamMutation::Publish {
+                    stream: StreamName::new("missing-stream").unwrap(),
+                    subject: Subject::new("noetl.event").unwrap(),
+                    payload: b"payload".to_vec(),
+                    sequence: 1,
+                })],
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::NotFound(_)));
+        assert!(runtime.replay().is_empty());
+        assert!(!path.exists());
     }
 
     #[test]
