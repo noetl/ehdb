@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/ehdb-catalog",
+    "crates/ehdb-core",
+    "crates/ehdb-storage",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/noetl/ehdb"
+rust-version = "1.82"
+
+[workspace.dependencies]
+arrow-schema = "53"
+ehdb-core = { path = "crates/ehdb-core" }
