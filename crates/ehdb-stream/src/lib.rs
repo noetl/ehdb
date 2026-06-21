@@ -1,10 +1,16 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+};
 
 use ehdb_core::{
     ConsumerName, EhdbError, NamespaceName, Result, StreamName, TenantId, TransactionId,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamSequence(u64);
 
 impl StreamSequence {
@@ -21,7 +27,7 @@ impl StreamSequence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Subject(String);
 
 impl Subject {
@@ -45,13 +51,13 @@ impl Subject {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionPolicy {
     KeepAll,
     MaxRecords(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -59,7 +65,7 @@ pub struct StreamConfig {
     pub retention: RetentionPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRecord {
     pub sequence: StreamSequence,
     pub subject: Subject,
@@ -67,7 +73,7 @@ pub struct StreamRecord {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableConsumer {
     pub name: ConsumerName,
     pub acked_sequence: Option<StreamSequence>,
@@ -78,6 +84,14 @@ struct StreamKey {
     tenant: TenantId,
     namespace: NamespaceName,
     name: StreamName,
+}
+
+fn stream_key(tenant: &TenantId, namespace: &NamespaceName, stream: &StreamName) -> StreamKey {
+    StreamKey {
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        name: stream.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,19 +132,8 @@ pub struct InMemoryStreamLog {
 
 impl InMemoryStreamLog {
     pub fn create_stream(&mut self, config: StreamConfig) -> Result<()> {
-        let key = StreamKey {
-            tenant: config.tenant.clone(),
-            namespace: config.namespace.clone(),
-            name: config.name.clone(),
-        };
-
-        if self.streams.contains_key(&key) {
-            return Err(EhdbError::AlreadyExists(format!(
-                "{}.{}.{}",
-                key.tenant, key.namespace, key.name
-            )));
-        }
-
+        self.ensure_stream_absent(&config)?;
+        let key = stream_key(&config.tenant, &config.namespace, &config.name);
         self.streams.insert(key, StreamState::new(config));
         Ok(())
     }
@@ -144,18 +147,37 @@ impl InMemoryStreamLog {
         payload: impl Into<Vec<u8>>,
         transaction_id: TransactionId,
     ) -> Result<StreamRecord> {
-        let state = self.stream_mut(tenant, namespace, stream)?;
         let record = StreamRecord {
-            sequence: state.next_sequence,
+            sequence: self.stream(tenant, namespace, stream)?.next_sequence,
             subject,
             payload: payload.into(),
             transaction_id,
         };
 
+        self.insert_record(tenant, namespace, stream, record.clone())?;
+        Ok(record)
+    }
+
+    fn insert_record(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        record: StreamRecord,
+    ) -> Result<()> {
+        let state = self.stream_mut(tenant, namespace, stream)?;
+        if record.sequence != state.next_sequence {
+            return Err(EhdbError::InvalidState(format!(
+                "expected stream sequence {}, got {}",
+                state.next_sequence.value(),
+                record.sequence.value()
+            )));
+        }
+
         state.records.insert(record.sequence, record.clone());
         state.next_sequence = state.next_sequence.next();
         state.enforce_retention();
-        Ok(record)
+        Ok(())
     }
 
     pub fn create_consumer(
@@ -165,10 +187,8 @@ impl InMemoryStreamLog {
         stream: &StreamName,
         consumer: ConsumerName,
     ) -> Result<DurableConsumer> {
+        self.ensure_consumer_absent(tenant, namespace, stream, &consumer)?;
         let state = self.stream_mut(tenant, namespace, stream)?;
-        if state.consumers.contains_key(&consumer) {
-            return Err(EhdbError::AlreadyExists(consumer.to_string()));
-        }
 
         let durable = DurableConsumer {
             name: consumer.clone(),
@@ -217,7 +237,53 @@ impl InMemoryStreamLog {
         consumer: &ConsumerName,
         sequence: StreamSequence,
     ) -> Result<DurableConsumer> {
+        self.validate_ack(tenant, namespace, stream, consumer, sequence)?;
         let state = self.stream_mut(tenant, namespace, stream)?;
+        let consumer_state = state
+            .consumers
+            .get_mut(consumer)
+            .ok_or_else(|| EhdbError::NotFound(consumer.to_string()))?;
+
+        consumer_state.acked_sequence = Some(sequence);
+        Ok(consumer_state.clone())
+    }
+
+    fn ensure_stream_absent(&self, config: &StreamConfig) -> Result<()> {
+        let key = stream_key(&config.tenant, &config.namespace, &config.name);
+        if self.streams.contains_key(&key) {
+            return Err(EhdbError::AlreadyExists(format!(
+                "{}.{}.{}",
+                key.tenant, key.namespace, key.name
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_consumer_absent(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+    ) -> Result<()> {
+        let state = self.stream(tenant, namespace, stream)?;
+        if state.consumers.contains_key(consumer) {
+            return Err(EhdbError::AlreadyExists(consumer.to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn validate_ack(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+        sequence: StreamSequence,
+    ) -> Result<()> {
+        let state = self.stream(tenant, namespace, stream)?;
         if !state.records.contains_key(&sequence) {
             return Err(EhdbError::NotFound(format!(
                 "stream sequence {}",
@@ -227,7 +293,7 @@ impl InMemoryStreamLog {
 
         let consumer_state = state
             .consumers
-            .get_mut(consumer)
+            .get(consumer)
             .ok_or_else(|| EhdbError::NotFound(consumer.to_string()))?;
 
         if consumer_state
@@ -242,8 +308,7 @@ impl InMemoryStreamLog {
             )));
         }
 
-        consumer_state.acked_sequence = Some(sequence);
-        Ok(consumer_state.clone())
+        Ok(())
     }
 
     fn stream(
@@ -279,8 +344,222 @@ impl InMemoryStreamLog {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum StreamJournalEntry {
+    CreateStream {
+        config: StreamConfig,
+    },
+    CreateConsumer {
+        tenant: TenantId,
+        namespace: NamespaceName,
+        stream: StreamName,
+        consumer: ConsumerName,
+    },
+    Publish {
+        tenant: TenantId,
+        namespace: NamespaceName,
+        stream: StreamName,
+        record: StreamRecord,
+    },
+    Ack {
+        tenant: TenantId,
+        namespace: NamespaceName,
+        stream: StreamName,
+        consumer: ConsumerName,
+        sequence: StreamSequence,
+    },
+}
+
+#[derive(Debug)]
+pub struct LocalJsonlStreamLog {
+    path: PathBuf,
+    inner: InMemoryStreamLog,
+}
+
+impl LocalJsonlStreamLog {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let mut inner = InMemoryStreamLog::default();
+
+        if path.exists() {
+            let file = File::open(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            for (index, line) in BufReader::new(file).lines().enumerate() {
+                let line = line.map_err(|err| EhdbError::Storage(err.to_string()))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: StreamJournalEntry = serde_json::from_str(&line).map_err(|err| {
+                    EhdbError::Storage(format!(
+                        "invalid stream log record at line {}: {err}",
+                        index + 1
+                    ))
+                })?;
+                apply_journal_entry(&mut inner, entry)?;
+            }
+        }
+
+        Ok(Self { path, inner })
+    }
+
+    pub fn create_stream(&mut self, config: StreamConfig) -> Result<()> {
+        self.inner.ensure_stream_absent(&config)?;
+        let entry = StreamJournalEntry::CreateStream {
+            config: config.clone(),
+        };
+        self.append_entry_to_disk(&entry)?;
+        self.inner.create_stream(config)
+    }
+
+    pub fn create_consumer(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: ConsumerName,
+    ) -> Result<DurableConsumer> {
+        self.inner
+            .ensure_consumer_absent(tenant, namespace, stream, &consumer)?;
+        let entry = StreamJournalEntry::CreateConsumer {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+        };
+        self.append_entry_to_disk(&entry)?;
+        self.inner
+            .create_consumer(tenant, namespace, stream, consumer)
+    }
+
+    pub fn publish(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        subject: Subject,
+        payload: impl Into<Vec<u8>>,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord> {
+        let record = StreamRecord {
+            sequence: self.inner.stream(tenant, namespace, stream)?.next_sequence,
+            subject,
+            payload: payload.into(),
+            transaction_id,
+        };
+        let entry = StreamJournalEntry::Publish {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            stream: stream.clone(),
+            record: record.clone(),
+        };
+        self.append_entry_to_disk(&entry)?;
+        self.inner
+            .insert_record(tenant, namespace, stream, record.clone())?;
+        Ok(record)
+    }
+
+    pub fn replay(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        after: Option<StreamSequence>,
+    ) -> Result<Vec<StreamRecord>> {
+        self.inner.replay(tenant, namespace, stream, after)
+    }
+
+    pub fn replay_for_consumer(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+    ) -> Result<Vec<StreamRecord>> {
+        self.inner
+            .replay_for_consumer(tenant, namespace, stream, consumer)
+    }
+
+    pub fn ack(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+        sequence: StreamSequence,
+    ) -> Result<DurableConsumer> {
+        self.inner
+            .validate_ack(tenant, namespace, stream, consumer, sequence)?;
+        let entry = StreamJournalEntry::Ack {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+            sequence,
+        };
+        self.append_entry_to_disk(&entry)?;
+        self.inner
+            .ack(tenant, namespace, stream, consumer, sequence)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn append_entry_to_disk(&self, entry: &StreamJournalEntry) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        serde_json::to_writer(&mut file, entry)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        file.write_all(b"\n")
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        file.sync_data()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        Ok(())
+    }
+}
+
+fn apply_journal_entry(inner: &mut InMemoryStreamLog, entry: StreamJournalEntry) -> Result<()> {
+    match entry {
+        StreamJournalEntry::CreateStream { config } => inner.create_stream(config),
+        StreamJournalEntry::CreateConsumer {
+            tenant,
+            namespace,
+            stream,
+            consumer,
+        } => inner
+            .create_consumer(&tenant, &namespace, &stream, consumer)
+            .map(|_| ()),
+        StreamJournalEntry::Publish {
+            tenant,
+            namespace,
+            stream,
+            record,
+        } => inner.insert_record(&tenant, &namespace, &stream, record),
+        StreamJournalEntry::Ack {
+            tenant,
+            namespace,
+            stream,
+            consumer,
+            sequence,
+        } => inner
+            .ack(&tenant, &namespace, &stream, &consumer, sequence)
+            .map(|_| ()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
 
     fn ids() -> (TenantId, NamespaceName, StreamName) {
@@ -289,6 +568,17 @@ mod tests {
             NamespaceName::new("system").unwrap(),
             StreamName::new("execution-events").unwrap(),
         )
+    }
+
+    fn temp_log_path(test_name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ehdb-stream-{test_name}-{}-{suffix}.jsonl",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -494,5 +784,140 @@ mod tests {
         assert!(Subject::new("noetl.event").is_ok());
         assert!(Subject::new("noetl event").is_err());
         assert!(Subject::new("").is_err());
+    }
+
+    #[test]
+    fn local_jsonl_log_replays_records_and_consumer_cursor_after_reopen() {
+        let path = temp_log_path("restart");
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        log.create_consumer(&tenant, &namespace, &stream, consumer.clone())
+            .unwrap();
+        let first = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.command").unwrap(),
+                b"command-1".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        let second = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"event-1".to_vec(),
+                TransactionId::new("txn-0002").unwrap(),
+            )
+            .unwrap();
+        log.ack(&tenant, &namespace, &stream, &consumer, first.sequence)
+            .unwrap();
+        drop(log);
+
+        let mut reopened = LocalJsonlStreamLog::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .replay_for_consumer(&tenant, &namespace, &stream, &consumer)
+                .unwrap(),
+            vec![second]
+        );
+        assert_eq!(reopened.path(), path.as_path());
+
+        let third = reopened
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"event-2".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(third.sequence.value(), 3);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_replays_retention_and_next_sequence_after_reopen() {
+        let path = temp_log_path("retention");
+        let (tenant, namespace, stream) = ids();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::MaxRecords(1),
+        })
+        .unwrap();
+        log.publish(
+            &tenant,
+            &namespace,
+            &stream,
+            Subject::new("noetl.event").unwrap(),
+            b"first".to_vec(),
+            TransactionId::new("txn-0001").unwrap(),
+        )
+        .unwrap();
+        let retained = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"second".to_vec(),
+                TransactionId::new("txn-0002").unwrap(),
+            )
+            .unwrap();
+        drop(log);
+
+        let mut reopened = LocalJsonlStreamLog::open(&path).unwrap();
+        assert_eq!(
+            reopened.replay(&tenant, &namespace, &stream, None).unwrap(),
+            vec![retained]
+        );
+        let third = reopened
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"third".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(third.sequence.value(), 3);
+        assert_eq!(
+            reopened.replay(&tenant, &namespace, &stream, None).unwrap(),
+            vec![third]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_corrupt_entries_on_open() {
+        let path = temp_log_path("corrupt");
+        fs::write(&path, b"not-json\n").unwrap();
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
+
+        fs::remove_file(path).unwrap();
     }
 }
