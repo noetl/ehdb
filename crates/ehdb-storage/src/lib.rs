@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -156,6 +157,122 @@ impl ObjectPlacement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementRole {
+    Primary,
+    Replica,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementTarget {
+    pub role: PlacementRole,
+    pub placement: ObjectPlacement,
+}
+
+impl PlacementTarget {
+    pub fn primary(placement: ObjectPlacement) -> Self {
+        Self {
+            role: PlacementRole::Primary,
+            placement,
+        }
+    }
+
+    pub fn replica(placement: ObjectPlacement) -> Self {
+        Self {
+            role: PlacementRole::Replica,
+            placement,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementPolicy {
+    minimum_copies: usize,
+    targets: Vec<PlacementTarget>,
+}
+
+impl PlacementPolicy {
+    pub fn new(minimum_copies: usize, targets: Vec<PlacementTarget>) -> Result<Self> {
+        if minimum_copies == 0 {
+            return Err(EhdbError::Storage(
+                "placement policy requires at least one copy".to_string(),
+            ));
+        }
+        if targets.len() < minimum_copies {
+            return Err(EhdbError::Storage(format!(
+                "placement policy requires {minimum_copies} copies, got {}",
+                targets.len()
+            )));
+        }
+
+        let primary_count = targets
+            .iter()
+            .filter(|target| target.role == PlacementRole::Primary)
+            .count();
+        if primary_count != 1 {
+            return Err(EhdbError::Storage(format!(
+                "placement policy requires exactly one primary, got {primary_count}"
+            )));
+        }
+
+        let first_shard = targets
+            .first()
+            .expect("targets length checked by minimum copies")
+            .placement
+            .data_gravity_shard
+            .clone();
+        let mut seen = BTreeSet::new();
+        for target in &targets {
+            if target.placement.data_gravity_shard != first_shard {
+                return Err(EhdbError::Storage(format!(
+                    "placement policy mixes data gravity shards: expected {}, got {}",
+                    first_shard.as_str(),
+                    target.placement.data_gravity_shard.as_str()
+                )));
+            }
+
+            let key = placement_key(&target.placement);
+            if !seen.insert(key.clone()) {
+                return Err(EhdbError::Storage(format!(
+                    "duplicate placement target: {key}"
+                )));
+            }
+        }
+
+        Ok(Self {
+            minimum_copies,
+            targets,
+        })
+    }
+
+    pub fn local_dev() -> Self {
+        Self {
+            minimum_copies: 1,
+            targets: vec![PlacementTarget::primary(ObjectPlacement::local_dev())],
+        }
+    }
+
+    pub fn minimum_copies(&self) -> usize {
+        self.minimum_copies
+    }
+
+    pub fn targets(&self) -> &[PlacementTarget] {
+        &self.targets
+    }
+
+    pub fn primary(&self) -> &ObjectPlacement {
+        self.targets
+            .iter()
+            .find(|target| target.role == PlacementRole::Primary)
+            .map(|target| &target.placement)
+            .expect("placement policy invariant guarantees one primary")
+    }
+
+    pub fn data_gravity_shard(&self) -> &DataGravityShard {
+        &self.primary().data_gravity_shard
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRef {
     pub path: ObjectPath,
@@ -288,6 +405,22 @@ fn validate_placement_component(label: &str, value: &str) -> Result<()> {
     }
 }
 
+fn placement_key(placement: &ObjectPlacement) -> String {
+    let provider = match placement.geo.provider {
+        CloudProvider::Local => "local",
+        CloudProvider::Aws => "aws",
+        CloudProvider::Gcp => "gcp",
+        CloudProvider::Azure => "azure",
+        CloudProvider::S3Compatible => "s3-compatible",
+    };
+    let zone = placement.geo.zone.as_deref().unwrap_or("-");
+    format!(
+        "{provider}/{}/{zone}/{}",
+        placement.geo.region,
+        placement.data_gravity_shard.as_str()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,6 +516,69 @@ mod tests {
         assert_eq!(placement.data_gravity_shard.as_str(), "tenant-a-system");
         assert!(GeoLocation::new(CloudProvider::Gcp, "us east1", None::<String>).is_err());
         assert!(DataGravityShard::new("tenant/a").is_err());
+    }
+
+    #[test]
+    fn builds_local_dev_placement_policy() {
+        let policy = PlacementPolicy::local_dev();
+
+        assert_eq!(policy.minimum_copies(), 1);
+        assert_eq!(policy.targets().len(), 1);
+        assert_eq!(policy.primary().geo.provider, CloudProvider::Local);
+        assert_eq!(policy.data_gravity_shard().as_str(), "local-dev");
+    }
+
+    #[test]
+    fn validates_multi_region_placement_policy() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let policy = PlacementPolicy::new(
+            3,
+            vec![
+                PlacementTarget::primary(ObjectPlacement::new(
+                    GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
+                    shard.clone(),
+                )),
+                PlacementTarget::replica(ObjectPlacement::new(
+                    GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a"))
+                        .unwrap(),
+                    shard.clone(),
+                )),
+                PlacementTarget::replica(ObjectPlacement::new(
+                    GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
+                    shard.clone(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(policy.minimum_copies(), 3);
+        assert_eq!(policy.targets().len(), 3);
+        assert_eq!(policy.data_gravity_shard().as_str(), "tenant-a-system");
+    }
+
+    #[test]
+    fn rejects_invalid_placement_policies() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let primary = PlacementTarget::primary(ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
+            shard.clone(),
+        ));
+        let replica = PlacementTarget::replica(ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a")).unwrap(),
+            shard.clone(),
+        ));
+
+        assert!(PlacementPolicy::new(0, vec![primary.clone()]).is_err());
+        assert!(PlacementPolicy::new(3, vec![primary.clone(), replica.clone()]).is_err());
+        assert!(PlacementPolicy::new(1, vec![replica.clone()]).is_err());
+        assert!(PlacementPolicy::new(1, vec![primary.clone(), primary.clone()]).is_err());
+        assert!(PlacementPolicy::new(2, vec![primary.clone(), primary.clone()]).is_err());
+
+        let other_shard_replica = PlacementTarget::replica(ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
+            DataGravityShard::new("tenant-b-system").unwrap(),
+        ));
+        assert!(PlacementPolicy::new(2, vec![primary, other_shard_replica]).is_err());
     }
 
     #[test]

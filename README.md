@@ -98,6 +98,12 @@ placement planners to route object files toward the region, cloud, and
 workload gravity that owns the data, without moving data-touch logic
 into the gateway.
 
+`PlacementPolicy` adds the local contract for those future planners: a
+policy has exactly one primary placement, one data-gravity shard shared
+by all targets, a minimum copy count, and no duplicate geo/shard
+targets. It is metadata only; it does not copy objects or schedule
+replication by itself.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
@@ -168,13 +174,14 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~1.94 ms |
-| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~14.6 ms |
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~613 us |
-| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.14 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~486 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~571 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~517 ms |
+| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.19 ms |
+| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~2.12 ms |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~14.7 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~614 us |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.16 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~443 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~542 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~534 ms |
 
 ## Design
 
