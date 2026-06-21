@@ -2,6 +2,7 @@
 members = [
     "crates/ehdb-catalog",
     "crates/ehdb-core",
+    "crates/ehdb-reference",
     "crates/ehdb-retrieval",
     "crates/ehdb-storage",
     "crates/ehdb-stream",
@@ -17,10 +18,11 @@ repository = "https://github.com/noetl/ehdb"
 rust-version = "1.82"
 
 [workspace.dependencies]
-arrow-schema = "53"
+arrow-schema = { version = "53", features = ["serde"] }
 criterion = "0.5"
 ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
+ehdb-reference = { path = "crates/ehdb-reference" }
 ehdb-retrieval = { path = "crates/ehdb-retrieval" }
 ehdb-storage = { path = "crates/ehdb-storage" }
 ehdb-stream = { path = "crates/ehdb-stream" }

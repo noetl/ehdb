@@ -37,6 +37,7 @@ ClickHouse.
 crates/
 |-- ehdb-core      # identifiers, errors, Arrow schema helpers
 |-- ehdb-catalog   # catalog model and reference in-memory catalog
+|-- ehdb-reference # replay applier over the local reference catalogs
 |-- ehdb-storage   # object-store traits and local reference adapter
 |-- ehdb-stream    # stream logs, durable consumers, replay cursors
 |-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
@@ -71,6 +72,18 @@ append-only journal for system WASM library manifests and bindings. It
 persists publish and bind operations, then rebuilds immutable manifests
 and environment/channel bindings on open so hot-replacement state
 survives restart.
+
+## Replay Reference
+
+`ehdb-reference` applies replayed `TransactionRecord` values to the
+local reference catalogs. Transaction mutations carry enough durable
+facts to rebuild catalog tables, stream records, retrieval documents and
+embeddings, and system WASM library bindings from the log alone.
+
+This keeps the reference implementation aligned with the NoETL rule
+that the event/transaction log is the source of truth. A replay mismatch
+such as an unexpected stream sequence fails deterministically instead of
+being silently repaired.
 
 ## System WASM Libraries
 
@@ -109,9 +122,9 @@ Current reference benchmark baseline on the initial local models:
 | Benchmark | Workload | Baseline |
 |---|---|---|
 | `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~626 us |
-| `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~1.04 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~448 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~456 ms |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.21 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~488 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~486 ms |
 
 ## Design
 

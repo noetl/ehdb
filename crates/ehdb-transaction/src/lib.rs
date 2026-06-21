@@ -7,10 +7,13 @@ use std::{
 
 use ehdb_core::{
     ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result,
-    StreamName, TableId, TableName, TenantId, TransactionId,
+    StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
 };
+use ehdb_storage::ObjectPath;
+use ehdb_stream::{RetentionPolicy, Subject};
 use ehdb_system::{
-    EnvironmentName, ModuleDigest, ReleaseChannel, SystemLibraryPath, SystemLibraryRevision,
+    EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
+    SystemLibraryRevision, WasmTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +34,7 @@ impl TransactionSequence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Mutation {
     Catalog(CatalogMutation),
     Stream(StreamMutation),
@@ -44,6 +47,7 @@ pub enum CatalogMutation {
     CreateTable {
         table_id: TableId,
         table_name: TableName,
+        schema: TableSchema,
     },
 }
 
@@ -51,6 +55,7 @@ pub enum CatalogMutation {
 pub enum StreamMutation {
     CreateStream {
         stream: StreamName,
+        retention: RetentionPolicy,
     },
     CreateConsumer {
         stream: StreamName,
@@ -58,7 +63,8 @@ pub enum StreamMutation {
     },
     Publish {
         stream: StreamName,
-        subject: String,
+        subject: Subject,
+        payload: Vec<u8>,
         sequence: u64,
     },
     Ack {
@@ -68,19 +74,25 @@ pub enum StreamMutation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RetrievalMutation {
     RegisterDocument {
         document_id: DocumentId,
+        source_uri: String,
+        content_type: String,
     },
     RegisterChunk {
         document_id: DocumentId,
         chunk_id: ChunkId,
+        ordinal: u32,
+        text: String,
+        checksum: String,
     },
     RegisterEmbedding {
         chunk_id: ChunkId,
         model_id: EmbeddingModelId,
         dimensions: usize,
+        vector: Vec<f32>,
     },
 }
 
@@ -90,6 +102,11 @@ pub enum SystemMutation {
         path: SystemLibraryPath,
         revision: SystemLibraryRevision,
         digest: ModuleDigest,
+        entry: String,
+        target: WasmTarget,
+        object_path: ObjectPath,
+        byte_len: u64,
+        capabilities: Vec<SystemCapability>,
     },
     BindLibrary {
         path: SystemLibraryPath,
@@ -100,7 +117,7 @@ pub enum SystemMutation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransactionRecord {
     pub sequence: TransactionSequence,
     pub transaction_id: TransactionId,
@@ -109,7 +126,7 @@ pub struct TransactionRecord {
     pub mutations: Vec<Mutation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitTransaction {
     pub transaction_id: TransactionId,
     pub tenant: TenantId,
@@ -277,6 +294,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use ehdb_core::{ColumnSchema, DataType};
+    use ehdb_storage::ObjectPath;
+    use ehdb_system::{SystemCapability, WasmTarget};
+
     use super::*;
 
     fn ids() -> (TenantId, NamespaceName) {
@@ -299,10 +320,21 @@ mod tests {
             namespace,
             mutations: vec![Mutation::Stream(StreamMutation::Publish {
                 stream: StreamName::new(stream).unwrap(),
-                subject: "noetl.event".to_string(),
+                subject: Subject::new("noetl.event").unwrap(),
+                payload: format!("event-{sequence}").into_bytes(),
                 sequence,
             })],
         }
+    }
+
+    fn schema() -> TableSchema {
+        TableSchema::new(vec![ColumnSchema::new(
+            "execution_id",
+            DataType::Utf8,
+            false,
+        )
+        .unwrap()])
+        .unwrap()
     }
 
     fn temp_log_path(test_name: &str) -> PathBuf {
@@ -332,6 +364,7 @@ mod tests {
                 namespace: namespace.clone(),
                 mutations: vec![Mutation::Stream(StreamMutation::CreateStream {
                     stream: StreamName::new("execution-events").unwrap(),
+                    retention: RetentionPolicy::KeepAll,
                 })],
             })
             .unwrap();
@@ -342,7 +375,8 @@ mod tests {
                 namespace,
                 mutations: vec![Mutation::Stream(StreamMutation::Publish {
                     stream: StreamName::new("execution-events").unwrap(),
-                    subject: "noetl.event".to_string(),
+                    subject: Subject::new("noetl.event").unwrap(),
+                    payload: b"event-1".to_vec(),
                     sequence: 1,
                 })],
             })
@@ -365,6 +399,7 @@ mod tests {
             mutations: vec![Mutation::Catalog(CatalogMutation::CreateTable {
                 table_id: TableId::new("tenant-a_system_executions").unwrap(),
                 table_name: TableName::new("executions").unwrap(),
+                schema: schema(),
             })],
         };
 
@@ -409,6 +444,14 @@ mod tests {
                         path: path.clone(),
                         revision,
                         digest: digest.clone(),
+                        entry: "run".to_string(),
+                        target: WasmTarget::Wasm32UnknownUnknown,
+                        object_path: ObjectPath::new(
+                            "system-libraries/system/catalog/bootstrap/1/module.wasm",
+                        )
+                        .unwrap(),
+                        byte_len: 512,
+                        capabilities: vec![SystemCapability::EhdbCatalogWrite],
                     }),
                     Mutation::System(SystemMutation::BindLibrary {
                         path,
@@ -435,6 +478,7 @@ mod tests {
                 namespace,
                 mutations: vec![Mutation::Stream(StreamMutation::CreateStream {
                     stream: StreamName::new("execution-events").unwrap(),
+                    retention: RetentionPolicy::KeepAll,
                 })],
             })
             .unwrap();
