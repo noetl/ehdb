@@ -52,9 +52,15 @@ line, calls `sync_data` after each append, and rebuilds replay state on
 open using the same duplicate transaction ID and sequence checks as the
 in-memory log.
 
-This is not the production consensus layer. Raft/Paxos integration
-belongs behind the transaction-log boundary once the metadata and NoETL
-integration contracts stabilize.
+`ehdb-stream` includes `LocalJsonlStreamLog`, a reference append-only
+stream journal for the local developer loop and restart tests. It
+persists create-stream, create-consumer, publish, and ack operations;
+on open it rebuilds stream records, retention state, next sequence, and
+durable consumer cursors.
+
+These are not the production consensus or replicated stream layers.
+Raft/Paxos and distributed stream storage belong behind these boundaries
+once the metadata, stream, and NoETL integration contracts stabilize.
 
 ## Developer Loop
 
@@ -70,9 +76,10 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~489 us |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~629 us |
 | `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~1.04 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~456 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~454 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~457 ms |
 
 ## Design
 
