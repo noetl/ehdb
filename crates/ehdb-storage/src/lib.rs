@@ -74,10 +74,94 @@ impl ObjectDigest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudProvider {
+    Local,
+    Aws,
+    Gcp,
+    Azure,
+    S3Compatible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    pub provider: CloudProvider,
+    pub region: String,
+    pub zone: Option<String>,
+}
+
+impl GeoLocation {
+    pub fn new(
+        provider: CloudProvider,
+        region: impl Into<String>,
+        zone: Option<impl Into<String>>,
+    ) -> Result<Self> {
+        let region = region.into();
+        validate_placement_component("region", &region)?;
+        let zone = zone.map(|zone| zone.into()).transpose_validated("zone")?;
+
+        Ok(Self {
+            provider,
+            region,
+            zone,
+        })
+    }
+
+    pub fn local_dev() -> Self {
+        Self {
+            provider: CloudProvider::Local,
+            region: "local-dev".to_string(),
+            zone: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DataGravityShard(String);
+
+impl DataGravityShard {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_placement_component("data gravity shard", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn local_dev() -> Self {
+        Self("local-dev".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectPlacement {
+    pub geo: GeoLocation,
+    pub data_gravity_shard: DataGravityShard,
+}
+
+impl ObjectPlacement {
+    pub fn new(geo: GeoLocation, data_gravity_shard: DataGravityShard) -> Self {
+        Self {
+            geo,
+            data_gravity_shard,
+        }
+    }
+
+    pub fn local_dev() -> Self {
+        Self {
+            geo: GeoLocation::local_dev(),
+            data_gravity_shard: DataGravityShard::local_dev(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRef {
     pub path: ObjectPath,
     pub len: u64,
     pub digest: ObjectDigest,
+    pub placement: ObjectPlacement,
 }
 
 pub trait ImmutableObjectStore {
@@ -126,6 +210,7 @@ impl ImmutableObjectStore for LocalObjectStore {
             path,
             len: bytes.len() as u64,
             digest: ObjectDigest::sha256(bytes),
+            placement: ObjectPlacement::local_dev(),
         })
     }
 
@@ -169,6 +254,36 @@ fn validate_file_name(file_name: &str) -> Result<()> {
     } else {
         Err(EhdbError::Storage(format!(
             "unsafe object file name: {file_name}"
+        )))
+    }
+}
+
+trait OptionalPlacementComponent {
+    fn transpose_validated(self, label: &str) -> Result<Option<String>>;
+}
+
+impl OptionalPlacementComponent for Option<String> {
+    fn transpose_validated(self, label: &str) -> Result<Option<String>> {
+        self.map(|value| {
+            validate_placement_component(label, &value)?;
+            Ok(value)
+        })
+        .transpose()
+    }
+}
+
+fn validate_placement_component(label: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+
+    if valid {
+        Ok(())
+    } else {
+        Err(EhdbError::Storage(format!(
+            "invalid {label} placement component: {value}"
         )))
     }
 }
@@ -219,6 +334,9 @@ mod tests {
             object.digest.as_str(),
             "sha256:f68b244fda3e7892b47146526f23ffd069dafb2ebba67ea8cb4f04c72da212dd"
         );
+        assert_eq!(object.placement.geo.provider, CloudProvider::Local);
+        assert_eq!(object.placement.geo.region, "local-dev");
+        assert_eq!(object.placement.data_gravity_shard.as_str(), "local-dev");
         assert_eq!(bytes, b"arrow-ipc-placeholder");
         assert_eq!(
             store.get_verified(&object).unwrap(),
@@ -251,6 +369,20 @@ mod tests {
         .is_ok());
         assert!(ObjectDigest::new("md5:6bb42ecc").is_err());
         assert!(ObjectDigest::new("sha256:not-hex").is_err());
+    }
+
+    #[test]
+    fn validates_geo_location_and_data_gravity_shard() {
+        let geo = GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap();
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let placement = ObjectPlacement::new(geo, shard);
+
+        assert_eq!(placement.geo.provider, CloudProvider::Aws);
+        assert_eq!(placement.geo.region, "us-east-1");
+        assert_eq!(placement.geo.zone.as_deref(), Some("use1-az1"));
+        assert_eq!(placement.data_gravity_shard.as_str(), "tenant-a-system");
+        assert!(GeoLocation::new(CloudProvider::Gcp, "us east1", None::<String>).is_err());
+        assert!(DataGravityShard::new("tenant/a").is_err());
     }
 
     #[test]

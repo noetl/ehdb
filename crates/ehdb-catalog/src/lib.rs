@@ -234,7 +234,7 @@ impl InMemoryCatalog {
 #[cfg(test)]
 mod tests {
     use ehdb_core::{ColumnSchema, DataType};
-    use ehdb_storage::{ObjectDigest, ObjectPath};
+    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement};
 
     use super::*;
 
@@ -259,6 +259,7 @@ mod tests {
             path: ObjectPath::new(path).unwrap(),
             len: 128,
             digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            placement: ObjectPlacement::local_dev(),
         }
     }
 

@@ -4,7 +4,7 @@ use ehdb_core::{
     ColumnSchema, DataType, NamespaceName, SnapshotId, TableName, TableSchema, TenantId,
     TransactionId,
 };
-use ehdb_storage::{ObjectDigest, ObjectPath, ObjectRef};
+use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef};
 
 fn bench_catalog_snapshot_commits(c: &mut Criterion) {
     c.bench_function("catalog_commit_snapshots_1000", |b| {
@@ -62,6 +62,7 @@ fn object_ref(index: usize) -> ObjectRef {
         .unwrap(),
         len: 4096,
         digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        placement: ObjectPlacement::local_dev(),
     }
 }
 
