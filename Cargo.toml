@@ -30,3 +30,4 @@ ehdb-system = { path = "crates/ehdb-system" }
 ehdb-transaction = { path = "crates/ehdb-transaction" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"

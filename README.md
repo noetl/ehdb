@@ -73,6 +73,25 @@ persists publish and bind operations, then rebuilds immutable manifests
 and environment/channel bindings on open so hot-replacement state
 survives restart.
 
+## Immutable Objects
+
+`ehdb-storage` includes a local immutable object-store adapter for tests
+and the developer loop. Stored `ObjectRef` values now carry the object
+path, byte length, and SHA-256 digest. `get_verified` reads through the
+object reference and rejects length or digest mismatches instead of
+returning corrupt bytes.
+
+The storage crate also provides a deterministic table/snapshot object
+path helper:
+
+```text
+{tenant}/{namespace}/tables/{table}/snapshots/{snapshot}/{file}
+```
+
+This is the local reference boundary for catalog-addressable data files.
+Production cloud object APIs remain adapter details behind the EHDB
+storage layer.
+
 ## Replay Reference
 
 `ehdb-reference` applies replayed `TransactionRecord` values to the
@@ -120,6 +139,7 @@ cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench --workspace --no-run
+cargo bench -p ehdb-storage --bench local_store
 cargo bench -p ehdb-reference --bench local_runtime
 cargo bench -p ehdb-transaction --bench reference_models
 ```
@@ -128,11 +148,12 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~626 us |
-| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.18 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~486 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~482 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~477 ms |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~14.8 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~640 us |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.17 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~476 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~454 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~452 ms |
 
 ## Design
 
