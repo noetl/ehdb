@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 pub struct StreamSequence(u64);
 
 impl StreamSequence {
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 {
+            Err(EhdbError::InvalidState(
+                "stream sequence must be greater than zero".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
     pub fn first() -> Self {
         Self(1)
     }
@@ -784,6 +794,8 @@ mod tests {
         assert!(Subject::new("noetl.event").is_ok());
         assert!(Subject::new("noetl event").is_err());
         assert!(Subject::new("").is_err());
+        assert!(StreamSequence::new(0).is_err());
+        assert_eq!(StreamSequence::new(1).unwrap(), StreamSequence::first());
     }
 
     #[test]

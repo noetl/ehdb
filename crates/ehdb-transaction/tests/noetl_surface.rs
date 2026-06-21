@@ -49,8 +49,9 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![Mutation::Catalog(CatalogMutation::CreateTable {
-                table_id: table.id,
-                table_name: table.name,
+                table_id: table.id.clone(),
+                table_name: table.name.clone(),
+                schema: table.schema.clone(),
             })],
         })
         .unwrap();
@@ -88,8 +89,9 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![Mutation::Stream(StreamMutation::Publish {
-                stream: stream_name,
-                subject: event.subject.as_str().to_string(),
+                stream: stream_name.clone(),
+                subject: event.subject.clone(),
+                payload: event.payload.clone(),
                 sequence: event.sequence.value(),
             })],
         })
@@ -131,16 +133,22 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             namespace: namespace.clone(),
             mutations: vec![
                 Mutation::Retrieval(RetrievalMutation::RegisterDocument {
-                    document_id: document.id,
+                    document_id: document.id.clone(),
+                    source_uri: document.source_uri.clone(),
+                    content_type: document.content_type.clone(),
                 }),
                 Mutation::Retrieval(RetrievalMutation::RegisterChunk {
-                    document_id: chunk.document_id,
-                    chunk_id: chunk.id,
+                    document_id: chunk.document_id.clone(),
+                    chunk_id: chunk.id.clone(),
+                    ordinal: chunk.ordinal,
+                    text: chunk.text.clone(),
+                    checksum: chunk.checksum.clone(),
                 }),
                 Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
-                    chunk_id: embedding.chunk_id,
-                    model_id: embedding.model_id,
+                    chunk_id: embedding.chunk_id.clone(),
+                    model_id: embedding.model_id.clone(),
                     dimensions: embedding.dimensions,
+                    vector: embedding.vector.clone(),
                 }),
             ],
         })
@@ -185,6 +193,11 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
                     path: system_path.clone(),
                     revision: system_revision,
                     digest: system_digest.clone(),
+                    entry: system_library.entry.clone(),
+                    target: system_library.target.clone(),
+                    object_path: system_library.object_path.clone(),
+                    byte_len: system_library.byte_len,
+                    capabilities: system_library.capabilities.clone(),
                 }),
                 Mutation::System(SystemMutation::BindLibrary {
                     path: system_path,

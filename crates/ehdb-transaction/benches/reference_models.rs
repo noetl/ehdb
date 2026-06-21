@@ -53,7 +53,8 @@ fn bench_transaction_append_replay(c: &mut Criterion) {
                     namespace: namespace.clone(),
                     mutations: vec![Mutation::Stream(StreamMutation::Publish {
                         stream: stream.clone(),
-                        subject: "noetl.event".to_string(),
+                        subject: Subject::new("noetl.event").unwrap(),
+                        payload: black_box(format!("event-{index}").into_bytes()),
                         sequence: index + 1,
                     })],
                 })
@@ -83,7 +84,8 @@ fn bench_local_transaction_jsonl_append_reopen(c: &mut Criterion) {
                     namespace: namespace.clone(),
                     mutations: vec![Mutation::Stream(StreamMutation::Publish {
                         stream: stream.clone(),
-                        subject: "noetl.event".to_string(),
+                        subject: Subject::new("noetl.event").unwrap(),
+                        payload: black_box(format!("event-{index}").into_bytes()),
                         sequence: index + 1,
                     })],
                 })

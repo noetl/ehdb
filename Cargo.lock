@@ -28,6 +28,9 @@ name = "arrow-schema"
 version = "53.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35b0f9c0c3582dd55db0f136d3b44bfa0189df07adcf7dc7f2f2e74db0f52eb8"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "autocfg"
@@ -185,6 +188,19 @@ version = "0.1.0"
 dependencies = [
  "arrow-schema",
  "serde",
+]
+
+[[package]]
+name = "ehdb-reference"
+version = "0.1.0"
+dependencies = [
+ "ehdb-catalog",
+ "ehdb-core",
+ "ehdb-retrieval",
+ "ehdb-storage",
+ "ehdb-stream",
+ "ehdb-system",
+ "ehdb-transaction",
 ]
 
 [[package]]
