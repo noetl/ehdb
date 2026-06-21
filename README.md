@@ -23,6 +23,9 @@ ClickHouse.
   and retention semantics for NoETL execution state.
 - Support RAG primitives: documents, chunks, embedding metadata, vector
   index metadata, retrieval policy, tenant context, and lineage.
+- Store NoETL system WASM library manifests and environment/channel
+  bindings so system playbook functionality can be hot-replaced without
+  crate semantic-version churn.
 - Use Apache Arrow datatypes and Arrow IPC/Flight as native boundaries.
 - Store immutable analytical data files in S3, GCS, Azure Blob, and
   compatible object stores.
@@ -37,6 +40,7 @@ crates/
 |-- ehdb-storage   # object-store traits and local reference adapter
 |-- ehdb-stream    # stream logs, durable consumers, replay cursors
 |-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
+|-- ehdb-system    # system WASM library manifests and environment bindings
 `-- ehdb-transaction # transaction records, replay, local durable log
 ```
 
@@ -62,6 +66,26 @@ These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries
 once the metadata, stream, and NoETL integration contracts stabilize.
 
+## System WASM Libraries
+
+`ehdb-system` models NoETL system playbook functionality as compiled
+WASM libraries stored in EHDB. It mirrors NoETL's worker-side WASM
+dispatch shape: a system module resolves to `{ path, version, digest,
+entry }`, while EHDB owns the durable catalog side.
+
+The model separates:
+
+- Immutable module manifests: path, revision, digest, entry export,
+  target, object path, byte length, host capabilities, and transaction
+  provenance.
+- Mutable bindings: tenant, namespace, environment, channel, and path
+  resolving to a specific module revision/digest.
+
+That lets `kind`, `gke-prod`, `azure-dev`, or tenant-specific
+environments run different implementations smoothly. A stable channel
+can be rebound to a new digest/revision for a hot fix without changing
+the Rust crate version or forcing every caller to chase semver bumps.
+
 ## Developer Loop
 
 ```bash
@@ -76,10 +100,10 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~629 us |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~626 us |
 | `transaction_append_replay_1000` | 1000 transaction appends + full replay | ~1.04 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~454 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~457 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced JSONL appends + reopen + full replay | ~448 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~456 ms |
 
 ## Design
 

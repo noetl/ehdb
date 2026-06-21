@@ -6,10 +6,16 @@ use ehdb_core::{
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
+use ehdb_storage::ObjectPath;
 use ehdb_stream::{InMemoryStreamLog, RetentionPolicy, StreamConfig, Subject};
+use ehdb_system::{
+    BindSystemLibrary, EnvironmentName, InMemorySystemLibraryCatalog, ModuleDigest,
+    PublishSystemLibrary, ReleaseChannel, SystemCapability, SystemLibraryPath,
+    SystemLibraryRevision, WasmTarget,
+};
 use ehdb_transaction::{
     CatalogMutation, CommitTransaction, InMemoryTransactionLog, Mutation, RetrievalMutation,
-    StreamMutation,
+    StreamMutation, SystemMutation,
 };
 
 #[test]
@@ -19,6 +25,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
     let mut catalog = InMemoryCatalog::default();
     let mut streams = InMemoryStreamLog::default();
     let mut retrieval = InMemoryRetrievalCatalog::default();
+    let mut system = InMemorySystemLibraryCatalog::default();
     let mut transactions = InMemoryTransactionLog::default();
 
     let table = catalog
@@ -139,10 +146,62 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
         })
         .unwrap();
 
+    let system_path = SystemLibraryPath::new("system/catalog/bootstrap").unwrap();
+    let system_revision = SystemLibraryRevision::new(1).unwrap();
+    let system_digest = ModuleDigest::new(format!("sha256:{}1", "c".repeat(63))).unwrap();
+    let system_library = system
+        .publish(PublishSystemLibrary {
+            path: system_path.clone(),
+            revision: system_revision,
+            digest: system_digest.clone(),
+            entry: "run".to_string(),
+            target: WasmTarget::Wasm32UnknownUnknown,
+            object_path: ObjectPath::new("system-libraries/system/catalog/bootstrap/1/module.wasm")
+                .unwrap(),
+            byte_len: 512,
+            capabilities: vec![SystemCapability::EhdbCatalogWrite],
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
+        })
+        .unwrap();
+    system
+        .bind(BindSystemLibrary {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            environment: EnvironmentName::new("kind").unwrap(),
+            channel: ReleaseChannel::stable(),
+            path: system_path.clone(),
+            revision: system_revision,
+            digest: system_digest.clone(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
+        })
+        .unwrap();
+    let system_tx = transactions
+        .append(CommitTransaction {
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![
+                Mutation::System(SystemMutation::PublishLibrary {
+                    path: system_path.clone(),
+                    revision: system_revision,
+                    digest: system_digest.clone(),
+                }),
+                Mutation::System(SystemMutation::BindLibrary {
+                    path: system_path,
+                    environment: EnvironmentName::new("kind").unwrap(),
+                    channel: ReleaseChannel::stable(),
+                    revision: system_revision,
+                    digest: system_digest,
+                }),
+            ],
+        })
+        .unwrap();
+
     assert_eq!(
         transactions.replay(None),
-        vec![catalog_tx, stream_tx, retrieval_tx]
+        vec![catalog_tx, stream_tx, retrieval_tx, system_tx]
     );
+    assert_eq!(system_library.plugin_ref().entry, "run");
     assert_eq!(
         retrieval
             .find_chunks_containing(&tenant, &namespace, "lineage")

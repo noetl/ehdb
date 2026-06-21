@@ -199,6 +199,7 @@ name = "ehdb-storage"
 version = "0.1.0"
 dependencies = [
  "ehdb-core",
+ "serde",
 ]
 
 [[package]]
@@ -211,6 +212,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-system"
+version = "0.1.0"
+dependencies = [
+ "ehdb-core",
+ "ehdb-storage",
+ "serde",
+]
+
+[[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
 dependencies = [
@@ -218,7 +228,9 @@ dependencies = [
  "ehdb-catalog",
  "ehdb-core",
  "ehdb-retrieval",
+ "ehdb-storage",
  "ehdb-stream",
+ "ehdb-system",
  "serde",
  "serde_json",
 ]
