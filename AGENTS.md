@@ -6,10 +6,14 @@ Applies to the entire `ehdb` repository.
 
 ## Mission
 
-EHDB is the Event Horizon Database for NoETL: an Arrow-native
-distributed database and catalog platform for operational metadata,
-catalog state, and historical analytical data in multi-cloud object
-storage.
+EHDB is the Event Horizon Database for NoETL: an Arrow-native,
+NoETL-domain storage system for operational metadata, catalog state,
+event streams, RAG retrieval state, and historical analytical data.
+
+This is not a generic database project. Favor NoETL-specific storage
+semantics over broad database scope. The long-term target is to collapse
+NoETL's ordinary dependence on PostgreSQL, NATS JetStream, external
+object stores, Qdrant, and ClickHouse into EHDB-owned capabilities.
 
 ## Execution Model Boundary
 
@@ -33,6 +37,10 @@ protocols.
 - Rust-first implementation.
 - Treat Arrow datatypes as native schema primitives.
 - Keep catalog metadata transactional and first-class.
+- Treat stream logs, durable consumers, replay cursors, and retention as
+  EHDB-native design concerns.
+- Treat RAG documents, chunks, embeddings, vector-index metadata, tenant
+  context, and lineage as first-class NoETL storage concerns.
 - Keep object data immutable by default.
 - Add wiki updates with public architecture or workflow changes.
 - Avoid secrets, tokens, and tenant-sensitive values in examples.
