@@ -14,11 +14,14 @@ arrow-schema.workspace = true
 ehdb-core.workspace = true
 ehdb-reference.workspace = true
 ehdb-storage.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio.workspace = true
 
 [[bench]]
 name = "local_scan_service"

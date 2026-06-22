@@ -571,8 +571,11 @@ dependencies = [
  "ehdb-core",
  "ehdb-reference",
  "ehdb-storage",
+ "futures-util",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

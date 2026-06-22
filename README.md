@@ -176,6 +176,13 @@ against a decoded Arrow Flight ticket, returning `FlightData` messages.
 This is still a local service facade, not a network server or gateway
 read path.
 
+`LocalArrowFlightServer` is the first generated Arrow Flight service
+trait adapter. It implements `get_flight_info` and `do_get` over the
+local facade, maps EHDB errors to gRPC statuses, streams `FlightData`
+responses, and returns explicit unimplemented statuses for non-scan
+Flight methods. It does not bind a port, start a server runtime, add
+auth policy, or give the gateway direct storage access.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
