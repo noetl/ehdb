@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ehdb_storage::{
-    CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore, LocalObjectStore,
-    ObjectPath, ObjectPlacement, PlacementPolicy, PlacementTarget,
+    plan_replication, CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore,
+    LocalObjectStore, ObjectPath, ObjectPlacement, PlacementPolicy, PlacementTarget,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -71,6 +71,49 @@ fn bench_placement_policy_validate(c: &mut Criterion) {
     });
 }
 
+fn bench_replication_plan(c: &mut Criterion) {
+    c.bench_function("replication_plan_1000", |b| {
+        b.iter(|| {
+            for index in 0..1000 {
+                let shard = DataGravityShard::new(format!("tenant-a-system-{index}")).unwrap();
+                let source_placement = ObjectPlacement::new(
+                    GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
+                    shard.clone(),
+                );
+                let policy = PlacementPolicy::new(
+                    3,
+                    vec![
+                        PlacementTarget::primary(source_placement.clone()),
+                        PlacementTarget::replica(ObjectPlacement::new(
+                            GeoLocation::new(
+                                CloudProvider::Gcp,
+                                "us-central1",
+                                Some("us-central1-a"),
+                            )
+                            .unwrap(),
+                            shard.clone(),
+                        )),
+                        PlacementTarget::replica(ObjectPlacement::new(
+                            GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
+                            shard,
+                        )),
+                    ],
+                )
+                .unwrap();
+                let source = ehdb_storage::ObjectRef {
+                    path: ObjectPath::new(format!("tenant-a/system/table/part-{index}.arrow"))
+                        .unwrap(),
+                    len: 4096,
+                    digest: ehdb_storage::ObjectDigest::new(format!("sha256:{}", "b".repeat(64)))
+                        .unwrap(),
+                    placement: source_placement,
+                };
+                black_box(plan_replication(&source, &[], &policy).unwrap());
+            }
+        })
+    });
+}
+
 fn temp_root(name: &str) -> std::path::PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -86,6 +129,7 @@ fn temp_root(name: &str) -> std::path::PathBuf {
 criterion_group!(
     benches,
     bench_local_store_put_verified_get,
-    bench_placement_policy_validate
+    bench_placement_policy_validate,
+    bench_replication_plan
 );
 criterion_main!(benches);
