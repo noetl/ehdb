@@ -159,6 +159,11 @@ is still a contract fixture: there is no Flight server, client, SQL
 planner, predicate pushdown, distributed executor, or gateway direct
 read path yet.
 
+`ArrowScanResult` can now encode its batches into Arrow Flight
+`FlightData` messages and decode those messages back into a validated
+result. This proves the local result-stream contract for the future
+`do_get` path while remaining pre-network and pre-distributed.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over

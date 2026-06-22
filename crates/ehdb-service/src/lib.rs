@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_flight::{flight_descriptor::DescriptorType, FlightDescriptor, Ticket};
+use arrow_flight::{
+    flight_descriptor::DescriptorType,
+    utils::{batches_to_flight_data, flight_data_to_batches},
+    FlightData, FlightDescriptor, Ticket,
+};
 use arrow_schema::Schema;
 use ehdb_core::{EhdbError, NamespaceName, Result, TableName, TenantId};
 use ehdb_reference::{
@@ -109,6 +113,19 @@ impl ArrowScanResult {
             batches,
             row_count,
         })
+    }
+
+    pub fn to_flight_data(&self) -> Result<Vec<FlightData>> {
+        batches_to_flight_data(self.schema.as_ref(), self.batches.clone()).map_err(|err| {
+            EhdbError::InvalidState(format!("encode scan result flight data: {err}"))
+        })
+    }
+
+    pub fn from_flight_data(flight_data: &[FlightData]) -> Result<Self> {
+        let batches = flight_data_to_batches(flight_data).map_err(|err| {
+            EhdbError::InvalidState(format!("decode scan result flight data: {err}"))
+        })?;
+        Self::from_batches(batches)
     }
 }
 
@@ -335,6 +352,90 @@ mod tests {
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_round_trips_through_flight_data() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-data");
+        let result = LocalArrowScanService::default()
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanLatestTableRequest {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: None,
+                },
+            )
+            .unwrap();
+
+        let flight_data = result.to_flight_data().unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(flight_data.len(), 2);
+        assert_eq!(decoded.row_count, result.row_count);
+        assert_eq!(decoded.schema.as_ref(), result.schema.as_ref());
+        let execution_ids = decoded.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(2), "exec-3");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_data_preserves_projected_schema() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-data-projection");
+        let result = LocalArrowScanService::default()
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanLatestTableRequest {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: Some(vec!["execution_id".to_string()]),
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "attempt".to_string(),
+                        value: ArrowScalarValue::Int64(2),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let decoded = ArrowScanResult::from_flight_data(&result.to_flight_data().unwrap()).unwrap();
+
+        assert_eq!(decoded.row_count, 1);
+        assert_eq!(decoded.schema.fields().len(), 1);
+        assert_eq!(decoded.schema.field(0).name(), "execution_id");
+        let execution_ids = decoded.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_data_rejects_empty_streams() {
+        let error = ArrowScanResult::from_flight_data(&[]).unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn scan_result_flight_data_rejects_malformed_streams() {
+        let error = ArrowScanResult::from_flight_data(&[FlightData::default()]).unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidState(_)));
     }
 
     fn seeded_table(
