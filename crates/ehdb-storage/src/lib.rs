@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -300,6 +300,67 @@ impl From<ObjectRef> for ObjectReplica {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InMemoryObjectReplicaRegistry {
+    replicas: BTreeMap<String, BTreeMap<String, ObjectReplica>>,
+}
+
+impl InMemoryObjectReplicaRegistry {
+    pub fn register(&mut self, replica: ObjectReplica) -> Result<ObjectReplica> {
+        self.validate_against_existing(&replica)?;
+
+        let path_key = replica.path.as_str().to_string();
+        let placement_key = placement_key(&replica.placement);
+        self.replicas
+            .entry(path_key)
+            .or_default()
+            .entry(placement_key)
+            .or_insert_with(|| replica.clone());
+        Ok(replica)
+    }
+
+    pub fn replicas_for(&self, source: &ObjectRef) -> Result<Vec<ObjectReplica>> {
+        let Some(replicas) = self.replicas.get(source.path.as_str()) else {
+            return Ok(Vec::new());
+        };
+
+        let mut matching = Vec::with_capacity(replicas.len());
+        for replica in replicas.values() {
+            validate_replica_matches_source(source, replica)?;
+            matching.push(replica.clone());
+        }
+        Ok(matching)
+    }
+
+    pub fn plan_replication(
+        &self,
+        source: &ObjectRef,
+        policy: &PlacementPolicy,
+    ) -> Result<ReplicationPlan> {
+        let replicas = self.replicas_for(source)?;
+        plan_replication(source, &replicas, policy)
+    }
+
+    pub fn replica_count(&self) -> usize {
+        self.replicas.values().map(BTreeMap::len).sum()
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.replicas.len()
+    }
+
+    fn validate_against_existing(&self, replica: &ObjectReplica) -> Result<()> {
+        let Some(replicas) = self.replicas.get(replica.path.as_str()) else {
+            return Ok(());
+        };
+
+        for existing in replicas.values() {
+            validate_replica_matches_replica(existing, replica)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplicationAction {
     AlreadySatisfied {
@@ -349,30 +410,7 @@ pub fn plan_replication(
     let mut available = BTreeSet::new();
     available.insert(placement_key(&source.placement));
     for replica in current_replicas {
-        if replica.digest != source.digest {
-            return Err(EhdbError::Storage(format!(
-                "replica {} digest mismatch: expected {}, got {}",
-                replica.path.as_str(),
-                source.digest.as_str(),
-                replica.digest.as_str()
-            )));
-        }
-        if replica.len != source.len {
-            return Err(EhdbError::Storage(format!(
-                "replica {} length mismatch: expected {}, got {}",
-                replica.path.as_str(),
-                source.len,
-                replica.len
-            )));
-        }
-        if replica.placement.data_gravity_shard != source.placement.data_gravity_shard {
-            return Err(EhdbError::Storage(format!(
-                "replica {} shard mismatch: expected {}, got {}",
-                replica.path.as_str(),
-                source.placement.data_gravity_shard.as_str(),
-                replica.placement.data_gravity_shard.as_str()
-            )));
-        }
+        validate_replica_matches_source(source, replica)?;
         available.insert(placement_key(&replica.placement));
     }
 
@@ -538,6 +576,72 @@ fn placement_key(placement: &ObjectPlacement) -> String {
         placement.geo.region,
         placement.data_gravity_shard.as_str()
     )
+}
+
+fn validate_replica_matches_source(source: &ObjectRef, replica: &ObjectReplica) -> Result<()> {
+    if replica.path != source.path {
+        return Err(EhdbError::Storage(format!(
+            "replica path mismatch: expected {}, got {}",
+            source.path.as_str(),
+            replica.path.as_str()
+        )));
+    }
+    if replica.digest != source.digest {
+        return Err(EhdbError::Storage(format!(
+            "replica {} digest mismatch: expected {}, got {}",
+            replica.path.as_str(),
+            source.digest.as_str(),
+            replica.digest.as_str()
+        )));
+    }
+    if replica.len != source.len {
+        return Err(EhdbError::Storage(format!(
+            "replica {} length mismatch: expected {}, got {}",
+            replica.path.as_str(),
+            source.len,
+            replica.len
+        )));
+    }
+    if replica.placement.data_gravity_shard != source.placement.data_gravity_shard {
+        return Err(EhdbError::Storage(format!(
+            "replica {} shard mismatch: expected {}, got {}",
+            replica.path.as_str(),
+            source.placement.data_gravity_shard.as_str(),
+            replica.placement.data_gravity_shard.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_replica_matches_replica(
+    existing: &ObjectReplica,
+    incoming: &ObjectReplica,
+) -> Result<()> {
+    if incoming.digest != existing.digest {
+        return Err(EhdbError::Storage(format!(
+            "replica {} digest mismatch: expected {}, got {}",
+            incoming.path.as_str(),
+            existing.digest.as_str(),
+            incoming.digest.as_str()
+        )));
+    }
+    if incoming.len != existing.len {
+        return Err(EhdbError::Storage(format!(
+            "replica {} length mismatch: expected {}, got {}",
+            incoming.path.as_str(),
+            existing.len,
+            incoming.len
+        )));
+    }
+    if incoming.placement.data_gravity_shard != existing.placement.data_gravity_shard {
+        return Err(EhdbError::Storage(format!(
+            "replica {} shard mismatch: expected {}, got {}",
+            incoming.path.as_str(),
+            existing.placement.data_gravity_shard.as_str(),
+            incoming.placement.data_gravity_shard.as_str()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -808,6 +912,103 @@ mod tests {
             aws_primary(DataGravityShard::new("tenant-b-system").unwrap()),
         );
         assert!(plan_replication(&other_shard_source, &[], &policy).is_err());
+    }
+
+    #[test]
+    fn replica_registry_tracks_replicas_idempotently() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let replica = ObjectReplica {
+            path: source.path.clone(),
+            len: source.len,
+            digest: source.digest.clone(),
+            placement: gcp_replica(shard),
+        };
+        let mut registry = InMemoryObjectReplicaRegistry::default();
+
+        registry.register(replica.clone()).unwrap();
+        registry.register(replica).unwrap();
+
+        assert_eq!(registry.object_count(), 1);
+        assert_eq!(registry.replica_count(), 1);
+        assert_eq!(registry.replicas_for(&source).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replica_registry_rejects_conflicting_metadata() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let mut registry = InMemoryObjectReplicaRegistry::default();
+        registry.register(source.clone().into()).unwrap();
+
+        let mut bad_digest: ObjectReplica = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            gcp_replica(shard.clone()),
+        )
+        .into();
+        bad_digest.digest = ObjectDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap();
+        assert!(registry.register(bad_digest).is_err());
+
+        let mut bad_len: ObjectReplica = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            gcp_replica(shard.clone()),
+        )
+        .into();
+        bad_len.len += 1;
+        assert!(registry.register(bad_len).is_err());
+
+        let bad_shard: ObjectReplica = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            gcp_replica(DataGravityShard::new("tenant-b-system").unwrap()),
+        )
+        .into();
+        assert!(registry.register(bad_shard).is_err());
+    }
+
+    #[test]
+    fn replica_registry_feeds_replication_planning() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let policy = PlacementPolicy::new(
+            3,
+            vec![
+                PlacementTarget::primary(aws_primary(shard.clone())),
+                PlacementTarget::replica(gcp_replica(shard.clone())),
+                PlacementTarget::replica(azure_replica(shard.clone())),
+            ],
+        )
+        .unwrap();
+        let mut registry = InMemoryObjectReplicaRegistry::default();
+        registry
+            .register(ObjectReplica {
+                path: source.path.clone(),
+                len: source.len,
+                digest: source.digest.clone(),
+                placement: gcp_replica(shard),
+            })
+            .unwrap();
+
+        let plan = registry.plan_replication(&source, &policy).unwrap();
+
+        assert!(!plan.is_satisfied());
+        assert_eq!(plan.copy_count(), 1);
+        assert!(matches!(
+            plan.actions[1],
+            ReplicationAction::AlreadySatisfied { .. }
+        ));
+        assert!(matches!(
+            plan.actions[2],
+            ReplicationAction::CopyNeeded { .. }
+        ));
     }
 
     #[test]

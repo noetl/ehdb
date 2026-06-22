@@ -109,6 +109,12 @@ placement policy and emits deterministic actions: already satisfied
 placements or copy-needed targets. The plan is still metadata; future
 replicator workers can execute it without changing the gateway role.
 
+`InMemoryObjectReplicaRegistry` records durable replica inventory for
+the reference model. It keeps object path, byte length, digest, geo
+placement, and data-gravity shard together, rejects conflicting metadata
+for the same object path, and can feed `plan_replication` from registry
+state instead of caller-supplied arrays.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
@@ -127,7 +133,8 @@ metadata, and system library bindings.
 `ehdb-reference` applies replayed `TransactionRecord` values to the
 local reference catalogs. Transaction mutations carry enough durable
 facts to rebuild catalog tables, stream records, retrieval documents and
-embeddings, and system WASM library bindings from the log alone.
+embeddings, system WASM library bindings, and object replica inventory
+from the log alone.
 
 This keeps the reference implementation aligned with the NoETL rule
 that the event/transaction log is the source of truth. A replay mismatch
@@ -179,15 +186,17 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `replication_plan_1000` | 1000 three-target replication plans | ~2.92 ms |
-| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.19 ms |
+| `replication_plan_from_registry_1000` | 1000 three-target replication plans from registry state | ~3.82 ms |
+| `replication_plan_1000` | 1000 three-target replication plans | ~2.95 ms |
+| `replica_registry_register_1000` | 1000 object replica registrations | ~1.10 ms |
+| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.17 ms |
 | `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~1.98 ms |
-| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~15.7 ms |
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~626 us |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~16.0 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~635 us |
 | `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.16 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~516 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~554 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~540 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~509 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~507 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~516 ms |
 
 ## Design
 
