@@ -9,7 +9,7 @@ use ehdb_core::{
     ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result,
     SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
 };
-use ehdb_storage::{ObjectPath, ObjectRef};
+use ehdb_storage::{ObjectPath, ObjectRef, ObjectReplica};
 use ehdb_stream::{RetentionPolicy, Subject};
 use ehdb_system::{
     EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -40,6 +40,7 @@ pub enum Mutation {
     Stream(StreamMutation),
     Retrieval(RetrievalMutation),
     System(SystemMutation),
+    Storage(StorageMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +122,11 @@ pub enum SystemMutation {
         revision: SystemLibraryRevision,
         digest: ModuleDigest,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageMutation {
+    RegisterReplica { replica: ObjectReplica },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,7 +311,7 @@ mod tests {
     };
 
     use ehdb_core::{ColumnSchema, DataType};
-    use ehdb_storage::ObjectPath;
+    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectReplica};
     use ehdb_system::{SystemCapability, WasmTarget};
 
     use super::*;
@@ -471,6 +477,31 @@ mod tests {
                         digest,
                     }),
                 ],
+            })
+            .unwrap();
+
+        assert_eq!(log.replay(None), vec![record]);
+    }
+
+    #[test]
+    fn records_storage_replica_registration_mutation() {
+        let (tenant, namespace) = ids();
+        let mut log = InMemoryTransactionLog::default();
+        let replica = ObjectReplica {
+            path: ObjectPath::new("tenant-a/system/table/part-000.arrow").unwrap(),
+            len: 4096,
+            digest: ObjectDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            placement: ObjectPlacement::local_dev(),
+        };
+
+        let record = log
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-storage-0001").unwrap(),
+                tenant,
+                namespace,
+                mutations: vec![Mutation::Storage(StorageMutation::RegisterReplica {
+                    replica,
+                })],
             })
             .unwrap();
 

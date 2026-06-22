@@ -3,11 +3,12 @@ use ehdb_core::{EhdbError, Result};
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
+use ehdb_storage::InMemoryObjectReplicaRegistry;
 use ehdb_stream::{InMemoryStreamLog, StreamConfig, StreamSequence};
 use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
 use ehdb_transaction::{
     CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
-    StreamMutation, SystemMutation, TransactionRecord,
+    StorageMutation, StreamMutation, SystemMutation, TransactionRecord,
 };
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,7 @@ pub struct ReferenceDatabase {
     pub streams: InMemoryStreamLog,
     pub retrieval: InMemoryRetrievalCatalog,
     pub system: InMemorySystemLibraryCatalog,
+    pub storage: InMemoryObjectReplicaRegistry,
 }
 
 #[derive(Debug)]
@@ -81,6 +83,7 @@ impl ReferenceDatabase {
             Mutation::Stream(mutation) => self.apply_stream(record, mutation),
             Mutation::Retrieval(mutation) => self.apply_retrieval(record, mutation),
             Mutation::System(mutation) => self.apply_system(record, mutation),
+            Mutation::Storage(mutation) => self.apply_storage(mutation),
         }
     }
 
@@ -294,6 +297,14 @@ impl ReferenceDatabase {
                 .map(|_| ()),
         }
     }
+
+    fn apply_storage(&mut self, mutation: &StorageMutation) -> Result<()> {
+        match mutation {
+            StorageMutation::RegisterReplica { replica } => {
+                self.storage.register(replica.clone()).map(|_| ())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -307,7 +318,7 @@ mod tests {
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
         SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
     };
-    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef};
+    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef, ObjectReplica};
     use ehdb_stream::{RetentionPolicy, Subject};
     use ehdb_system::{
         EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -315,7 +326,7 @@ mod tests {
     };
     use ehdb_transaction::{
         CatalogMutation, CommitTransaction, InMemoryTransactionLog, Mutation, RetrievalMutation,
-        StreamMutation, SystemMutation,
+        StorageMutation, StreamMutation, SystemMutation,
     };
 
     use super::*;
@@ -384,6 +395,10 @@ mod tests {
         }
     }
 
+    fn object_replica(path: &str) -> ObjectReplica {
+        object_ref(path).into()
+    }
+
     #[test]
     fn local_runtime_appends_and_rebuilds_state_after_reopen() {
         let path = temp_log_path("runtime-restart");
@@ -428,6 +443,42 @@ mod tests {
         assert!(matches!(error, EhdbError::NotFound(_)));
         assert!(runtime.replay().is_empty());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn local_runtime_does_not_append_conflicting_replica_registration() {
+        let path = temp_log_path("runtime-storage-invalid");
+        let (tenant, namespace) = ids();
+        let object_path = "tenant-a/system/table/part-000.arrow";
+        let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-storage-0001").unwrap(),
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations: vec![Mutation::Storage(StorageMutation::RegisterReplica {
+                    replica: object_replica(object_path),
+                })],
+            })
+            .unwrap();
+
+        let mut conflicting = object_replica(object_path);
+        conflicting.digest = ObjectDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
+        let error = runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-storage-0002").unwrap(),
+                tenant,
+                namespace,
+                mutations: vec![Mutation::Storage(StorageMutation::RegisterReplica {
+                    replica: conflicting,
+                })],
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
+        assert_eq!(runtime.replay().len(), 1);
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -553,6 +604,17 @@ mod tests {
             ],
         })
         .unwrap();
+        log.append(CommitTransaction {
+            transaction_id: TransactionId::new("txn-0006").unwrap(),
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![Mutation::Storage(StorageMutation::RegisterReplica {
+                replica: object_replica(
+                    "tenant-a/system/tables/tenant-a_system_executions/snapshots/snapshot-0001/part-000.arrow",
+                ),
+            })],
+        })
+        .unwrap();
 
         let mut reference = ReferenceDatabase::default();
         let records = log.replay(None);
@@ -606,6 +668,8 @@ mod tests {
                 .value(),
             1
         );
+        assert_eq!(reference.storage.object_count(), 1);
+        assert_eq!(reference.storage.replica_count(), 1);
     }
 
     #[test]
