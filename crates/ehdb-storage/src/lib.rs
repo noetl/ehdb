@@ -281,6 +281,125 @@ pub struct ObjectRef {
     pub placement: ObjectPlacement,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectReplica {
+    pub path: ObjectPath,
+    pub len: u64,
+    pub digest: ObjectDigest,
+    pub placement: ObjectPlacement,
+}
+
+impl From<ObjectRef> for ObjectReplica {
+    fn from(object: ObjectRef) -> Self {
+        Self {
+            path: object.path,
+            len: object.len,
+            digest: object.digest,
+            placement: object.placement,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationAction {
+    AlreadySatisfied {
+        placement: ObjectPlacement,
+    },
+    CopyNeeded {
+        source: ObjectPlacement,
+        target: ObjectPlacement,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationPlan {
+    pub object_path: ObjectPath,
+    pub digest: ObjectDigest,
+    pub actions: Vec<ReplicationAction>,
+}
+
+impl ReplicationPlan {
+    pub fn is_satisfied(&self) -> bool {
+        self.actions
+            .iter()
+            .all(|action| matches!(action, ReplicationAction::AlreadySatisfied { .. }))
+    }
+
+    pub fn copy_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| matches!(action, ReplicationAction::CopyNeeded { .. }))
+            .count()
+    }
+}
+
+pub fn plan_replication(
+    source: &ObjectRef,
+    current_replicas: &[ObjectReplica],
+    policy: &PlacementPolicy,
+) -> Result<ReplicationPlan> {
+    if &source.placement.data_gravity_shard != policy.data_gravity_shard() {
+        return Err(EhdbError::Storage(format!(
+            "source data gravity shard {} does not match policy shard {}",
+            source.placement.data_gravity_shard.as_str(),
+            policy.data_gravity_shard().as_str()
+        )));
+    }
+
+    let mut available = BTreeSet::new();
+    available.insert(placement_key(&source.placement));
+    for replica in current_replicas {
+        if replica.digest != source.digest {
+            return Err(EhdbError::Storage(format!(
+                "replica {} digest mismatch: expected {}, got {}",
+                replica.path.as_str(),
+                source.digest.as_str(),
+                replica.digest.as_str()
+            )));
+        }
+        if replica.len != source.len {
+            return Err(EhdbError::Storage(format!(
+                "replica {} length mismatch: expected {}, got {}",
+                replica.path.as_str(),
+                source.len,
+                replica.len
+            )));
+        }
+        if replica.placement.data_gravity_shard != source.placement.data_gravity_shard {
+            return Err(EhdbError::Storage(format!(
+                "replica {} shard mismatch: expected {}, got {}",
+                replica.path.as_str(),
+                source.placement.data_gravity_shard.as_str(),
+                replica.placement.data_gravity_shard.as_str()
+            )));
+        }
+        available.insert(placement_key(&replica.placement));
+    }
+
+    let actions = policy
+        .targets()
+        .iter()
+        .map(|target| {
+            if available.contains(&placement_key(&target.placement)) {
+                ReplicationAction::AlreadySatisfied {
+                    placement: target.placement.clone(),
+                }
+            } else {
+                ReplicationAction::CopyNeeded {
+                    source: source.placement.clone(),
+                    target: target.placement.clone(),
+                }
+            }
+        })
+        .collect();
+
+    Ok(ReplicationPlan {
+        object_path: source.path.clone(),
+        digest: source.digest.clone(),
+        actions,
+    })
+}
+
 pub trait ImmutableObjectStore {
     fn put_if_absent(&self, path: ObjectPath, bytes: &[u8]) -> Result<ObjectRef>;
     fn get(&self, path: &ObjectPath) -> Result<Vec<u8>>;
@@ -504,6 +623,36 @@ mod tests {
         assert!(ObjectDigest::new("sha256:not-hex").is_err());
     }
 
+    fn aws_primary(shard: DataGravityShard) -> ObjectPlacement {
+        ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
+            shard,
+        )
+    }
+
+    fn gcp_replica(shard: DataGravityShard) -> ObjectPlacement {
+        ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a")).unwrap(),
+            shard,
+        )
+    }
+
+    fn azure_replica(shard: DataGravityShard) -> ObjectPlacement {
+        ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
+            shard,
+        )
+    }
+
+    fn placed_object(path: &str, placement: ObjectPlacement) -> ObjectRef {
+        ObjectRef {
+            path: ObjectPath::new(path).unwrap(),
+            len: 4096,
+            digest: ObjectDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
+            placement,
+        }
+    }
+
     #[test]
     fn validates_geo_location_and_data_gravity_shard() {
         let geo = GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap();
@@ -534,19 +683,9 @@ mod tests {
         let policy = PlacementPolicy::new(
             3,
             vec![
-                PlacementTarget::primary(ObjectPlacement::new(
-                    GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
-                    shard.clone(),
-                )),
-                PlacementTarget::replica(ObjectPlacement::new(
-                    GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a"))
-                        .unwrap(),
-                    shard.clone(),
-                )),
-                PlacementTarget::replica(ObjectPlacement::new(
-                    GeoLocation::new(CloudProvider::Azure, "eastus", Some("1")).unwrap(),
-                    shard.clone(),
-                )),
+                PlacementTarget::primary(aws_primary(shard.clone())),
+                PlacementTarget::replica(gcp_replica(shard.clone())),
+                PlacementTarget::replica(azure_replica(shard.clone())),
             ],
         )
         .unwrap();
@@ -559,14 +698,8 @@ mod tests {
     #[test]
     fn rejects_invalid_placement_policies() {
         let shard = DataGravityShard::new("tenant-a-system").unwrap();
-        let primary = PlacementTarget::primary(ObjectPlacement::new(
-            GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap(),
-            shard.clone(),
-        ));
-        let replica = PlacementTarget::replica(ObjectPlacement::new(
-            GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a")).unwrap(),
-            shard.clone(),
-        ));
+        let primary = PlacementTarget::primary(aws_primary(shard.clone()));
+        let replica = PlacementTarget::replica(gcp_replica(shard));
 
         assert!(PlacementPolicy::new(0, vec![primary.clone()]).is_err());
         assert!(PlacementPolicy::new(3, vec![primary.clone(), replica.clone()]).is_err());
@@ -579,6 +712,102 @@ mod tests {
             DataGravityShard::new("tenant-b-system").unwrap(),
         ));
         assert!(PlacementPolicy::new(2, vec![primary, other_shard_replica]).is_err());
+    }
+
+    #[test]
+    fn plans_missing_replication_targets() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let policy = PlacementPolicy::new(
+            3,
+            vec![
+                PlacementTarget::primary(aws_primary(shard.clone())),
+                PlacementTarget::replica(gcp_replica(shard.clone())),
+                PlacementTarget::replica(azure_replica(shard)),
+            ],
+        )
+        .unwrap();
+
+        let plan = plan_replication(&source, &[], &policy).unwrap();
+
+        assert!(!plan.is_satisfied());
+        assert_eq!(plan.copy_count(), 2);
+        assert!(matches!(
+            plan.actions[0],
+            ReplicationAction::AlreadySatisfied { .. }
+        ));
+        assert!(matches!(
+            plan.actions[1],
+            ReplicationAction::CopyNeeded { .. }
+        ));
+        assert!(matches!(
+            plan.actions[2],
+            ReplicationAction::CopyNeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn recognizes_satisfied_replication_policy() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let gcp = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            gcp_replica(shard.clone()),
+        );
+        let azure = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            azure_replica(shard.clone()),
+        );
+        let policy = PlacementPolicy::new(
+            3,
+            vec![
+                PlacementTarget::primary(aws_primary(shard.clone())),
+                PlacementTarget::replica(gcp_replica(shard.clone())),
+                PlacementTarget::replica(azure_replica(shard)),
+            ],
+        )
+        .unwrap();
+
+        let plan = plan_replication(&source, &[gcp.into(), azure.into()], &policy).unwrap();
+
+        assert!(plan.is_satisfied());
+        assert_eq!(plan.copy_count(), 0);
+    }
+
+    #[test]
+    fn rejects_replication_plan_with_mismatched_replicas() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let mut bad_replica = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            gcp_replica(shard.clone()),
+        );
+        bad_replica.digest = ObjectDigest::new(format!("sha256:{}", "c".repeat(64))).unwrap();
+        let policy = PlacementPolicy::new(
+            2,
+            vec![
+                PlacementTarget::primary(aws_primary(shard.clone())),
+                PlacementTarget::replica(gcp_replica(shard)),
+            ],
+        )
+        .unwrap();
+
+        assert!(plan_replication(&source, &[bad_replica.into()], &policy).is_err());
+
+        let other_shard_source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(DataGravityShard::new("tenant-b-system").unwrap()),
+        );
+        assert!(plan_replication(&other_shard_source, &[], &policy).is_err());
     }
 
     #[test]
