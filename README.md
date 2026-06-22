@@ -181,9 +181,9 @@ trait adapter. It implements `get_flight_info` and `do_get` over the
 local facade, maps EHDB errors to gRPC statuses, streams `FlightData`
 responses, and returns explicit unimplemented statuses for non-scan
 Flight methods. It enforces the configured request metadata auth policy
-on implemented scan methods, but it does not bind a port, start a
-daemon, implement TLS/external identity, or give the gateway direct
-storage access.
+and optional tenant/namespace scan scope policy on implemented scan
+methods, but it does not bind a port, start a daemon, implement
+TLS/external identity, or give the gateway direct storage access.
 
 `LocalArrowFlightServerConfig` adds the first bounded lifecycle
 configuration surface. It validates bind address, message sizes,
@@ -194,6 +194,14 @@ valid only for loopback local-reference use. The reference
 and non-empty token, then requires that token on scan calls. This is an
 auth-boundary contract for tests and local harnesses, not production
 TLS, identity federation, ACL enforcement, or gateway read routing.
+
+`FlightScanScopePolicy` adds the first tenant/namespace request scope
+guard for scan calls. When enabled, it requires `x-ehdb-tenant` and
+`x-ehdb-namespace` metadata to match the decoded scan request before
+the local scanner runs. Missing scope metadata returns
+`UNAUTHENTICATED`; mismatched scope metadata returns
+`PERMISSION_DENIED`. This is the metadata contract that future catalog
+ACL checks can attach to, not ACL enforcement by itself.
 
 `LocalArrowFlightListener` is a loopback-only reference harness behind
 that config. It binds an ephemeral or configured loopback address,
@@ -207,8 +215,9 @@ The loopback client smoke path starts that listener and connects with
 the Arrow Flight client over tonic/gRPC transport. It calls
 `get_flight_info`, follows the returned endpoint ticket with `do_get`,
 and decodes the returned Arrow batches. A second smoke path proves the
-same flow with the header-token auth policy enabled. This remains a
-local-reference test path, not a gateway integration.
+same flow with the header-token auth policy enabled, and a third proves
+tenant/namespace scope metadata over real tonic/gRPC transport. This
+remains a local-reference test path, not a gateway integration.
 
 ## Catalog Snapshots
 
