@@ -190,6 +190,14 @@ generated service with message limits applied. Unauthenticated mode is
 valid only for loopback local-reference use. This still does not bind a
 listener, run a daemon, implement TLS/auth, or route gateway reads.
 
+`LocalArrowFlightListener` is a loopback-only reference harness behind
+that config. It binds an ephemeral or configured loopback address,
+reports the actual local address, serves the generated Flight service,
+and exits through an explicit shutdown future. Non-loopback exposure,
+TLS/auth implementation, request scheduling, gateway integration, SQL
+planning, predicate pushdown, and distributed execution remain out of
+scope.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over

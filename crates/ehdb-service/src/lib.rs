@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
@@ -18,6 +18,8 @@ use ehdb_reference::{
 use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Request, Response, Status, Streaming};
 
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
@@ -96,6 +98,65 @@ impl LocalArrowFlightServerConfig {
     {
         self.validate()?;
         Ok(LocalArrowFlightServer::new(runtime, store).into_server_with_config(self))
+    }
+
+    pub async fn bind_loopback_listener<S>(
+        &self,
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+    ) -> Result<LocalArrowFlightListener<S>>
+    where
+        S: ImmutableObjectStore + Send + Sync + 'static,
+    {
+        self.validate()?;
+        if !self.bind_addr.ip().is_loopback() {
+            return Err(EhdbError::InvalidState(
+                "Flight listener harness only supports loopback binds".to_string(),
+            ));
+        }
+
+        let listener = TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|err| EhdbError::Storage(format!("bind Flight listener: {err}")))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|err| EhdbError::Storage(format!("read Flight listener address: {err}")))?;
+        let incoming = TcpIncoming::from_listener(listener, true, None)
+            .map_err(|err| EhdbError::Storage(format!("create Flight incoming stream: {err}")))?;
+        let service = self.build_service(runtime, store)?;
+
+        Ok(LocalArrowFlightListener {
+            local_addr,
+            incoming,
+            service,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalArrowFlightListener<S> {
+    local_addr: SocketAddr,
+    incoming: TcpIncoming,
+    service: FlightServiceServer<LocalArrowFlightServer<S>>,
+}
+
+impl<S> LocalArrowFlightListener<S>
+where
+    S: ImmutableObjectStore + Send + Sync + 'static,
+{
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub async fn serve_with_shutdown<F>(self, shutdown: F) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        Server::builder()
+            .add_service(self.service)
+            .serve_with_incoming_shutdown(self.incoming, shutdown)
+            .await
+            .map_err(|err| EhdbError::Storage(format!("serve Flight listener: {err}")))
     }
 }
 
@@ -486,7 +547,7 @@ mod tests {
             atomic::{AtomicU64, Ordering},
             Arc,
         },
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -1021,6 +1082,59 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn flight_listener_binds_loopback_and_shutdown_completes() {
+        let log_path = temp_log_path("local-flight-listener");
+        let object_root = temp_object_root("local-flight-listener");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let listener = LocalArrowFlightServerConfig::default()
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap();
+        let local_addr = listener.local_addr();
+
+        assert!(local_addr.ip().is_loopback());
+        assert_ne!(local_addr.port(), 0);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            listener.serve_with_shutdown(async {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn flight_listener_rejects_non_loopback_even_with_external_auth_policy() {
+        let log_path = temp_log_path("local-flight-listener-non-loopback");
+        let object_root = temp_object_root("local-flight-listener-non-loopback");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let config = LocalArrowFlightServerConfig {
+            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            auth_policy: FlightAuthPolicy::ExternalRequired,
+            ..LocalArrowFlightServerConfig::default()
+        };
+
+        let error = config
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
         assert!(!log_path.exists());
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
