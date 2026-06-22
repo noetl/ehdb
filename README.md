@@ -187,13 +187,22 @@ TLS/external identity, or give the gateway direct storage access.
 
 `LocalArrowFlightServerConfig` adds the first bounded lifecycle
 configuration surface. It validates bind address, message sizes,
-concurrency, auth policy, and access-log policy, then constructs the
-generated service with message limits applied. Unauthenticated mode is
-valid only for loopback local-reference use. The reference
+concurrency, auth policy, scan scope, scan grants, and access-log
+policy, then constructs the generated service with message limits
+applied. Unauthenticated mode is valid only for loopback local-reference
+use. The reference
 `HeaderToken` policy validates a lowercase ASCII metadata header name
 and non-empty token, then requires that token on scan calls. This is an
 auth-boundary contract for tests and local harnesses, not production
 TLS, identity federation, ACL enforcement, or gateway read routing.
+
+`FlightAccessLogPolicy` keeps scan access summaries bounded and
+DEBUG-only by default. `DebugOnly` emits structured summaries for
+decoded `get_flight_info` and `do_get` requests with method, gRPC code,
+row/message counts, projection count, predicate presence, and which
+metadata guards were required. It does not log tokens, principal values,
+tenant/table identifiers, object paths, predicate values, or Arrow
+payloads. `Disabled` emits no scan access summaries.
 
 `FlightScanScopePolicy` adds the first tenant/namespace request scope
 guard for scan calls. When enabled, it requires `x-ehdb-tenant` and
