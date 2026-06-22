@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
@@ -239,6 +239,7 @@ impl LocalArrowIpcTableStore {
                 namespace: namespace.clone(),
                 table_name: table_name.clone(),
                 projection: None,
+                predicate: None,
             },
         )
     }
@@ -250,6 +251,19 @@ pub struct ScanArrowSnapshot {
     pub namespace: NamespaceName,
     pub table_name: TableName,
     pub projection: Option<Vec<String>>,
+    pub predicate: Option<ArrowEqualityPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrowEqualityPredicate {
+    pub column: String,
+    pub value: ArrowScalarValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArrowScalarValue {
+    Utf8(String),
+    Int64(i64),
 }
 
 #[derive(Debug, Default)]
@@ -278,6 +292,11 @@ impl LocalArrowSnapshotScanner {
             .as_ref()
             .map(|columns| projection_indices(expected_schema.as_ref(), columns))
             .transpose()?;
+        let predicate = request
+            .predicate
+            .as_ref()
+            .map(|predicate| predicate_index(expected_schema.as_ref(), predicate))
+            .transpose()?;
 
         let mut batches = Vec::new();
         for object in &snapshot.files {
@@ -289,6 +308,7 @@ impl LocalArrowSnapshotScanner {
                         object.path.as_str()
                     )));
                 }
+                let batch = filter_batch(batch, predicate.as_ref())?;
                 batches.push(project_batch(batch, projection.as_deref())?);
             }
         }
@@ -612,6 +632,93 @@ fn projection_indices(schema: &Schema, columns: &[String]) -> Result<Vec<usize>>
                 .ok_or_else(|| EhdbError::NotFound(format!("projection column {column}")))
         })
         .collect()
+}
+
+fn predicate_index(
+    schema: &Schema,
+    predicate: &ArrowEqualityPredicate,
+) -> Result<(usize, ArrowScalarValue)> {
+    let index = schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == &predicate.column)
+        .ok_or_else(|| EhdbError::NotFound(format!("predicate column {}", predicate.column)))?;
+    Ok((index, predicate.value.clone()))
+}
+
+fn filter_batch(
+    batch: RecordBatch,
+    predicate: Option<&(usize, ArrowScalarValue)>,
+) -> Result<RecordBatch> {
+    let Some((column_index, value)) = predicate else {
+        return Ok(batch);
+    };
+    let keep = matching_row_indices(&batch, *column_index, value)?;
+    if keep.len() == batch.num_rows() {
+        return Ok(batch);
+    }
+
+    let arrays = batch
+        .columns()
+        .iter()
+        .map(|array| take_rows(array, &keep))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), arrays)
+        .map_err(|err| EhdbError::InvalidState(format!("arrow filter failed: {err}")))
+}
+
+fn matching_row_indices(
+    batch: &RecordBatch,
+    column_index: usize,
+    value: &ArrowScalarValue,
+) -> Result<Vec<usize>> {
+    let column = batch.column(column_index);
+    match value {
+        ArrowScalarValue::Utf8(expected) => {
+            let strings = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    EhdbError::InvalidState(
+                        "UTF-8 equality predicate requires a UTF-8 column".to_string(),
+                    )
+                })?;
+            Ok((0..strings.len())
+                .filter(|row| !strings.is_null(*row) && strings.value(*row) == expected)
+                .collect())
+        }
+        ArrowScalarValue::Int64(expected) => {
+            let ints = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    EhdbError::InvalidState(
+                        "Int64 equality predicate requires an Int64 column".to_string(),
+                    )
+                })?;
+            Ok((0..ints.len())
+                .filter(|row| !ints.is_null(*row) && ints.value(*row) == *expected)
+                .collect())
+        }
+    }
+}
+
+fn take_rows(array: &ArrayRef, rows: &[usize]) -> Result<ArrayRef> {
+    if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+        let values = rows
+            .iter()
+            .map(|row| strings.value(*row))
+            .collect::<Vec<_>>();
+        return Ok(Arc::new(StringArray::from(values)));
+    }
+    if let Some(ints) = array.as_any().downcast_ref::<Int64Array>() {
+        let values = rows.iter().map(|row| ints.value(*row)).collect::<Vec<_>>();
+        return Ok(Arc::new(Int64Array::from(values)));
+    }
+
+    Err(EhdbError::InvalidState(
+        "arrow filter supports UTF-8 and Int64 arrays only".to_string(),
+    ))
 }
 
 fn project_batch(batch: RecordBatch, projection: Option<&[usize]>) -> Result<RecordBatch> {
@@ -1135,6 +1242,7 @@ mod tests {
                     namespace: namespace.clone(),
                     table_name: table_name.clone(),
                     projection: Some(vec!["attempt".to_string(), "execution_id".to_string()]),
+                    predicate: None,
                 },
             )
             .unwrap();
@@ -1193,11 +1301,219 @@ mod tests {
                     namespace,
                     table_name,
                     projection: Some(vec!["missing".to_string()]),
+                    predicate: None,
                 },
             )
             .unwrap_err();
 
         assert!(matches!(error, EhdbError::NotFound(_)));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_filter_fixture_filters_utf8_equality() {
+        let log_path = temp_log_path("arrow-filter-utf8");
+        let object_root = temp_object_root("arrow-filter-utf8");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let batches = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    projection: None,
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "execution_id".to_string(),
+                        value: ArrowScalarValue::Utf8("exec-2".to_string()),
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let execution_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_filter_fixture_filters_int64_before_projection() {
+        let log_path = temp_log_path("arrow-filter-int64");
+        let object_root = temp_object_root("arrow-filter-int64");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let batches = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    projection: Some(vec!["execution_id".to_string()]),
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "attempt".to_string(),
+                        value: ArrowScalarValue::Int64(1),
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "execution_id");
+        let execution_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-1");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_filter_fixture_rejects_missing_predicate_column() {
+        let log_path = temp_log_path("arrow-filter-missing-column");
+        let object_root = temp_object_root("arrow-filter-missing-column");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let error = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "missing".to_string(),
+                        value: ArrowScalarValue::Utf8("value".to_string()),
+                    }),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::NotFound(_)));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_filter_fixture_rejects_type_mismatch() {
+        let log_path = temp_log_path("arrow-filter-type-mismatch");
+        let object_root = temp_object_root("arrow-filter-type-mismatch");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let error = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "attempt".to_string(),
+                        value: ArrowScalarValue::Utf8("1".to_string()),
+                    }),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
