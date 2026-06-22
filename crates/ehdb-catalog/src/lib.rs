@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use ehdb_core::{
-    EhdbError, NamespaceName, Result, SnapshotId, TableId, TableName, TableSchema, TenantId,
-    TransactionId,
+    EhdbError, NamespaceName, PrincipalId, Result, SnapshotId, TableId, TableName, TableSchema,
+    TenantId, TransactionId,
 };
 use ehdb_storage::ObjectRef;
 
@@ -24,6 +24,12 @@ struct TableIdentity {
 struct SnapshotKey {
     table: TableIdentity,
     snapshot: SnapshotId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScanGrantKey {
+    table: TableIdentity,
+    principal: PrincipalId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +54,15 @@ pub struct CatalogSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogScanGrant {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub table_id: TableId,
+    pub principal: PrincipalId,
+    pub granted_by: TransactionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTable {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -67,12 +82,22 @@ pub struct CommitSnapshot {
     pub transaction_id: TransactionId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantScan {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub table_id: TableId,
+    pub principal: PrincipalId,
+    pub transaction_id: TransactionId,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryCatalog {
     tables: BTreeMap<TableKey, CatalogTable>,
     tables_by_id: BTreeMap<TableIdentity, CatalogTable>,
     snapshots: BTreeMap<SnapshotKey, CatalogSnapshot>,
     latest_snapshots: BTreeMap<TableIdentity, SnapshotId>,
+    scan_grants: BTreeMap<ScanGrantKey, CatalogScanGrant>,
 }
 
 impl InMemoryCatalog {
@@ -229,6 +254,62 @@ impl InMemoryCatalog {
     pub fn snapshot_count(&self) -> usize {
         self.snapshots.len()
     }
+
+    pub fn grant_scan(&mut self, request: GrantScan) -> Result<CatalogScanGrant> {
+        let table = TableIdentity {
+            tenant: request.tenant.clone(),
+            namespace: request.namespace.clone(),
+            id: request.table_id.clone(),
+        };
+        if !self.tables_by_id.contains_key(&table) {
+            return Err(EhdbError::NotFound(format!(
+                "{}.{}.{}",
+                table.tenant, table.namespace, table.id
+            )));
+        }
+
+        let key = ScanGrantKey {
+            table,
+            principal: request.principal.clone(),
+        };
+        if self.scan_grants.contains_key(&key) {
+            return Err(EhdbError::AlreadyExists(format!(
+                "{}.{}.{}#{}",
+                key.table.tenant, key.table.namespace, key.table.id, key.principal
+            )));
+        }
+
+        let grant = CatalogScanGrant {
+            tenant: request.tenant,
+            namespace: request.namespace,
+            table_id: request.table_id,
+            principal: request.principal,
+            granted_by: request.transaction_id,
+        };
+        self.scan_grants.insert(key, grant.clone());
+        Ok(grant)
+    }
+
+    pub fn can_scan(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        table_id: &TableId,
+        principal: &PrincipalId,
+    ) -> bool {
+        self.scan_grants.contains_key(&ScanGrantKey {
+            table: TableIdentity {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                id: table_id.clone(),
+            },
+            principal: principal.clone(),
+        })
+    }
+
+    pub fn scan_grant_count(&self) -> usize {
+        self.scan_grants.len()
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +353,16 @@ mod tests {
             parent_snapshot: None,
             files: vec![object_ref("tenant-a/system/table/snapshot/part-000.arrow")],
             transaction_id: TransactionId::new(format!("txn-{snapshot_id}")).unwrap(),
+        }
+    }
+
+    fn grant_scan_request(table_id: TableId, principal: &str) -> GrantScan {
+        GrantScan {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("system").unwrap(),
+            table_id,
+            principal: PrincipalId::new(principal).unwrap(),
+            transaction_id: TransactionId::new(format!("txn-grant-{principal}")).unwrap(),
         }
     }
 
@@ -404,5 +495,48 @@ mod tests {
                 .id,
             SnapshotId::new("snapshot-0002").unwrap()
         );
+    }
+
+    #[test]
+    fn grants_and_checks_table_scan_access() {
+        let mut catalog = InMemoryCatalog::default();
+        let table = catalog.create_table(create_table_request()).unwrap();
+        let principal = PrincipalId::new("worker-system").unwrap();
+
+        let grant = catalog
+            .grant_scan(grant_scan_request(table.id.clone(), principal.as_str()))
+            .unwrap();
+
+        assert_eq!(grant.table_id, table.id);
+        assert_eq!(grant.principal, principal);
+        assert_eq!(catalog.scan_grant_count(), 1);
+        assert!(catalog.can_scan(&table.tenant, &table.namespace, &table.id, &grant.principal));
+        assert!(!catalog.can_scan(
+            &table.tenant,
+            &table.namespace,
+            &table.id,
+            &PrincipalId::new("worker-other").unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_scan_grants_for_missing_tables_and_duplicates() {
+        let mut catalog = InMemoryCatalog::default();
+        let missing = grant_scan_request(TableId::new("missing").unwrap(), "worker-system");
+        assert!(matches!(
+            catalog.grant_scan(missing).unwrap_err(),
+            EhdbError::NotFound(_)
+        ));
+
+        let table = catalog.create_table(create_table_request()).unwrap();
+        catalog
+            .grant_scan(grant_scan_request(table.id.clone(), "worker-system"))
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .grant_scan(grant_scan_request(table.id, "worker-system"))
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
     }
 }

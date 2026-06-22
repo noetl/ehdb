@@ -1,7 +1,7 @@
-use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
+use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
     ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
-    SnapshotId, StreamName, TableName, TableSchema, TenantId, TransactionId,
+    PrincipalId, SnapshotId, StreamName, TableName, TableSchema, TenantId, TransactionId,
 };
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
@@ -89,6 +89,28 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
         })
         .unwrap();
 
+    let scan_principal = PrincipalId::new("worker-system").unwrap();
+    let scan_grant = catalog
+        .grant_scan(GrantScan {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            table_id: table.id.clone(),
+            principal: scan_principal.clone(),
+            transaction_id: TransactionId::new("txn-0003").unwrap(),
+        })
+        .unwrap();
+    let grant_tx = transactions
+        .append(CommitTransaction {
+            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![Mutation::Catalog(CatalogMutation::GrantScan {
+                table_id: scan_grant.table_id.clone(),
+                principal: scan_grant.principal.clone(),
+            })],
+        })
+        .unwrap();
+
     let stream_name = StreamName::new("execution-events").unwrap();
     streams
         .create_stream(StreamConfig {
@@ -113,12 +135,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             &stream_name,
             Subject::new("noetl.execution.playbook.completed").unwrap(),
             b"{\"execution_id\":\"exec-1\"}".to_vec(),
-            TransactionId::new("txn-0003").unwrap(),
+            TransactionId::new("txn-0004").unwrap(),
         )
         .unwrap();
     let stream_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0003").unwrap(),
+            transaction_id: TransactionId::new("txn-0004").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![Mutation::Stream(StreamMutation::Publish {
@@ -137,7 +159,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             namespace: namespace.clone(),
             source_uri: "artifact://exec-1/result.md".to_string(),
             content_type: "text/markdown".to_string(),
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
         })
         .unwrap();
     let chunk = retrieval
@@ -147,7 +169,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             ordinal: 0,
             text: "EHDB stores NoETL lineage with retrieval metadata.".to_string(),
             checksum: "sha256-test".to_string(),
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
         })
         .unwrap();
     let embedding = retrieval
@@ -156,12 +178,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             model_id: EmbeddingModelId::new("embedding-model").unwrap(),
             dimensions: 3,
             vector: vec![0.1, 0.2, 0.3],
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
         })
         .unwrap();
     let retrieval_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0004").unwrap(),
+            transaction_id: TransactionId::new("txn-0005").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -201,7 +223,7 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
                 .unwrap(),
             byte_len: 512,
             capabilities: vec![SystemCapability::EhdbCatalogWrite],
-            transaction_id: TransactionId::new("txn-0005").unwrap(),
+            transaction_id: TransactionId::new("txn-0006").unwrap(),
         })
         .unwrap();
     system
@@ -213,12 +235,12 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
             path: system_path.clone(),
             revision: system_revision,
             digest: system_digest.clone(),
-            transaction_id: TransactionId::new("txn-0005").unwrap(),
+            transaction_id: TransactionId::new("txn-0006").unwrap(),
         })
         .unwrap();
     let system_tx = transactions
         .append(CommitTransaction {
-            transaction_id: TransactionId::new("txn-0005").unwrap(),
+            transaction_id: TransactionId::new("txn-0006").unwrap(),
             tenant: tenant.clone(),
             namespace: namespace.clone(),
             mutations: vec![
@@ -245,9 +267,17 @@ fn records_noetl_catalog_stream_and_retrieval_mutations_in_one_replayable_log() 
 
     assert_eq!(
         transactions.replay(None),
-        vec![catalog_tx, snapshot_tx, stream_tx, retrieval_tx, system_tx]
+        vec![
+            catalog_tx,
+            snapshot_tx,
+            grant_tx,
+            stream_tx,
+            retrieval_tx,
+            system_tx
+        ]
     );
     assert_eq!(catalog.snapshot_count(), 1);
+    assert!(catalog.can_scan(&tenant, &namespace, &table.id, &scan_principal));
     assert_eq!(system_library.plugin_ref().entry, "run");
     assert_eq!(
         retrieval

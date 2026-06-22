@@ -59,6 +59,7 @@ identifier_type!(TableName);
 identifier_type!(TableId);
 identifier_type!(SnapshotId);
 identifier_type!(TransactionId);
+identifier_type!(PrincipalId);
 identifier_type!(StreamName);
 identifier_type!(ConsumerName);
 identifier_type!(DocumentId);
