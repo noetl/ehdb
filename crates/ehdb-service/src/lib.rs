@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
@@ -21,6 +21,83 @@ use serde::{Deserialize, Serialize};
 use tonic::{Request, Response, Status, Streaming};
 
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
+pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightAuthPolicy {
+    DisabledForLocalReference,
+    ExternalRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightAccessLogPolicy {
+    Disabled,
+    DebugOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalArrowFlightServerConfig {
+    pub bind_addr: SocketAddr,
+    pub max_decoding_message_size: usize,
+    pub max_encoding_message_size: usize,
+    pub max_concurrent_requests: usize,
+    pub auth_policy: FlightAuthPolicy,
+    pub access_log_policy: FlightAccessLogPolicy,
+}
+
+impl Default for LocalArrowFlightServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            max_decoding_message_size: DEFAULT_FLIGHT_MAX_MESSAGE_SIZE,
+            max_encoding_message_size: DEFAULT_FLIGHT_MAX_MESSAGE_SIZE,
+            max_concurrent_requests: DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS,
+            auth_policy: FlightAuthPolicy::DisabledForLocalReference,
+            access_log_policy: FlightAccessLogPolicy::DebugOnly,
+        }
+    }
+}
+
+impl LocalArrowFlightServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_decoding_message_size == 0 {
+            return Err(EhdbError::InvalidState(
+                "Flight max decoding message size must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_encoding_message_size == 0 {
+            return Err(EhdbError::InvalidState(
+                "Flight max encoding message size must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err(EhdbError::InvalidState(
+                "Flight max concurrent requests must be greater than zero".to_string(),
+            ));
+        }
+        if self.auth_policy == FlightAuthPolicy::DisabledForLocalReference
+            && !self.bind_addr.ip().is_loopback()
+        {
+            return Err(EhdbError::InvalidState(
+                "unauthenticated Flight service config must bind to loopback".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn build_service<S>(
+        &self,
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+    ) -> Result<FlightServiceServer<LocalArrowFlightServer<S>>>
+    where
+        S: ImmutableObjectStore + Send + Sync + 'static,
+    {
+        self.validate()?;
+        Ok(LocalArrowFlightServer::new(runtime, store).into_server_with_config(self))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanLatestTableRequest {
@@ -254,6 +331,15 @@ where
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
         FlightServiceServer::new(self)
+    }
+
+    pub fn into_server_with_config(
+        self,
+        config: &LocalArrowFlightServerConfig,
+    ) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(self)
+            .max_decoding_message_size(config.max_decoding_message_size)
+            .max_encoding_message_size(config.max_encoding_message_size)
     }
 
     fn request_from_descriptor(descriptor: FlightDescriptor) -> Result<ScanLatestTableRequest> {
@@ -935,6 +1021,97 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn flight_server_config_defaults_to_bounded_loopback_reference() {
+        let config = LocalArrowFlightServerConfig::default();
+
+        config.validate().unwrap();
+        assert!(config.bind_addr.ip().is_loopback());
+        assert_eq!(
+            config.max_decoding_message_size,
+            DEFAULT_FLIGHT_MAX_MESSAGE_SIZE
+        );
+        assert_eq!(
+            config.max_encoding_message_size,
+            DEFAULT_FLIGHT_MAX_MESSAGE_SIZE
+        );
+        assert_eq!(
+            config.max_concurrent_requests,
+            DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(
+            config.auth_policy,
+            FlightAuthPolicy::DisabledForLocalReference
+        );
+        assert_eq!(config.access_log_policy, FlightAccessLogPolicy::DebugOnly);
+    }
+
+    #[test]
+    fn flight_server_config_rejects_unbounded_values() {
+        let zero_decode = LocalArrowFlightServerConfig {
+            max_decoding_message_size: 0,
+            ..LocalArrowFlightServerConfig::default()
+        };
+        assert!(matches!(
+            zero_decode.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let zero_encode = LocalArrowFlightServerConfig {
+            max_encoding_message_size: 0,
+            ..LocalArrowFlightServerConfig::default()
+        };
+        assert!(matches!(
+            zero_encode.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let zero_concurrency = LocalArrowFlightServerConfig {
+            max_concurrent_requests: 0,
+            ..LocalArrowFlightServerConfig::default()
+        };
+        assert!(matches!(
+            zero_concurrency.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn flight_server_config_requires_auth_for_non_loopback_binds() {
+        let mut config = LocalArrowFlightServerConfig {
+            bind_addr: "0.0.0.0:32010".parse().unwrap(),
+            ..LocalArrowFlightServerConfig::default()
+        };
+
+        assert!(matches!(config.validate(), Err(EhdbError::InvalidState(_))));
+
+        config.auth_policy = FlightAuthPolicy::ExternalRequired;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn flight_server_config_builds_generated_service_without_binding_listener() {
+        let log_path = temp_log_path("local-flight-server-config-build");
+        let object_root = temp_object_root("local-flight-server-config-build");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let config = LocalArrowFlightServerConfig {
+            max_decoding_message_size: 1024 * 1024,
+            max_encoding_message_size: 2 * 1024 * 1024,
+            max_concurrent_requests: 8,
+            ..LocalArrowFlightServerConfig::default()
+        };
+
+        let _server = config
+            .build_service(Arc::new(runtime), Arc::new(store))
+            .unwrap();
+
         assert!(!log_path.exists());
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
