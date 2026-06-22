@@ -130,6 +130,12 @@ and reads the latest snapshot back through verified object reads before
 decoding Arrow. This is not an Arrow Flight service yet; it proves the
 catalog/object boundary for columnar data.
 
+`LocalArrowSnapshotScanner` adds the first local scan fixture on top of
+that boundary. It resolves the latest table snapshot, verifies each
+Arrow IPC object before decoding, and can project named columns in the
+requested order. Predicate pushdown, SQL planning, distributed execution,
+and Arrow Flight remain future service surfaces.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
@@ -201,19 +207,20 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `local_arrow_ipc_table/write_read_10` | 10 Arrow IPC write + catalog snapshot + verified read cycles | ~123 ms |
-| `local_replication_executor/register_25` | 25 verified source reads + fsynced replica-registration transactions + reopen | ~155 ms |
-| `replication_plan_from_registry_1000` | 1000 three-target replication plans from registry state | ~3.76 ms |
-| `replication_plan_1000` | 1000 three-target replication plans | ~2.82 ms |
-| `replica_registry_register_1000` | 1000 object replica registrations | ~1.08 ms |
-| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.13 ms |
-| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~1.96 ms |
-| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~15.0 ms |
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~609 us |
-| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.17 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~530 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~491 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~502 ms |
+| `local_arrow_scan/project_latest_100` | 100 verified latest-snapshot scans with two-column projection | ~13.1 ms |
+| `local_arrow_ipc_table/write_read_10` | 10 Arrow IPC write + catalog snapshot + verified read cycles | ~107 ms |
+| `local_replication_executor/register_25` | 25 verified source reads + fsynced replica-registration transactions + reopen | ~133 ms |
+| `replication_plan_from_registry_1000` | 1000 three-target replication plans from registry state | ~3.86 ms |
+| `replication_plan_1000` | 1000 three-target replication plans | ~2.97 ms |
+| `replica_registry_register_1000` | 1000 object replica registrations | ~1.12 ms |
+| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.21 ms |
+| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~2.06 ms |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~16.4 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~793 us |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.22 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~562 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~443 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~517 ms |
 
 ## Design
 

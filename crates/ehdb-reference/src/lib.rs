@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
@@ -231,15 +231,53 @@ impl LocalArrowIpcTableStore {
         namespace: &NamespaceName,
         table_name: &TableName,
     ) -> Result<Vec<RecordBatch>> {
-        let table = runtime
-            .state()
-            .catalog
-            .get_table(tenant, namespace, table_name)?;
-        let snapshot = runtime
-            .state()
-            .catalog
-            .latest_snapshot(tenant, namespace, &table.id)?;
+        LocalArrowSnapshotScanner.scan_latest(
+            runtime,
+            store,
+            ScanArrowSnapshot {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                table_name: table_name.clone(),
+                projection: None,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanArrowSnapshot {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub table_name: TableName,
+    pub projection: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+pub struct LocalArrowSnapshotScanner;
+
+impl LocalArrowSnapshotScanner {
+    pub fn scan_latest<S: ImmutableObjectStore>(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        store: &S,
+        request: ScanArrowSnapshot,
+    ) -> Result<Vec<RecordBatch>> {
+        let table = runtime.state().catalog.get_table(
+            &request.tenant,
+            &request.namespace,
+            &request.table_name,
+        )?;
+        let snapshot = runtime.state().catalog.latest_snapshot(
+            &request.tenant,
+            &request.namespace,
+            &table.id,
+        )?;
         let expected_schema = arrow_schema_from_table(&table.schema);
+        let projection = request
+            .projection
+            .as_ref()
+            .map(|columns| projection_indices(expected_schema.as_ref(), columns))
+            .transpose()?;
 
         let mut batches = Vec::new();
         for object in &snapshot.files {
@@ -251,7 +289,7 @@ impl LocalArrowIpcTableStore {
                         object.path.as_str()
                     )));
                 }
-                batches.push(batch);
+                batches.push(project_batch(batch, projection.as_deref())?);
             }
         }
         Ok(batches)
@@ -561,6 +599,36 @@ fn arrow_schema_from_table(schema: &TableSchema) -> Arc<Schema> {
             })
             .collect::<Vec<_>>(),
     ))
+}
+
+fn projection_indices(schema: &Schema, columns: &[String]) -> Result<Vec<usize>> {
+    columns
+        .iter()
+        .map(|column| {
+            schema
+                .fields()
+                .iter()
+                .position(|field| field.name() == column)
+                .ok_or_else(|| EhdbError::NotFound(format!("projection column {column}")))
+        })
+        .collect()
+}
+
+fn project_batch(batch: RecordBatch, projection: Option<&[usize]>) -> Result<RecordBatch> {
+    let Some(indices) = projection else {
+        return Ok(batch);
+    };
+
+    let fields = indices
+        .iter()
+        .map(|index| batch.schema().field(*index).clone())
+        .collect::<Vec<_>>();
+    let arrays = indices
+        .iter()
+        .map(|index| batch.column(*index).clone() as ArrayRef)
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|err| EhdbError::InvalidState(format!("arrow projection failed: {err}")))
 }
 
 fn validate_plan_matches_source(source: &ObjectRef, plan: &ReplicationPlan) -> Result<()> {
@@ -1028,6 +1096,108 @@ mod tests {
                 .num_rows(),
             2
         );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_scan_fixture_projects_columns_in_order() {
+        let log_path = temp_log_path("arrow-scan-projection");
+        let object_root = temp_object_root("arrow-scan-projection");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let batches = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    projection: Some(vec!["attempt".to_string(), "execution_id".to_string()]),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "attempt");
+        assert_eq!(batches[0].schema().field(1).name(), "execution_id");
+        let attempts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let execution_ids = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(attempts.value(0), 1);
+        assert_eq!(execution_ids.value(1), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_scan_fixture_rejects_missing_projection_columns() {
+        let log_path = temp_log_path("arrow-scan-missing-projection");
+        let object_root = temp_object_root("arrow-scan-missing-projection");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let error = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: Some(vec!["missing".to_string()]),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::NotFound(_)));
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
