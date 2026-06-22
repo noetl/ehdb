@@ -551,6 +551,7 @@ mod tests {
     };
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_flight::FlightClient;
     use arrow_schema::{DataType, Field, Schema};
     use ehdb_core::{EhdbError, NamespaceName, SnapshotId, TableName, TenantId, TransactionId};
     use ehdb_reference::{
@@ -558,6 +559,8 @@ mod tests {
     };
     use ehdb_storage::LocalObjectStore;
     use futures_util::TryStreamExt;
+    use tokio::sync::oneshot;
+    use tonic::transport::Channel;
 
     use super::*;
 
@@ -1115,6 +1118,73 @@ mod tests {
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn flight_client_reads_scan_over_loopback_listener() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-client-smoke");
+        let listener = LocalArrowFlightServerConfig::default()
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(listener.serve_with_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = FlightClient::new(channel);
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+
+        let info = client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let batches = client
+            .do_get(endpoint_ticket)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "execution_id");
+        let execution_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-2");
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
     }
 
     #[tokio::test]
