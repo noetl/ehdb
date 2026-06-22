@@ -11,8 +11,9 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use ehdb_core::{NamespaceName, SnapshotId, StreamName, TableName, TenantId, TransactionId};
 use ehdb_reference::{
-    ExecuteReplication, LocalArrowIpcTableStore, LocalArrowSnapshotScanner, LocalReferenceRuntime,
-    LocalReplicationExecutor, ScanArrowSnapshot, WriteArrowIpcTable,
+    ArrowEqualityPredicate, ArrowScalarValue, ExecuteReplication, LocalArrowIpcTableStore,
+    LocalArrowSnapshotScanner, LocalReferenceRuntime, LocalReplicationExecutor, ScanArrowSnapshot,
+    WriteArrowIpcTable,
 };
 use ehdb_storage::{
     plan_replication, CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore,
@@ -192,7 +193,7 @@ fn bench_local_arrow_ipc_table(c: &mut Criterion) {
 fn bench_local_arrow_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("local_arrow_scan");
     group.sample_size(10);
-    group.bench_function("project_latest_100", |b| {
+    group.bench_function("filter_project_latest_100", |b| {
         b.iter(|| {
             let tenant = TenantId::new("tenant-a").unwrap();
             let namespace = NamespaceName::new("system").unwrap();
@@ -233,6 +234,10 @@ fn bench_local_arrow_scan(c: &mut Criterion) {
                                     "attempt".to_string(),
                                     "execution_id".to_string(),
                                 ]),
+                                predicate: Some(ArrowEqualityPredicate {
+                                    column: "execution_id".to_string(),
+                                    value: ArrowScalarValue::Utf8("exec-2".to_string()),
+                                }),
                             },
                         )
                         .unwrap(),
