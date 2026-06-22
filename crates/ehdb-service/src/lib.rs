@@ -3,8 +3,11 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_flight::{
     flight_descriptor::DescriptorType,
+    flight_service_server::{FlightService, FlightServiceServer},
     utils::{batches_to_flight_data, flight_data_to_batches},
-    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, IpcMessage, PollInfo, PutResult, SchemaAsIpc,
+    SchemaResult, Ticket,
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
@@ -13,7 +16,9 @@ use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
 use ehdb_storage::ImmutableObjectStore;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tonic::{Request, Response, Status, Streaming};
 
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
 
@@ -228,6 +233,165 @@ impl LocalArrowFlightService {
     }
 }
 
+#[derive(Debug)]
+pub struct LocalArrowFlightServer<S> {
+    runtime: Arc<LocalReferenceRuntime>,
+    store: Arc<S>,
+    service: LocalArrowFlightService,
+}
+
+impl<S> LocalArrowFlightServer<S>
+where
+    S: ImmutableObjectStore + Send + Sync + 'static,
+{
+    pub fn new(runtime: Arc<LocalReferenceRuntime>, store: Arc<S>) -> Self {
+        Self {
+            runtime,
+            store,
+            service: LocalArrowFlightService::default(),
+        }
+    }
+
+    pub fn into_server(self) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(self)
+    }
+
+    fn request_from_descriptor(descriptor: FlightDescriptor) -> Result<ScanLatestTableRequest> {
+        if descriptor.r#type != DescriptorType::Cmd as i32 {
+            return Err(EhdbError::InvalidState(
+                "EHDB scan get_flight_info requires a command descriptor".to_string(),
+            ));
+        }
+
+        ScanFlightTicket::decode(descriptor.cmd.as_ref()).map(ScanFlightTicket::into_request)
+    }
+}
+
+type FlightResponseStream<T> = BoxStream<'static, std::result::Result<T, Status>>;
+
+#[tonic::async_trait]
+impl<S> FlightService for LocalArrowFlightServer<S>
+where
+    S: ImmutableObjectStore + Send + Sync + 'static,
+{
+    type HandshakeStream = FlightResponseStream<HandshakeResponse>;
+    type ListFlightsStream = FlightResponseStream<FlightInfo>;
+    type DoGetStream = FlightResponseStream<FlightData>;
+    type DoPutStream = FlightResponseStream<PutResult>;
+    type DoActionStream = FlightResponseStream<arrow_flight::Result>;
+    type ListActionsStream = FlightResponseStream<ActionType>;
+    type DoExchangeStream = FlightResponseStream<FlightData>;
+
+    async fn handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight handshake is not implemented",
+        ))
+    }
+
+    async fn list_flights(
+        &self,
+        _request: Request<Criteria>,
+    ) -> std::result::Result<Response<Self::ListFlightsStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight list_flights is not implemented",
+        ))
+    }
+
+    async fn get_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let scan_request =
+            Self::request_from_descriptor(request.into_inner()).map_err(error_to_status)?;
+        let info = self
+            .service
+            .get_flight_info(&self.runtime, self.store.as_ref(), scan_request)
+            .map_err(error_to_status)?;
+        Ok(Response::new(info))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight poll_flight_info is not implemented",
+        ))
+    }
+
+    async fn get_schema(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<SchemaResult>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight get_schema is not implemented",
+        ))
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        let data = self
+            .service
+            .do_get(&self.runtime, self.store.as_ref(), request.get_ref())
+            .map_err(error_to_status)?;
+        Ok(Response::new(
+            stream::iter(data.into_iter().map(Ok)).boxed(),
+        ))
+    }
+
+    async fn do_put(
+        &self,
+        _request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight do_put is not implemented",
+        ))
+    }
+
+    async fn do_exchange(
+        &self,
+        _request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight do_exchange is not implemented",
+        ))
+    }
+
+    async fn do_action(
+        &self,
+        _request: Request<Action>,
+    ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight do_action is not implemented",
+        ))
+    }
+
+    async fn list_actions(
+        &self,
+        _request: Request<Empty>,
+    ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
+        Err(Status::unimplemented(
+            "EHDB Flight list_actions is not implemented",
+        ))
+    }
+}
+
+fn error_to_status(error: EhdbError) -> Status {
+    match error {
+        EhdbError::InvalidIdentifier(_) | EhdbError::InvalidState(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        EhdbError::NotFound(_) => Status::not_found(error.to_string()),
+        EhdbError::AlreadyExists(_) => Status::already_exists(error.to_string()),
+        EhdbError::Storage(_) => Status::internal(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -246,6 +410,7 @@ mod tests {
         ArrowScalarValue, LocalArrowIpcTableStore, LocalReferenceRuntime, WriteArrowIpcTable,
     };
     use ehdb_storage::LocalObjectStore;
+    use futures_util::TryStreamExt;
 
     use super::*;
 
@@ -655,6 +820,121 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, EhdbError::NotFound(_)));
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_get_flight_info_and_do_get_stream() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-server");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+        let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
+
+        let info = server
+            .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap()
+            .into_inner();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let flight_data = server
+            .do_get(Request::new(endpoint_ticket))
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(decoded.row_count, 1);
+        assert_eq!(decoded.schema.field(0).name(), "execution_id");
+        let execution_ids = decoded.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_rejects_non_command_descriptors() {
+        let log_path = temp_log_path("local-flight-server-path-descriptor");
+        let object_root = temp_object_root("local-flight-server-path-descriptor");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let descriptor = FlightDescriptor {
+            r#type: DescriptorType::Path as i32,
+            cmd: Vec::new().into(),
+            path: vec!["tenant-a".to_string(), "system".to_string()],
+        };
+
+        let error = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store))
+            .get_flight_info(Request::new(descriptor))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_rejects_malformed_do_get_tickets() {
+        let log_path = temp_log_path("local-flight-server-bad-ticket");
+        let object_root = temp_object_root("local-flight-server-bad-ticket");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let ticket = Ticket {
+            ticket: b"not-json".to_vec().into(),
+        };
+
+        let result = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store))
+            .do_get(Request::new(ticket))
+            .await;
+
+        match result {
+            Ok(_) => panic!("malformed tickets must fail"),
+            Err(error) => assert_eq!(error.code(), tonic::Code::InvalidArgument),
+        }
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_marks_unsupported_methods_unimplemented() {
+        let log_path = temp_log_path("local-flight-server-unimplemented");
+        let object_root = temp_object_root("local-flight-server-unimplemented");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
+
+        let error = server
+            .get_schema(Request::new(FlightDescriptor::default()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
         assert!(!log_path.exists());
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
