@@ -170,6 +170,12 @@ a command descriptor, one endpoint ticket, ordered result metadata, row
 count, and encoded byte count. It is metadata only; no Flight server or
 gateway data-touch path is introduced.
 
+`LocalArrowFlightService` ties those fixtures together in process. It
+can build `FlightInfo` for a latest-table scan and execute `do_get`
+against a decoded Arrow Flight ticket, returning `FlightData` messages.
+This is still a local service facade, not a network server or gateway
+read path.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
