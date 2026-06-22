@@ -571,6 +571,7 @@ dependencies = [
  "ehdb-core",
  "ehdb-reference",
  "ehdb-storage",
+ "ehdb-transaction",
  "futures-util",
  "serde",
  "serde_json",
