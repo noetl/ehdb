@@ -180,15 +180,20 @@ read path.
 trait adapter. It implements `get_flight_info` and `do_get` over the
 local facade, maps EHDB errors to gRPC statuses, streams `FlightData`
 responses, and returns explicit unimplemented statuses for non-scan
-Flight methods. It does not bind a port, start a server runtime, add
-auth policy, or give the gateway direct storage access.
+Flight methods. It enforces the configured request metadata auth policy
+on implemented scan methods, but it does not bind a port, start a
+daemon, implement TLS/external identity, or give the gateway direct
+storage access.
 
 `LocalArrowFlightServerConfig` adds the first bounded lifecycle
 configuration surface. It validates bind address, message sizes,
 concurrency, auth policy, and access-log policy, then constructs the
 generated service with message limits applied. Unauthenticated mode is
-valid only for loopback local-reference use. This still does not bind a
-listener, run a daemon, implement TLS/auth, or route gateway reads.
+valid only for loopback local-reference use. The reference
+`HeaderToken` policy validates a lowercase ASCII metadata header name
+and non-empty token, then requires that token on scan calls. This is an
+auth-boundary contract for tests and local harnesses, not production
+TLS, identity federation, ACL enforcement, or gateway read routing.
 
 `LocalArrowFlightListener` is a loopback-only reference harness behind
 that config. It binds an ephemeral or configured loopback address,
@@ -201,8 +206,9 @@ scope.
 The loopback client smoke path starts that listener and connects with
 the Arrow Flight client over tonic/gRPC transport. It calls
 `get_flight_info`, follows the returned endpoint ticket with `do_get`,
-and decodes the returned Arrow batches. This remains a local-reference
-test path, not a gateway integration.
+and decodes the returned Arrow batches. A second smoke path proves the
+same flow with the header-token auth policy enabled. This remains a
+local-reference test path, not a gateway integration.
 
 ## Catalog Snapshots
 
