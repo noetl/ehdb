@@ -183,6 +183,13 @@ responses, and returns explicit unimplemented statuses for non-scan
 Flight methods. It does not bind a port, start a server runtime, add
 auth policy, or give the gateway direct storage access.
 
+`LocalArrowFlightServerConfig` adds the first bounded lifecycle
+configuration surface. It validates bind address, message sizes,
+concurrency, auth policy, and access-log policy, then constructs the
+generated service with message limits applied. Unauthenticated mode is
+valid only for loopback local-reference use. This still does not bind a
+listener, run a daemon, implement TLS/auth, or route gateway reads.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
