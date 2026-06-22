@@ -26,6 +26,8 @@ use tonic::{Request, Response, Status, Streaming};
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
 pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
+pub const DEFAULT_FLIGHT_TENANT_SCOPE_HEADER: &str = "x-ehdb-tenant";
+pub const DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER: &str = "x-ehdb-namespace";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
@@ -101,6 +103,112 @@ impl FlightAuthPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightScanScopePolicy {
+    DisabledForLocalReference,
+    RequireTenantNamespace {
+        tenant_header_name: String,
+        namespace_header_name: String,
+    },
+}
+
+impl FlightScanScopePolicy {
+    pub fn require_default_tenant_namespace() -> Self {
+        Self::RequireTenantNamespace {
+            tenant_header_name: DEFAULT_FLIGHT_TENANT_SCOPE_HEADER.to_string(),
+            namespace_header_name: DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER.to_string(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::DisabledForLocalReference => Ok(()),
+            Self::RequireTenantNamespace {
+                tenant_header_name,
+                namespace_header_name,
+            } => {
+                FlightAuthPolicy::header_key(tenant_header_name).map_err(|err| {
+                    EhdbError::InvalidState(format!(
+                        "invalid Flight tenant scope header name: {err}"
+                    ))
+                })?;
+                FlightAuthPolicy::header_key(namespace_header_name).map_err(|err| {
+                    EhdbError::InvalidState(format!(
+                        "invalid Flight namespace scope header name: {err}"
+                    ))
+                })?;
+                if tenant_header_name == namespace_header_name {
+                    return Err(EhdbError::InvalidState(
+                        "Flight tenant and namespace scope headers must differ".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn authorize_scan_metadata(
+        &self,
+        metadata: &MetadataMap,
+        request: &ScanLatestTableRequest,
+    ) -> Option<Status> {
+        match self {
+            Self::DisabledForLocalReference => None,
+            Self::RequireTenantNamespace {
+                tenant_header_name,
+                namespace_header_name,
+            } => {
+                let tenant_key = match FlightAuthPolicy::header_key(tenant_header_name) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        return Some(Status::internal(
+                            "EHDB Flight tenant scope policy is invalid",
+                        ))
+                    }
+                };
+                let namespace_key = match FlightAuthPolicy::header_key(namespace_header_name) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        return Some(Status::internal(
+                            "EHDB Flight namespace scope policy is invalid",
+                        ))
+                    }
+                };
+
+                Self::match_metadata_scope(metadata, &tenant_key, "tenant", request.tenant.as_str())
+                    .or_else(|| {
+                        Self::match_metadata_scope(
+                            metadata,
+                            &namespace_key,
+                            "namespace",
+                            request.namespace.as_str(),
+                        )
+                    })
+            }
+        }
+    }
+
+    fn match_metadata_scope(
+        metadata: &MetadataMap,
+        key: &AsciiMetadataKey,
+        label: &str,
+        expected: &str,
+    ) -> Option<Status> {
+        let Some(value) = metadata.get(key) else {
+            return Some(Status::unauthenticated(format!(
+                "EHDB Flight {label} scope header is missing"
+            )));
+        };
+        if value.to_str().ok() == Some(expected) {
+            None
+        } else {
+            Some(Status::permission_denied(format!(
+                "EHDB Flight {label} scope does not match scan request"
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAccessLogPolicy {
     Disabled,
     DebugOnly,
@@ -113,6 +221,7 @@ pub struct LocalArrowFlightServerConfig {
     pub max_encoding_message_size: usize,
     pub max_concurrent_requests: usize,
     pub auth_policy: FlightAuthPolicy,
+    pub scan_scope_policy: FlightScanScopePolicy,
     pub access_log_policy: FlightAccessLogPolicy,
 }
 
@@ -124,6 +233,7 @@ impl Default for LocalArrowFlightServerConfig {
             max_encoding_message_size: DEFAULT_FLIGHT_MAX_MESSAGE_SIZE,
             max_concurrent_requests: DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS,
             auth_policy: FlightAuthPolicy::DisabledForLocalReference,
+            scan_scope_policy: FlightScanScopePolicy::DisabledForLocalReference,
             access_log_policy: FlightAccessLogPolicy::DebugOnly,
         }
     }
@@ -147,6 +257,7 @@ impl LocalArrowFlightServerConfig {
             ));
         }
         self.auth_policy.validate()?;
+        self.scan_scope_policy.validate()?;
         if self.auth_policy == FlightAuthPolicy::DisabledForLocalReference
             && !self.bind_addr.ip().is_loopback()
         {
@@ -166,10 +277,13 @@ impl LocalArrowFlightServerConfig {
         S: ImmutableObjectStore + Send + Sync + 'static,
     {
         self.validate()?;
-        Ok(
-            LocalArrowFlightServer::new_with_auth(runtime, store, self.auth_policy.clone())
-                .into_server_with_config(self),
+        Ok(LocalArrowFlightServer::new_with_policies(
+            runtime,
+            store,
+            self.auth_policy.clone(),
+            self.scan_scope_policy.clone(),
         )
+        .into_server_with_config(self))
     }
 
     pub async fn bind_loopback_listener<S>(
@@ -449,6 +563,7 @@ pub struct LocalArrowFlightServer<S> {
     store: Arc<S>,
     service: LocalArrowFlightService,
     auth_policy: FlightAuthPolicy,
+    scan_scope_policy: FlightScanScopePolicy,
 }
 
 impl<S> LocalArrowFlightServer<S>
@@ -464,11 +579,26 @@ where
         store: Arc<S>,
         auth_policy: FlightAuthPolicy,
     ) -> Self {
+        Self::new_with_policies(
+            runtime,
+            store,
+            auth_policy,
+            FlightScanScopePolicy::DisabledForLocalReference,
+        )
+    }
+
+    pub fn new_with_policies(
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+        auth_policy: FlightAuthPolicy,
+        scan_scope_policy: FlightScanScopePolicy,
+    ) -> Self {
         Self {
             runtime,
             store,
             service: LocalArrowFlightService::default(),
             auth_policy,
+            scan_scope_policy,
         }
     }
 
@@ -533,11 +663,17 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        if let Some(status) = self.auth_policy.authorize_metadata(request.metadata()) {
+        let (metadata, _extensions, descriptor) = request.into_parts();
+        if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
             return Err(status);
         }
-        let scan_request =
-            Self::request_from_descriptor(request.into_inner()).map_err(error_to_status)?;
+        let scan_request = Self::request_from_descriptor(descriptor).map_err(error_to_status)?;
+        if let Some(status) = self
+            .scan_scope_policy
+            .authorize_scan_metadata(&metadata, &scan_request)
+        {
+            return Err(status);
+        }
         let info = self
             .service
             .get_flight_info(&self.runtime, self.store.as_ref(), scan_request)
@@ -567,12 +703,22 @@ where
         &self,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
-        if let Some(status) = self.auth_policy.authorize_metadata(request.metadata()) {
+        let (metadata, _extensions, ticket) = request.into_parts();
+        if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
+            return Err(status);
+        }
+        let scan_request = ScanFlightTicket::from_arrow_ticket(&ticket)
+            .map(ScanFlightTicket::into_request)
+            .map_err(error_to_status)?;
+        if let Some(status) = self
+            .scan_scope_policy
+            .authorize_scan_metadata(&metadata, &scan_request)
+        {
             return Err(status);
         }
         let data = self
             .service
-            .do_get(&self.runtime, self.store.as_ref(), request.get_ref())
+            .do_get(&self.runtime, self.store.as_ref(), &ticket)
             .map_err(error_to_status)?;
         Ok(Response::new(
             stream::iter(data.into_iter().map(Ok)).boxed(),
@@ -1186,6 +1332,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_flight_server_enforces_scan_scope_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-server-scope");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+        let server = LocalArrowFlightServer::new_with_policies(
+            Arc::new(runtime),
+            Arc::new(store),
+            FlightAuthPolicy::DisabledForLocalReference,
+            FlightScanScopePolicy::require_default_tenant_namespace(),
+        );
+
+        let missing_error = server
+            .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong_scope = Request::new(ticket.command_descriptor().unwrap());
+        wrong_scope.metadata_mut().insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-b".parse().unwrap(),
+        );
+        wrong_scope.metadata_mut().insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "system".parse().unwrap(),
+        );
+        let wrong_error = server.get_flight_info(wrong_scope).await.unwrap_err();
+        assert_eq!(wrong_error.code(), tonic::Code::PermissionDenied);
+
+        let mut info_request = Request::new(ticket.command_descriptor().unwrap());
+        info_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-a".parse().unwrap(),
+        );
+        info_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "system".parse().unwrap(),
+        );
+        let info = server
+            .get_flight_info(info_request)
+            .await
+            .unwrap()
+            .into_inner();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+
+        match server.do_get(Request::new(endpoint_ticket.clone())).await {
+            Ok(_) => panic!("missing Flight scan scope metadata must fail"),
+            Err(error) => assert_eq!(error.code(), tonic::Code::Unauthenticated),
+        }
+
+        let mut do_get_request = Request::new(endpoint_ticket);
+        do_get_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-a".parse().unwrap(),
+        );
+        do_get_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "system".parse().unwrap(),
+        );
+        let flight_data = server
+            .do_get(do_get_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(decoded.row_count, 1);
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_flight_server_rejects_non_command_descriptors() {
         let log_path = temp_log_path("local-flight-server-path-descriptor");
         let object_root = temp_object_root("local-flight-server-path-descriptor");
@@ -1429,6 +1662,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_client_uses_scan_scope_metadata_over_loopback_listener() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-client-scope-smoke");
+        let config = LocalArrowFlightServerConfig {
+            scan_scope_policy: FlightScanScopePolicy::require_default_tenant_namespace(),
+            ..LocalArrowFlightServerConfig::default()
+        };
+        let listener = config
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(listener.serve_with_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+
+        let missing_error = FlightClient::new(channel.clone())
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap_err();
+        match missing_error {
+            arrow_flight::error::FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+            error => panic!("expected tonic unauthenticated error, got {error:?}"),
+        }
+
+        let mut wrong_client = FlightClient::new(channel.clone());
+        wrong_client
+            .add_header(DEFAULT_FLIGHT_TENANT_SCOPE_HEADER, "tenant-b")
+            .unwrap();
+        wrong_client
+            .add_header(DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER, "system")
+            .unwrap();
+        let wrong_error = wrong_client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap_err();
+        match wrong_error {
+            arrow_flight::error::FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            }
+            error => panic!("expected tonic permission denied error, got {error:?}"),
+        }
+
+        let mut client = FlightClient::new(channel);
+        client
+            .add_header(DEFAULT_FLIGHT_TENANT_SCOPE_HEADER, "tenant-a")
+            .unwrap();
+        client
+            .add_header(DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER, "system")
+            .unwrap();
+        let info = client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let batches = client
+            .do_get(endpoint_ticket)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn flight_listener_rejects_non_loopback_even_with_external_auth_policy() {
         let log_path = temp_log_path("local-flight-listener-non-loopback");
         let object_root = temp_object_root("local-flight-listener-non-loopback");
@@ -1473,6 +1805,10 @@ mod tests {
         assert_eq!(
             config.auth_policy,
             FlightAuthPolicy::DisabledForLocalReference
+        );
+        assert_eq!(
+            config.scan_scope_policy,
+            FlightScanScopePolicy::DisabledForLocalReference
         );
         assert_eq!(config.access_log_policy, FlightAccessLogPolicy::DebugOnly);
     }
@@ -1576,6 +1912,75 @@ mod tests {
         };
         assert!(matches!(
             control_token.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn flight_scan_scope_policy_validates_metadata() {
+        let policy = FlightScanScopePolicy::require_default_tenant_namespace();
+        let request = filtered_request();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-a".parse().unwrap(),
+        );
+        metadata.insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "system".parse().unwrap(),
+        );
+
+        policy.validate().unwrap();
+        assert!(policy
+            .authorize_scan_metadata(&metadata, &request)
+            .is_none());
+
+        let missing = policy
+            .authorize_scan_metadata(&MetadataMap::new(), &request)
+            .unwrap();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong_namespace = MetadataMap::new();
+        wrong_namespace.insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-a".parse().unwrap(),
+        );
+        wrong_namespace.insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "analytics".parse().unwrap(),
+        );
+        let wrong = policy
+            .authorize_scan_metadata(&wrong_namespace, &request)
+            .unwrap();
+        assert_eq!(wrong.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn flight_scan_scope_policy_rejects_invalid_contracts() {
+        let empty_tenant_header = FlightScanScopePolicy::RequireTenantNamespace {
+            tenant_header_name: String::new(),
+            namespace_header_name: DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER.to_string(),
+        };
+        assert!(matches!(
+            empty_tenant_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let binary_namespace_header = FlightScanScopePolicy::RequireTenantNamespace {
+            tenant_header_name: DEFAULT_FLIGHT_TENANT_SCOPE_HEADER.to_string(),
+            namespace_header_name: "x-ehdb-namespace-bin".to_string(),
+        };
+        assert!(matches!(
+            binary_namespace_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let duplicate_headers = FlightScanScopePolicy::RequireTenantNamespace {
+            tenant_header_name: DEFAULT_FLIGHT_TENANT_SCOPE_HEADER.to_string(),
+            namespace_header_name: DEFAULT_FLIGHT_TENANT_SCOPE_HEADER.to_string(),
+        };
+        assert!(matches!(
+            duplicate_headers.validate(),
             Err(EhdbError::InvalidState(_))
         ));
     }
