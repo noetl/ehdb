@@ -1,9 +1,12 @@
 use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
-use ehdb_core::{EhdbError, Result};
+use ehdb_core::{EhdbError, NamespaceName, Result, TenantId, TransactionId};
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
-use ehdb_storage::InMemoryObjectReplicaRegistry;
+use ehdb_storage::{
+    ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectRef, ObjectReplica,
+    ReplicationAction, ReplicationPlan,
+};
 use ehdb_stream::{InMemoryStreamLog, StreamConfig, StreamSequence};
 use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
 use ehdb_transaction::{
@@ -56,6 +59,60 @@ impl LocalReferenceRuntime {
 
     pub fn path(&self) -> &Path {
         self.log.path()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecuteReplication {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub transaction_id: TransactionId,
+    pub source: ObjectRef,
+    pub plan: ReplicationPlan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicationExecution {
+    pub registered: Vec<ObjectReplica>,
+    pub record: Option<TransactionRecord>,
+}
+
+#[derive(Debug, Default)]
+pub struct LocalReplicationExecutor;
+
+impl LocalReplicationExecutor {
+    pub fn execute<S: ImmutableObjectStore>(
+        &self,
+        runtime: &mut LocalReferenceRuntime,
+        store: &S,
+        request: ExecuteReplication,
+    ) -> Result<ReplicationExecution> {
+        validate_plan_matches_source(&request.source, &request.plan)?;
+
+        let replicas = replicas_to_register(&request.source, &request.plan)?;
+        if replicas.is_empty() {
+            return Ok(ReplicationExecution {
+                registered: Vec::new(),
+                record: None,
+            });
+        }
+
+        store.get_verified(&request.source)?;
+        let record = runtime.append(CommitTransaction {
+            transaction_id: request.transaction_id,
+            tenant: request.tenant,
+            namespace: request.namespace,
+            mutations: replicas
+                .iter()
+                .cloned()
+                .map(|replica| Mutation::Storage(StorageMutation::RegisterReplica { replica }))
+                .collect(),
+        })?;
+
+        Ok(ReplicationExecution {
+            registered: replicas,
+            record: Some(record),
+        })
     }
 }
 
@@ -307,10 +364,56 @@ impl ReferenceDatabase {
     }
 }
 
+fn validate_plan_matches_source(source: &ObjectRef, plan: &ReplicationPlan) -> Result<()> {
+    if plan.object_path != source.path {
+        return Err(EhdbError::InvalidState(format!(
+            "replication plan path mismatch: expected {}, got {}",
+            source.path.as_str(),
+            plan.object_path.as_str()
+        )));
+    }
+    if plan.digest != source.digest {
+        return Err(EhdbError::InvalidState(format!(
+            "replication plan digest mismatch: expected {}, got {}",
+            source.digest.as_str(),
+            plan.digest.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn replicas_to_register(source: &ObjectRef, plan: &ReplicationPlan) -> Result<Vec<ObjectReplica>> {
+    let mut replicas = Vec::new();
+    for action in &plan.actions {
+        match action {
+            ReplicationAction::AlreadySatisfied { .. } => {}
+            ReplicationAction::CopyNeeded {
+                source: action_source,
+                target,
+            } => {
+                if action_source != &source.placement {
+                    return Err(EhdbError::InvalidState(
+                        "replication action source placement does not match object source"
+                            .to_string(),
+                    ));
+                }
+                replicas.push(ObjectReplica {
+                    path: source.path.clone(),
+                    len: source.len,
+                    digest: source.digest.clone(),
+                    placement: target.clone(),
+                });
+            }
+        }
+    }
+    Ok(replicas)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -318,7 +421,11 @@ mod tests {
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
         SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
     };
-    use ehdb_storage::{ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef, ObjectReplica};
+    use ehdb_storage::{
+        plan_replication, CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore,
+        LocalObjectStore, ObjectDigest, ObjectPath, ObjectPlacement, ObjectRef, ObjectReplica,
+        PlacementPolicy, PlacementTarget,
+    };
     use ehdb_stream::{RetentionPolicy, Subject};
     use ehdb_system::{
         EnvironmentName, ModuleDigest, ReleaseChannel, SystemCapability, SystemLibraryPath,
@@ -347,6 +454,38 @@ mod tests {
             "ehdb-reference-{test_name}-{}-{suffix}.jsonl",
             std::process::id()
         ))
+    }
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_object_root(test_name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ehdb-reference-objects-{test_name}-{}-{suffix}-{counter}",
+            std::process::id()
+        ))
+    }
+
+    fn gcp_local_shard_replica() -> ObjectPlacement {
+        ObjectPlacement::new(
+            GeoLocation::new(CloudProvider::Gcp, "us-central1", Some("us-central1-a")).unwrap(),
+            DataGravityShard::local_dev(),
+        )
+    }
+
+    fn local_plus_gcp_policy() -> PlacementPolicy {
+        PlacementPolicy::new(
+            2,
+            vec![
+                PlacementTarget::primary(ObjectPlacement::local_dev()),
+                PlacementTarget::replica(gcp_local_shard_replica()),
+            ],
+        )
+        .unwrap()
     }
 
     fn create_table_commit(transaction_id: &str) -> CommitTransaction {
@@ -479,6 +618,122 @@ mod tests {
         assert_eq!(runtime.replay().len(), 1);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_replication_executor_records_copy_needed_replicas() {
+        let log_path = temp_log_path("replication-executor");
+        let object_root = temp_object_root("replication-executor");
+        let (tenant, namespace) = ids();
+        let store = LocalObjectStore::new(&object_root);
+        let source = store
+            .put_if_absent(
+                ObjectPath::new("tenant-a/system/table/part-000.arrow").unwrap(),
+                b"arrow-ipc-placeholder",
+            )
+            .unwrap();
+        let plan = plan_replication(&source, &[], &local_plus_gcp_policy()).unwrap();
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+        let execution = LocalReplicationExecutor
+            .execute(
+                &mut runtime,
+                &store,
+                ExecuteReplication {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    transaction_id: TransactionId::new("txn-replicate-0001").unwrap(),
+                    source: source.clone(),
+                    plan,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(execution.registered.len(), 1);
+        assert!(execution.record.is_some());
+        assert_eq!(runtime.state().storage.replica_count(), 1);
+        drop(runtime);
+
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        assert_eq!(reopened.state().storage.replica_count(), 1);
+        assert_eq!(
+            reopened
+                .state()
+                .storage
+                .plan_replication(&source, &local_plus_gcp_policy())
+                .unwrap()
+                .copy_count(),
+            0
+        );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_replication_executor_noops_satisfied_plan() {
+        let log_path = temp_log_path("replication-executor-noop");
+        let (tenant, namespace) = ids();
+        let source = object_ref("tenant-a/system/table/part-000.arrow");
+        let plan = plan_replication(&source, &[], &PlacementPolicy::local_dev()).unwrap();
+        let store = LocalObjectStore::new(temp_object_root("replication-executor-noop"));
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+        let execution = LocalReplicationExecutor
+            .execute(
+                &mut runtime,
+                &store,
+                ExecuteReplication {
+                    tenant,
+                    namespace,
+                    transaction_id: TransactionId::new("txn-replicate-0001").unwrap(),
+                    source,
+                    plan,
+                },
+            )
+            .unwrap();
+
+        assert!(execution.registered.is_empty());
+        assert!(execution.record.is_none());
+        assert!(runtime.replay().is_empty());
+        assert!(!log_path.exists());
+    }
+
+    #[test]
+    fn local_replication_executor_verifies_source_before_append() {
+        let log_path = temp_log_path("replication-executor-corrupt");
+        let object_root = temp_object_root("replication-executor-corrupt");
+        let (tenant, namespace) = ids();
+        let store = LocalObjectStore::new(&object_root);
+        let source = store
+            .put_if_absent(
+                ObjectPath::new("tenant-a/system/table/part-000.arrow").unwrap(),
+                b"arrow-ipc-placeholder",
+            )
+            .unwrap();
+        fs::write(object_root.join(source.path.as_str()), b"corrupt").unwrap();
+        let plan = plan_replication(&source, &[], &local_plus_gcp_policy()).unwrap();
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+        let error = LocalReplicationExecutor
+            .execute(
+                &mut runtime,
+                &store,
+                ExecuteReplication {
+                    tenant,
+                    namespace,
+                    transaction_id: TransactionId::new("txn-replicate-0001").unwrap(),
+                    source,
+                    plan,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
+        assert!(runtime.replay().is_empty());
+        assert!(!log_path.exists());
+
+        fs::remove_dir_all(object_root).unwrap();
     }
 
     #[test]
