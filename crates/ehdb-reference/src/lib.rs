@@ -7,7 +7,7 @@ use std::{
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
-use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
+use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
     ColumnSchema, EhdbError, NamespaceName, Result, SnapshotId, TableName, TableSchema, TenantId,
     TransactionId,
@@ -385,6 +385,19 @@ impl ReferenceDatabase {
                     snapshot_id: snapshot_id.clone(),
                     parent_snapshot: parent_snapshot.clone(),
                     files: files.clone(),
+                    transaction_id: record.transaction_id.clone(),
+                })
+                .map(|_| ()),
+            CatalogMutation::GrantScan {
+                table_id,
+                principal,
+            } => self
+                .catalog
+                .grant_scan(GrantScan {
+                    tenant: record.tenant.clone(),
+                    namespace: record.namespace.clone(),
+                    table_id: table_id.clone(),
+                    principal: principal.clone(),
                     transaction_id: record.transaction_id.clone(),
                 })
                 .map(|_| ()),
@@ -799,7 +812,8 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use ehdb_core::{
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
-        SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
+        PrincipalId, SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId,
+        TransactionId,
     };
     use ehdb_storage::{
         plan_replication, CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore,
@@ -920,6 +934,19 @@ mod tests {
         }
     }
 
+    fn grant_scan_commit(transaction_id: &str, principal: &str) -> CommitTransaction {
+        let (tenant, namespace) = ids();
+        CommitTransaction {
+            transaction_id: TransactionId::new(transaction_id).unwrap(),
+            tenant,
+            namespace,
+            mutations: vec![Mutation::Catalog(CatalogMutation::GrantScan {
+                table_id: TableId::new("tenant-a_system_executions").unwrap(),
+                principal: PrincipalId::new(principal).unwrap(),
+            })],
+        }
+    }
+
     fn object_ref(path: &str) -> ObjectRef {
         ObjectRef {
             path: ObjectPath::new(path).unwrap(),
@@ -939,18 +966,30 @@ mod tests {
         let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
         let record = runtime.append(create_table_commit("txn-0001")).unwrap();
         runtime.append(commit_snapshot_commit("txn-0002")).unwrap();
+        runtime
+            .append(grant_scan_commit("txn-0003", "worker-system"))
+            .unwrap();
 
         assert_eq!(record.sequence.value(), 1);
         assert_eq!(runtime.state().catalog.table_count(), 1);
         assert_eq!(runtime.state().catalog.snapshot_count(), 1);
-        assert_eq!(runtime.replay().len(), 2);
+        assert_eq!(runtime.state().catalog.scan_grant_count(), 1);
+        assert_eq!(runtime.replay().len(), 3);
         assert_eq!(runtime.path(), path.as_path());
         drop(runtime);
 
         let reopened = LocalReferenceRuntime::open(&path).unwrap();
+        let (tenant, namespace) = ids();
+        let table_id = TableId::new("tenant-a_system_executions").unwrap();
+        let principal = PrincipalId::new("worker-system").unwrap();
         assert_eq!(reopened.state().catalog.table_count(), 1);
         assert_eq!(reopened.state().catalog.snapshot_count(), 1);
-        assert_eq!(reopened.replay().len(), 2);
+        assert_eq!(reopened.state().catalog.scan_grant_count(), 1);
+        assert!(reopened
+            .state()
+            .catalog
+            .can_scan(&tenant, &namespace, &table_id, &principal));
+        assert_eq!(reopened.replay().len(), 3);
 
         fs::remove_file(path).unwrap();
     }

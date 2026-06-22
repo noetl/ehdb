@@ -6,8 +6,8 @@ use std::{
 };
 
 use ehdb_core::{
-    ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result,
-    SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
+    ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, PrincipalId,
+    Result, SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
 };
 use ehdb_storage::{ObjectPath, ObjectRef, ObjectReplica};
 use ehdb_stream::{RetentionPolicy, Subject};
@@ -55,6 +55,10 @@ pub enum CatalogMutation {
         snapshot_id: SnapshotId,
         parent_snapshot: Option<SnapshotId>,
         files: Vec<ObjectRef>,
+    },
+    GrantScan {
+        table_id: TableId,
+        principal: PrincipalId,
     },
 }
 
@@ -501,6 +505,26 @@ mod tests {
                 namespace,
                 mutations: vec![Mutation::Storage(StorageMutation::RegisterReplica {
                     replica,
+                })],
+            })
+            .unwrap();
+
+        assert_eq!(log.replay(None), vec![record]);
+    }
+
+    #[test]
+    fn records_catalog_scan_grant_mutation() {
+        let (tenant, namespace) = ids();
+        let mut log = InMemoryTransactionLog::default();
+
+        let record = log
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-grant-scan-0001").unwrap(),
+                tenant,
+                namespace,
+                mutations: vec![Mutation::Catalog(CatalogMutation::GrantScan {
+                    table_id: TableId::new("tenant-a_system_executions").unwrap(),
+                    principal: PrincipalId::new("worker-system").unwrap(),
                 })],
             })
             .unwrap();

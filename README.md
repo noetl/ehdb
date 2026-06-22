@@ -219,7 +219,7 @@ same flow with the header-token auth policy enabled, and a third proves
 tenant/namespace scope metadata over real tonic/gRPC transport. This
 remains a local-reference test path, not a gateway integration.
 
-## Catalog Snapshots
+## Catalog Snapshots And Scan Grants
 
 `ehdb-catalog` stores immutable table snapshot metadata over
 content-checked object references. A snapshot carries a snapshot ID,
@@ -231,6 +231,16 @@ empty file sets, duplicate snapshots, and parent-chain mismatches.
 through the transaction log, and `ehdb-reference` rebuilds latest table
 snapshot state from replay alongside catalog tables, streams, retrieval
 metadata, and system library bindings.
+
+`CatalogScanGrant` adds the first durable catalog-side scan grant
+reference model. A grant ties a tenant, namespace, table ID, principal,
+and granting transaction together, and `InMemoryCatalog::can_scan`
+answers whether that principal has scan access to the table. The
+reference catalog rejects grants for missing tables and duplicate grants.
+`CatalogMutation::GrantScan` makes the metadata replayable through
+`ehdb-reference` and `LocalReferenceRuntime`. This is ACL metadata only;
+production IAM, policy evaluation, and service enforcement remain future
+surfaces.
 
 ## Replay Reference
 
