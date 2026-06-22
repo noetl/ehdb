@@ -171,19 +171,20 @@ count, and encoded byte count. It is metadata only; no Flight server or
 gateway data-touch path is introduced.
 
 `LocalArrowFlightService` ties those fixtures together in process. It
-can build `FlightInfo` for a latest-table scan and execute `do_get`
-against a decoded Arrow Flight ticket, returning `FlightData` messages.
-This is still a local service facade, not a network server or gateway
-read path.
+can build `FlightInfo`, return `SchemaResult`, and execute `do_get` for
+a latest-table scan against the same decoded Arrow Flight ticket
+contract. This is still a local service facade, not a network server,
+SQL planner, or gateway read path.
 
 `LocalArrowFlightServer` is the first generated Arrow Flight service
-trait adapter. It implements `get_flight_info` and `do_get` over the
-local facade, maps EHDB errors to gRPC statuses, streams `FlightData`
-responses, and returns explicit unimplemented statuses for non-scan
-Flight methods. It enforces the configured request metadata auth policy
-and optional tenant/namespace scan scope policy on implemented scan
-methods, but it does not bind a port, start a daemon, implement
-TLS/external identity, or give the gateway direct storage access.
+trait adapter. It implements `get_flight_info`, `get_schema`, and
+`do_get` over the local facade, maps EHDB errors to gRPC statuses,
+streams `FlightData` responses, and returns explicit unimplemented
+statuses for non-scan Flight methods. It enforces the configured request
+metadata auth policy and optional tenant/namespace scan scope policy on
+implemented scan methods, but it does not bind a port, start a daemon,
+implement TLS/external identity, or give the gateway direct storage
+access.
 
 `LocalArrowFlightServerConfig` adds the first bounded lifecycle
 configuration surface. It validates bind address, message sizes,
@@ -198,11 +199,12 @@ TLS, identity federation, ACL enforcement, or gateway read routing.
 
 `FlightAccessLogPolicy` keeps scan access summaries bounded and
 DEBUG-only by default. `DebugOnly` emits structured summaries for
-decoded `get_flight_info` and `do_get` requests with method, gRPC code,
-row/message counts, projection count, predicate presence, and which
-metadata guards were required. It does not log tokens, principal values,
-tenant/table identifiers, object paths, predicate values, or Arrow
-payloads. `Disabled` emits no scan access summaries.
+decoded `get_flight_info`, `get_schema`, and `do_get` requests with
+method, gRPC code, row/message counts, projection count, predicate
+presence, and which metadata guards were required. It does not log
+tokens, principal values, tenant/table identifiers, object paths,
+predicate values, or Arrow payloads. `Disabled` emits no scan access
+summaries.
 
 `FlightScanScopePolicy` adds the first tenant/namespace request scope
 guard for scan calls. When enabled, it requires `x-ehdb-tenant` and
