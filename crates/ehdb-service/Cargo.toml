@@ -17,11 +17,11 @@ ehdb-storage.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tokio.workspace = true
 
 [[bench]]
 name = "local_scan_service"
