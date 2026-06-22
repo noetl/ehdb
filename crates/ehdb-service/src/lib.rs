@@ -315,6 +315,7 @@ pub enum FlightAccessLogPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlightScanCall {
     GetFlightInfo,
+    GetSchema,
     DoGet,
 }
 
@@ -322,6 +323,7 @@ impl FlightScanCall {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::GetFlightInfo => "get_flight_info",
+            Self::GetSchema => "get_schema",
             Self::DoGet => "do_get",
         }
     }
@@ -674,6 +676,13 @@ fn schema_ipc_bytes(schema: &Schema) -> Result<Vec<u8>> {
     Ok(message.0.to_vec())
 }
 
+fn schema_result_from_schema(schema: &Schema) -> Result<SchemaResult> {
+    let options = IpcWriteOptions::default();
+    SchemaAsIpc::new(schema, &options)
+        .try_into()
+        .map_err(|err| EhdbError::InvalidState(format!("encode flight schema result: {err}")))
+}
+
 fn total_flight_data_bytes(stream: &[FlightData]) -> Result<i64> {
     let total: usize = stream
         .iter()
@@ -725,6 +734,16 @@ impl LocalArrowFlightService {
         let ticket = ScanFlightTicket::new(request.clone());
         let result = self.scan.scan_latest(runtime, store, request)?;
         result.to_flight_info(&ticket)
+    }
+
+    pub fn get_schema<S: ImmutableObjectStore>(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        store: &S,
+        request: ScanLatestTableRequest,
+    ) -> Result<SchemaResult> {
+        let result = self.scan.scan_latest(runtime, store, request)?;
+        schema_result_from_schema(result.schema.as_ref())
     }
 
     pub fn do_get<S: ImmutableObjectStore>(
@@ -864,7 +883,7 @@ where
     fn request_from_descriptor(descriptor: FlightDescriptor) -> Result<ScanLatestTableRequest> {
         if descriptor.r#type != DescriptorType::Cmd as i32 {
             return Err(EhdbError::InvalidState(
-                "EHDB scan get_flight_info requires a command descriptor".to_string(),
+                "EHDB scan Flight descriptor requires a command descriptor".to_string(),
             ));
         }
 
@@ -979,11 +998,65 @@ where
 
     async fn get_schema(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented(
-            "EHDB Flight get_schema is not implemented",
-        ))
+        let (metadata, _extensions, descriptor) = request.into_parts();
+        if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
+            return Err(status);
+        }
+        let scan_request = Self::request_from_descriptor(descriptor).map_err(error_to_status)?;
+        if let Some(status) = self
+            .scan_scope_policy
+            .authorize_scan_metadata(&metadata, &scan_request)
+        {
+            self.log_scan_access(
+                FlightScanCall::GetSchema,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
+            return Err(status);
+        }
+        if let Some(status) =
+            self.scan_grant_policy
+                .authorize_catalog_grant(&metadata, &self.runtime, &scan_request)
+        {
+            self.log_scan_access(
+                FlightScanCall::GetSchema,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
+            return Err(status);
+        }
+        let schema =
+            match self
+                .service
+                .get_schema(&self.runtime, self.store.as_ref(), scan_request.clone())
+            {
+                Ok(schema) => schema,
+                Err(error) => {
+                    let status = error_to_status(error);
+                    self.log_scan_access(
+                        FlightScanCall::GetSchema,
+                        &scan_request,
+                        status.code(),
+                        None,
+                        None,
+                    );
+                    return Err(status);
+                }
+            };
+        self.log_scan_access(
+            FlightScanCall::GetSchema,
+            &scan_request,
+            Code::Ok,
+            None,
+            None,
+        );
+        Ok(Response::new(schema))
     }
 
     async fn do_get(
@@ -1461,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn local_flight_service_returns_info_and_do_get_stream() {
+    fn local_flight_service_returns_info_schema_and_do_get_stream() {
         let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
             seeded_table("local-flight-service");
         let request = ScanLatestTableRequest {
@@ -1476,11 +1549,19 @@ mod tests {
         };
         let service = LocalArrowFlightService::default();
 
-        let info = service.get_flight_info(&runtime, &store, request).unwrap();
+        let schema_result = service
+            .get_schema(&runtime, &store, request.clone())
+            .unwrap();
+        let schema: Schema = schema_result.try_into().unwrap();
+        let info = service
+            .get_flight_info(&runtime, &store, request.clone())
+            .unwrap();
         let endpoint_ticket = info.endpoint[0].ticket.as_ref().unwrap();
         let flight_data = service.do_get(&runtime, &store, endpoint_ticket).unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(decoded.row_count, 1);
         assert_eq!(decoded.schema.field(0).name(), "execution_id");
@@ -1542,7 +1623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_flight_server_get_flight_info_and_do_get_stream() {
+    async fn local_flight_server_get_schema_info_and_do_get_stream() {
         let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
             seeded_table("local-flight-server");
         let request = ScanLatestTableRequest {
@@ -1558,6 +1639,12 @@ mod tests {
         let ticket = ScanFlightTicket::new(request);
         let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
 
+        let schema_result = server
+            .get_schema(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap()
+            .into_inner();
+        let schema: Schema = schema_result.try_into().unwrap();
         let info = server
             .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
             .await
@@ -1574,6 +1661,8 @@ mod tests {
             .unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(decoded.row_count, 1);
         assert_eq!(decoded.schema.field(0).name(), "execution_id");
@@ -1617,6 +1706,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+        let missing_schema_error = server
+            .get_schema(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_schema_error.code(), tonic::Code::Unauthenticated);
 
         let mut wrong_request = Request::new(ticket.command_descriptor().unwrap());
         wrong_request
@@ -1625,6 +1719,17 @@ mod tests {
         let wrong_error = server.get_flight_info(wrong_request).await.unwrap_err();
         assert_eq!(wrong_error.code(), tonic::Code::Unauthenticated);
 
+        let mut schema_request = Request::new(ticket.command_descriptor().unwrap());
+        schema_request
+            .metadata_mut()
+            .insert("x-ehdb-auth", "local-secret".parse().unwrap());
+        let schema: Schema = server
+            .get_schema(schema_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_into()
+            .unwrap();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request
             .metadata_mut()
@@ -1655,6 +1760,7 @@ mod tests {
             .unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(decoded.row_count, 1);
 
@@ -1689,6 +1795,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+        let missing_schema_error = server
+            .get_schema(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_schema_error.code(), tonic::Code::Unauthenticated);
 
         let mut wrong_scope = Request::new(ticket.command_descriptor().unwrap());
         wrong_scope.metadata_mut().insert(
@@ -1702,6 +1813,22 @@ mod tests {
         let wrong_error = server.get_flight_info(wrong_scope).await.unwrap_err();
         assert_eq!(wrong_error.code(), tonic::Code::PermissionDenied);
 
+        let mut schema_request = Request::new(ticket.command_descriptor().unwrap());
+        schema_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
+            "tenant-a".parse().unwrap(),
+        );
+        schema_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
+            "system".parse().unwrap(),
+        );
+        let schema: Schema = server
+            .get_schema(schema_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_into()
+            .unwrap();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request.metadata_mut().insert(
             DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
@@ -1742,6 +1869,7 @@ mod tests {
             .unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(decoded.row_count, 1);
 
@@ -1778,6 +1906,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+        let missing_schema_error = server
+            .get_schema(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_schema_error.code(), tonic::Code::Unauthenticated);
 
         let mut wrong_principal = Request::new(ticket.command_descriptor().unwrap());
         wrong_principal.metadata_mut().insert(
@@ -1787,6 +1920,18 @@ mod tests {
         let wrong_error = server.get_flight_info(wrong_principal).await.unwrap_err();
         assert_eq!(wrong_error.code(), tonic::Code::PermissionDenied);
 
+        let mut schema_request = Request::new(ticket.command_descriptor().unwrap());
+        schema_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-system".parse().unwrap(),
+        );
+        let schema: Schema = server
+            .get_schema(schema_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_into()
+            .unwrap();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request.metadata_mut().insert(
             DEFAULT_FLIGHT_PRINCIPAL_HEADER,
@@ -1819,6 +1964,7 @@ mod tests {
             .unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(decoded.row_count, 1);
 
@@ -1837,13 +1983,19 @@ mod tests {
             cmd: Vec::new().into(),
             path: vec!["tenant-a".to_string(), "system".to_string()],
         };
+        let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
 
-        let error = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store))
-            .get_flight_info(Request::new(descriptor))
+        let info_error = server
+            .get_flight_info(Request::new(descriptor.clone()))
+            .await
+            .unwrap_err();
+        let schema_error = server
+            .get_schema(Request::new(descriptor))
             .await
             .unwrap_err();
 
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(info_error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(schema_error.code(), tonic::Code::InvalidArgument);
         assert!(!log_path.exists());
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
@@ -1883,7 +2035,7 @@ mod tests {
         let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
 
         let error = server
-            .get_schema(Request::new(FlightDescriptor::default()))
+            .poll_flight_info(Request::new(FlightDescriptor::default()))
             .await
             .unwrap_err();
 
@@ -1954,6 +2106,10 @@ mod tests {
         };
         let ticket = ScanFlightTicket::new(request);
 
+        let schema = client
+            .get_schema(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
         let info = client
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
@@ -1967,6 +2123,8 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
