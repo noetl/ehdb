@@ -11,8 +11,8 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use ehdb_core::{NamespaceName, SnapshotId, StreamName, TableName, TenantId, TransactionId};
 use ehdb_reference::{
-    ExecuteReplication, LocalArrowIpcTableStore, LocalReferenceRuntime, LocalReplicationExecutor,
-    WriteArrowIpcTable,
+    ExecuteReplication, LocalArrowIpcTableStore, LocalArrowSnapshotScanner, LocalReferenceRuntime,
+    LocalReplicationExecutor, ScanArrowSnapshot, WriteArrowIpcTable,
 };
 use ehdb_storage::{
     plan_replication, CloudProvider, DataGravityShard, GeoLocation, ImmutableObjectStore,
@@ -189,6 +189,63 @@ fn bench_local_arrow_ipc_table(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_local_arrow_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_arrow_scan");
+    group.sample_size(10);
+    group.bench_function("project_latest_100", |b| {
+        b.iter(|| {
+            let tenant = TenantId::new("tenant-a").unwrap();
+            let namespace = NamespaceName::new("system").unwrap();
+            let table_name = TableName::new("executions").unwrap();
+            let log_path = temp_log_path("local-arrow-scan");
+            let object_root = temp_object_root("local-arrow-scan");
+            let store = LocalObjectStore::new(&object_root);
+            let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+            LocalArrowIpcTableStore
+                .write_batch(
+                    &mut runtime,
+                    &store,
+                    WriteArrowIpcTable {
+                        tenant: tenant.clone(),
+                        namespace: namespace.clone(),
+                        table_name: table_name.clone(),
+                        snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                        create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                        snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                        file_name: "part-000.arrow".to_string(),
+                        batch: arrow_batch(),
+                    },
+                )
+                .unwrap();
+
+            for _ in 0..100 {
+                black_box(
+                    LocalArrowSnapshotScanner
+                        .scan_latest(
+                            &runtime,
+                            &store,
+                            ScanArrowSnapshot {
+                                tenant: tenant.clone(),
+                                namespace: namespace.clone(),
+                                table_name: table_name.clone(),
+                                projection: Some(vec![
+                                    "attempt".to_string(),
+                                    "execution_id".to_string(),
+                                ]),
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+
+            std::fs::remove_file(log_path).unwrap();
+            std::fs::remove_dir_all(object_root).unwrap();
+        })
+    });
+    group.finish();
+}
+
 fn temp_log_path(name: &str) -> std::path::PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -246,6 +303,7 @@ criterion_group!(
     benches,
     bench_local_reference_runtime_append_reopen,
     bench_local_replication_executor,
-    bench_local_arrow_ipc_table
+    bench_local_arrow_ipc_table,
+    bench_local_arrow_scan
 );
 criterion_main!(benches);
