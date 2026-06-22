@@ -203,6 +203,14 @@ the local scanner runs. Missing scope metadata returns
 `PERMISSION_DENIED`. This is the metadata contract that future catalog
 ACL checks can attach to, not ACL enforcement by itself.
 
+`FlightScanGrantPolicy` can require `x-ehdb-principal` metadata and
+check the replayed catalog scan grants before `get_flight_info` or
+`do_get` reaches the local scanner. Missing or invalid principal
+metadata returns `UNAUTHENTICATED`; a principal without
+`CatalogScanGrant` for the requested table returns `PERMISSION_DENIED`.
+This is local reference enforcement over EHDB catalog state, not
+production IAM, TLS identity, revocation, or policy composition.
+
 `LocalArrowFlightListener` is a loopback-only reference harness behind
 that config. It binds an ephemeral or configured loopback address,
 reports the actual local address, serves the generated Flight service,
@@ -216,8 +224,10 @@ the Arrow Flight client over tonic/gRPC transport. It calls
 `get_flight_info`, follows the returned endpoint ticket with `do_get`,
 and decodes the returned Arrow batches. A second smoke path proves the
 same flow with the header-token auth policy enabled, and a third proves
-tenant/namespace scope metadata over real tonic/gRPC transport. This
-remains a local-reference test path, not a gateway integration.
+tenant/namespace scope metadata over real tonic/gRPC transport. A fourth
+proves catalog-backed scan grant enforcement with principal metadata
+over the same loopback path. This remains a local-reference test path,
+not a gateway integration.
 
 ## Catalog Snapshots And Scan Grants
 
@@ -238,9 +248,10 @@ and granting transaction together, and `InMemoryCatalog::can_scan`
 answers whether that principal has scan access to the table. The
 reference catalog rejects grants for missing tables and duplicate grants.
 `CatalogMutation::GrantScan` makes the metadata replayable through
-`ehdb-reference` and `LocalReferenceRuntime`. This is ACL metadata only;
-production IAM, policy evaluation, and service enforcement remain future
-surfaces.
+`ehdb-reference` and `LocalReferenceRuntime`. `ehdb-service` can now use
+that replayed metadata through `FlightScanGrantPolicy` for local Arrow
+Flight scan authorization. Production IAM, policy evaluation,
+revocation, and non-loopback service exposure remain future surfaces.
 
 ## Replay Reference
 

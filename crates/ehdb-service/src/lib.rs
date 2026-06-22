@@ -11,7 +11,7 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
-use ehdb_core::{EhdbError, NamespaceName, Result, TableName, TenantId};
+use ehdb_core::{EhdbError, NamespaceName, PrincipalId, Result, TableName, TenantId};
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
@@ -28,6 +28,7 @@ pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
 pub const DEFAULT_FLIGHT_TENANT_SCOPE_HEADER: &str = "x-ehdb-tenant";
 pub const DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER: &str = "x-ehdb-namespace";
+pub const DEFAULT_FLIGHT_PRINCIPAL_HEADER: &str = "x-ehdb-principal";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
@@ -209,6 +210,91 @@ impl FlightScanScopePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightScanGrantPolicy {
+    DisabledForLocalReference,
+    RequireCatalogGrant { principal_header_name: String },
+}
+
+impl FlightScanGrantPolicy {
+    pub fn require_default_principal() -> Self {
+        Self::RequireCatalogGrant {
+            principal_header_name: DEFAULT_FLIGHT_PRINCIPAL_HEADER.to_string(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::DisabledForLocalReference => Ok(()),
+            Self::RequireCatalogGrant {
+                principal_header_name,
+            } => FlightAuthPolicy::header_key(principal_header_name)
+                .map(|_| ())
+                .map_err(|err| {
+                    EhdbError::InvalidState(format!("invalid Flight principal header name: {err}"))
+                }),
+        }
+    }
+
+    pub fn authorize_catalog_grant(
+        &self,
+        metadata: &MetadataMap,
+        runtime: &LocalReferenceRuntime,
+        request: &ScanLatestTableRequest,
+    ) -> Option<Status> {
+        match self {
+            Self::DisabledForLocalReference => None,
+            Self::RequireCatalogGrant {
+                principal_header_name,
+            } => {
+                let principal_key = match FlightAuthPolicy::header_key(principal_header_name) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        return Some(Status::internal(
+                            "EHDB Flight principal grant policy is invalid",
+                        ))
+                    }
+                };
+                let Some(value) = metadata.get(&principal_key) else {
+                    return Some(Status::unauthenticated(
+                        "EHDB Flight principal header is missing",
+                    ));
+                };
+                let Some(principal) = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| PrincipalId::new(value).ok())
+                else {
+                    return Some(Status::unauthenticated(
+                        "EHDB Flight principal header is invalid",
+                    ));
+                };
+
+                let table = match runtime.state().catalog.get_table(
+                    &request.tenant,
+                    &request.namespace,
+                    &request.table_name,
+                ) {
+                    Ok(table) => table,
+                    Err(error) => return Some(error_to_status(error)),
+                };
+                if runtime.state().catalog.can_scan(
+                    &request.tenant,
+                    &request.namespace,
+                    &table.id,
+                    &principal,
+                ) {
+                    None
+                } else {
+                    Some(Status::permission_denied(
+                        "EHDB Flight principal is not granted scan access",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAccessLogPolicy {
     Disabled,
     DebugOnly,
@@ -222,6 +308,7 @@ pub struct LocalArrowFlightServerConfig {
     pub max_concurrent_requests: usize,
     pub auth_policy: FlightAuthPolicy,
     pub scan_scope_policy: FlightScanScopePolicy,
+    pub scan_grant_policy: FlightScanGrantPolicy,
     pub access_log_policy: FlightAccessLogPolicy,
 }
 
@@ -234,6 +321,7 @@ impl Default for LocalArrowFlightServerConfig {
             max_concurrent_requests: DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS,
             auth_policy: FlightAuthPolicy::DisabledForLocalReference,
             scan_scope_policy: FlightScanScopePolicy::DisabledForLocalReference,
+            scan_grant_policy: FlightScanGrantPolicy::DisabledForLocalReference,
             access_log_policy: FlightAccessLogPolicy::DebugOnly,
         }
     }
@@ -258,6 +346,7 @@ impl LocalArrowFlightServerConfig {
         }
         self.auth_policy.validate()?;
         self.scan_scope_policy.validate()?;
+        self.scan_grant_policy.validate()?;
         if self.auth_policy == FlightAuthPolicy::DisabledForLocalReference
             && !self.bind_addr.ip().is_loopback()
         {
@@ -277,11 +366,12 @@ impl LocalArrowFlightServerConfig {
         S: ImmutableObjectStore + Send + Sync + 'static,
     {
         self.validate()?;
-        Ok(LocalArrowFlightServer::new_with_policies(
+        Ok(LocalArrowFlightServer::new_with_authorization_policies(
             runtime,
             store,
             self.auth_policy.clone(),
             self.scan_scope_policy.clone(),
+            self.scan_grant_policy.clone(),
         )
         .into_server_with_config(self))
     }
@@ -564,6 +654,7 @@ pub struct LocalArrowFlightServer<S> {
     service: LocalArrowFlightService,
     auth_policy: FlightAuthPolicy,
     scan_scope_policy: FlightScanScopePolicy,
+    scan_grant_policy: FlightScanGrantPolicy,
 }
 
 impl<S> LocalArrowFlightServer<S>
@@ -593,12 +684,29 @@ where
         auth_policy: FlightAuthPolicy,
         scan_scope_policy: FlightScanScopePolicy,
     ) -> Self {
+        Self::new_with_authorization_policies(
+            runtime,
+            store,
+            auth_policy,
+            scan_scope_policy,
+            FlightScanGrantPolicy::DisabledForLocalReference,
+        )
+    }
+
+    pub fn new_with_authorization_policies(
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+        auth_policy: FlightAuthPolicy,
+        scan_scope_policy: FlightScanScopePolicy,
+        scan_grant_policy: FlightScanGrantPolicy,
+    ) -> Self {
         Self {
             runtime,
             store,
             service: LocalArrowFlightService::default(),
             auth_policy,
             scan_scope_policy,
+            scan_grant_policy,
         }
     }
 
@@ -674,6 +782,12 @@ where
         {
             return Err(status);
         }
+        if let Some(status) =
+            self.scan_grant_policy
+                .authorize_catalog_grant(&metadata, &self.runtime, &scan_request)
+        {
+            return Err(status);
+        }
         let info = self
             .service
             .get_flight_info(&self.runtime, self.store.as_ref(), scan_request)
@@ -713,6 +827,12 @@ where
         if let Some(status) = self
             .scan_scope_policy
             .authorize_scan_metadata(&metadata, &scan_request)
+        {
+            return Err(status);
+        }
+        if let Some(status) =
+            self.scan_grant_policy
+                .authorize_catalog_grant(&metadata, &self.runtime, &scan_request)
         {
             return Err(status);
         }
@@ -787,11 +907,15 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_flight::FlightClient;
     use arrow_schema::{DataType, Field, Schema};
-    use ehdb_core::{EhdbError, NamespaceName, SnapshotId, TableName, TenantId, TransactionId};
+    use ehdb_core::{
+        EhdbError, NamespaceName, PrincipalId, SnapshotId, TableId, TableName, TenantId,
+        TransactionId,
+    };
     use ehdb_reference::{
         ArrowScalarValue, LocalArrowIpcTableStore, LocalReferenceRuntime, WriteArrowIpcTable,
     };
     use ehdb_storage::LocalObjectStore;
+    use ehdb_transaction::{CatalogMutation, CommitTransaction, Mutation};
     use futures_util::TryStreamExt;
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
@@ -1419,6 +1543,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_flight_server_enforces_catalog_scan_grants() {
+        let (log_path, object_root, mut runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-server-scan-grant");
+        grant_scan(&mut runtime, "worker-system", "txn-grant-scan").unwrap();
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+        let server = LocalArrowFlightServer::new_with_authorization_policies(
+            Arc::new(runtime),
+            Arc::new(store),
+            FlightAuthPolicy::DisabledForLocalReference,
+            FlightScanScopePolicy::DisabledForLocalReference,
+            FlightScanGrantPolicy::require_default_principal(),
+        );
+
+        let missing_error = server
+            .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong_principal = Request::new(ticket.command_descriptor().unwrap());
+        wrong_principal.metadata_mut().insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-other".parse().unwrap(),
+        );
+        let wrong_error = server.get_flight_info(wrong_principal).await.unwrap_err();
+        assert_eq!(wrong_error.code(), tonic::Code::PermissionDenied);
+
+        let mut info_request = Request::new(ticket.command_descriptor().unwrap());
+        info_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-system".parse().unwrap(),
+        );
+        let info = server
+            .get_flight_info(info_request)
+            .await
+            .unwrap()
+            .into_inner();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+
+        match server.do_get(Request::new(endpoint_ticket.clone())).await {
+            Ok(_) => panic!("missing Flight principal metadata must fail"),
+            Err(error) => assert_eq!(error.code(), tonic::Code::Unauthenticated),
+        }
+
+        let mut do_get_request = Request::new(endpoint_ticket);
+        do_get_request.metadata_mut().insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-system".parse().unwrap(),
+        );
+        let flight_data = server
+            .do_get(do_get_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(decoded.row_count, 1);
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_flight_server_rejects_non_command_descriptors() {
         let log_path = temp_log_path("local-flight-server-path-descriptor");
         let object_root = temp_object_root("local-flight-server-path-descriptor");
@@ -1761,6 +1962,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_client_uses_catalog_scan_grants_over_loopback_listener() {
+        let (log_path, object_root, mut runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-client-grant-smoke");
+        grant_scan(&mut runtime, "worker-system", "txn-grant-scan").unwrap();
+        let config = LocalArrowFlightServerConfig {
+            scan_grant_policy: FlightScanGrantPolicy::require_default_principal(),
+            ..LocalArrowFlightServerConfig::default()
+        };
+        let listener = config
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(listener.serve_with_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+
+        let missing_error = FlightClient::new(channel.clone())
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap_err();
+        match missing_error {
+            arrow_flight::error::FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+            error => panic!("expected tonic unauthenticated error, got {error:?}"),
+        }
+
+        let mut wrong_client = FlightClient::new(channel.clone());
+        wrong_client
+            .add_header(DEFAULT_FLIGHT_PRINCIPAL_HEADER, "worker-other")
+            .unwrap();
+        let wrong_error = wrong_client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap_err();
+        match wrong_error {
+            arrow_flight::error::FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            }
+            error => panic!("expected tonic permission denied error, got {error:?}"),
+        }
+
+        let mut client = FlightClient::new(channel);
+        client
+            .add_header(DEFAULT_FLIGHT_PRINCIPAL_HEADER, "worker-system")
+            .unwrap();
+        let info = client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let batches = client
+            .do_get(endpoint_ticket)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn flight_listener_rejects_non_loopback_even_with_external_auth_policy() {
         let log_path = temp_log_path("local-flight-listener-non-loopback");
         let object_root = temp_object_root("local-flight-listener-non-loopback");
@@ -1809,6 +2104,10 @@ mod tests {
         assert_eq!(
             config.scan_scope_policy,
             FlightScanScopePolicy::DisabledForLocalReference
+        );
+        assert_eq!(
+            config.scan_grant_policy,
+            FlightScanGrantPolicy::DisabledForLocalReference
         );
         assert_eq!(config.access_log_policy, FlightAccessLogPolicy::DebugOnly);
     }
@@ -1986,6 +2285,69 @@ mod tests {
     }
 
     #[test]
+    fn flight_scan_grant_policy_validates_metadata() {
+        let (log_path, object_root, mut runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-grant-policy");
+        grant_scan(&mut runtime, "worker-system", "txn-grant-scan").unwrap();
+        let policy = FlightScanGrantPolicy::require_default_principal();
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-system".parse().unwrap(),
+        );
+
+        policy.validate().unwrap();
+        assert!(policy
+            .authorize_catalog_grant(&metadata, &runtime, &request)
+            .is_none());
+
+        let missing = policy
+            .authorize_catalog_grant(&MetadataMap::new(), &runtime, &request)
+            .unwrap();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong = MetadataMap::new();
+        wrong.insert(
+            DEFAULT_FLIGHT_PRINCIPAL_HEADER,
+            "worker-other".parse().unwrap(),
+        );
+        let denied = policy
+            .authorize_catalog_grant(&wrong, &runtime, &request)
+            .unwrap();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        drop(store);
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn flight_scan_grant_policy_rejects_invalid_contracts() {
+        let empty_header = FlightScanGrantPolicy::RequireCatalogGrant {
+            principal_header_name: String::new(),
+        };
+        assert!(matches!(
+            empty_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let binary_header = FlightScanGrantPolicy::RequireCatalogGrant {
+            principal_header_name: "x-ehdb-principal-bin".to_string(),
+        };
+        assert!(matches!(
+            binary_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+    }
+
+    #[test]
     fn flight_server_config_builds_generated_service_without_binding_listener() {
         let log_path = temp_log_path("local-flight-server-config-build");
         let object_root = temp_object_root("local-flight-server-config-build");
@@ -2006,6 +2368,24 @@ mod tests {
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
         }
+    }
+
+    fn grant_scan(
+        runtime: &mut LocalReferenceRuntime,
+        principal: &str,
+        transaction_id: &str,
+    ) -> Result<()> {
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new(transaction_id)?,
+                tenant: TenantId::new("tenant-a")?,
+                namespace: NamespaceName::new("system")?,
+                mutations: vec![Mutation::Catalog(CatalogMutation::GrantScan {
+                    table_id: TableId::new("tenant-a_system_executions")?,
+                    principal: PrincipalId::new(principal)?,
+                })],
+            })
+            .map(|_| ())
     }
 
     fn seeded_table(

@@ -22,6 +22,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+ehdb-transaction.workspace = true
 
 [[bench]]
 name = "local_scan_service"
