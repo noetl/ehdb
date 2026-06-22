@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 use tonic::transport::{server::TcpIncoming, Server};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
 pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -90,6 +90,10 @@ impl FlightAuthPolicy {
                 "EHDB Flight external auth is not implemented",
             )),
         }
+    }
+
+    pub fn requires_request_metadata(&self) -> bool {
+        !matches!(self, Self::DisabledForLocalReference)
     }
 
     fn header_key(header_name: &str) -> std::result::Result<AsciiMetadataKey, String> {
@@ -186,6 +190,10 @@ impl FlightScanScopePolicy {
                     })
             }
         }
+    }
+
+    pub fn requires_request_metadata(&self) -> bool {
+        !matches!(self, Self::DisabledForLocalReference)
     }
 
     fn match_metadata_scope(
@@ -292,12 +300,96 @@ impl FlightScanGrantPolicy {
             }
         }
     }
+
+    pub fn requires_request_metadata(&self) -> bool {
+        !matches!(self, Self::DisabledForLocalReference)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAccessLogPolicy {
     Disabled,
     DebugOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightScanCall {
+    GetFlightInfo,
+    DoGet,
+}
+
+impl FlightScanCall {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GetFlightInfo => "get_flight_info",
+            Self::DoGet => "do_get",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightScanAccessLogEntry {
+    pub call: FlightScanCall,
+    pub grpc_code: Code,
+    pub row_count: Option<i64>,
+    pub flight_data_message_count: Option<usize>,
+    pub projection_count: Option<usize>,
+    pub predicate_present: bool,
+    pub auth_required: bool,
+    pub scan_scope_required: bool,
+    pub scan_grant_required: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FlightScanAccessLogInput<'a> {
+    pub call: FlightScanCall,
+    pub request: &'a ScanLatestTableRequest,
+    pub grpc_code: Code,
+    pub row_count: Option<i64>,
+    pub flight_data_message_count: Option<usize>,
+    pub auth_policy: &'a FlightAuthPolicy,
+    pub scan_scope_policy: &'a FlightScanScopePolicy,
+    pub scan_grant_policy: &'a FlightScanGrantPolicy,
+}
+
+impl FlightAccessLogPolicy {
+    pub fn scan_access_entry(
+        &self,
+        input: FlightScanAccessLogInput<'_>,
+    ) -> Option<FlightScanAccessLogEntry> {
+        match self {
+            Self::Disabled => None,
+            Self::DebugOnly => Some(FlightScanAccessLogEntry {
+                call: input.call,
+                grpc_code: input.grpc_code,
+                row_count: input.row_count,
+                flight_data_message_count: input.flight_data_message_count,
+                projection_count: input.request.projection.as_ref().map(Vec::len),
+                predicate_present: input.request.predicate.is_some(),
+                auth_required: input.auth_policy.requires_request_metadata(),
+                scan_scope_required: input.scan_scope_policy.requires_request_metadata(),
+                scan_grant_required: input.scan_grant_policy.requires_request_metadata(),
+            }),
+        }
+    }
+}
+
+impl FlightScanAccessLogEntry {
+    pub fn emit_debug(&self) {
+        tracing::debug!(
+            target: "ehdb_service::flight_access",
+            call = self.call.as_str(),
+            grpc_code = ?self.grpc_code,
+            row_count = self.row_count,
+            flight_data_message_count = self.flight_data_message_count,
+            projection_count = self.projection_count,
+            predicate_present = self.predicate_present,
+            auth_required = self.auth_required,
+            scan_scope_required = self.scan_scope_required,
+            scan_grant_required = self.scan_grant_required,
+            "EHDB local Arrow Flight scan access"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,12 +458,13 @@ impl LocalArrowFlightServerConfig {
         S: ImmutableObjectStore + Send + Sync + 'static,
     {
         self.validate()?;
-        Ok(LocalArrowFlightServer::new_with_authorization_policies(
+        Ok(LocalArrowFlightServer::new_with_runtime_policies(
             runtime,
             store,
             self.auth_policy.clone(),
             self.scan_scope_policy.clone(),
             self.scan_grant_policy.clone(),
+            self.access_log_policy.clone(),
         )
         .into_server_with_config(self))
     }
@@ -655,6 +748,7 @@ pub struct LocalArrowFlightServer<S> {
     auth_policy: FlightAuthPolicy,
     scan_scope_policy: FlightScanScopePolicy,
     scan_grant_policy: FlightScanGrantPolicy,
+    access_log_policy: FlightAccessLogPolicy,
 }
 
 impl<S> LocalArrowFlightServer<S>
@@ -700,6 +794,24 @@ where
         scan_scope_policy: FlightScanScopePolicy,
         scan_grant_policy: FlightScanGrantPolicy,
     ) -> Self {
+        Self::new_with_runtime_policies(
+            runtime,
+            store,
+            auth_policy,
+            scan_scope_policy,
+            scan_grant_policy,
+            FlightAccessLogPolicy::DebugOnly,
+        )
+    }
+
+    pub fn new_with_runtime_policies(
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+        auth_policy: FlightAuthPolicy,
+        scan_scope_policy: FlightScanScopePolicy,
+        scan_grant_policy: FlightScanGrantPolicy,
+        access_log_policy: FlightAccessLogPolicy,
+    ) -> Self {
         Self {
             runtime,
             store,
@@ -707,6 +819,7 @@ where
             auth_policy,
             scan_scope_policy,
             scan_grant_policy,
+            access_log_policy,
         }
     }
 
@@ -721,6 +834,31 @@ where
         FlightServiceServer::new(self)
             .max_decoding_message_size(config.max_decoding_message_size)
             .max_encoding_message_size(config.max_encoding_message_size)
+    }
+
+    fn log_scan_access(
+        &self,
+        call: FlightScanCall,
+        request: &ScanLatestTableRequest,
+        grpc_code: Code,
+        row_count: Option<i64>,
+        flight_data_message_count: Option<usize>,
+    ) {
+        if let Some(entry) = self
+            .access_log_policy
+            .scan_access_entry(FlightScanAccessLogInput {
+                call,
+                request,
+                grpc_code,
+                row_count,
+                flight_data_message_count,
+                auth_policy: &self.auth_policy,
+                scan_scope_policy: &self.scan_scope_policy,
+                scan_grant_policy: &self.scan_grant_policy,
+            })
+        {
+            entry.emit_debug();
+        }
     }
 
     fn request_from_descriptor(descriptor: FlightDescriptor) -> Result<ScanLatestTableRequest> {
@@ -780,18 +918,53 @@ where
             .scan_scope_policy
             .authorize_scan_metadata(&metadata, &scan_request)
         {
+            self.log_scan_access(
+                FlightScanCall::GetFlightInfo,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
             return Err(status);
         }
         if let Some(status) =
             self.scan_grant_policy
                 .authorize_catalog_grant(&metadata, &self.runtime, &scan_request)
         {
+            self.log_scan_access(
+                FlightScanCall::GetFlightInfo,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
             return Err(status);
         }
-        let info = self
-            .service
-            .get_flight_info(&self.runtime, self.store.as_ref(), scan_request)
-            .map_err(error_to_status)?;
+        let info = match self.service.get_flight_info(
+            &self.runtime,
+            self.store.as_ref(),
+            scan_request.clone(),
+        ) {
+            Ok(info) => info,
+            Err(error) => {
+                let status = error_to_status(error);
+                self.log_scan_access(
+                    FlightScanCall::GetFlightInfo,
+                    &scan_request,
+                    status.code(),
+                    None,
+                    None,
+                );
+                return Err(status);
+            }
+        };
+        self.log_scan_access(
+            FlightScanCall::GetFlightInfo,
+            &scan_request,
+            Code::Ok,
+            Some(info.total_records),
+            None,
+        );
         Ok(Response::new(info))
     }
 
@@ -828,18 +1001,52 @@ where
             .scan_scope_policy
             .authorize_scan_metadata(&metadata, &scan_request)
         {
+            self.log_scan_access(
+                FlightScanCall::DoGet,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
             return Err(status);
         }
         if let Some(status) =
             self.scan_grant_policy
                 .authorize_catalog_grant(&metadata, &self.runtime, &scan_request)
         {
+            self.log_scan_access(
+                FlightScanCall::DoGet,
+                &scan_request,
+                status.code(),
+                None,
+                None,
+            );
             return Err(status);
         }
-        let data = self
+        let data = match self
             .service
             .do_get(&self.runtime, self.store.as_ref(), &ticket)
-            .map_err(error_to_status)?;
+        {
+            Ok(data) => data,
+            Err(error) => {
+                let status = error_to_status(error);
+                self.log_scan_access(
+                    FlightScanCall::DoGet,
+                    &scan_request,
+                    status.code(),
+                    None,
+                    None,
+                );
+                return Err(status);
+            }
+        };
+        self.log_scan_access(
+            FlightScanCall::DoGet,
+            &scan_request,
+            Code::Ok,
+            None,
+            Some(data.len()),
+        );
         Ok(Response::new(
             stream::iter(data.into_iter().map(Ok)).boxed(),
         ))
@@ -2153,6 +2360,84 @@ mod tests {
 
         config.auth_policy = FlightAuthPolicy::ExternalRequired;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn flight_access_log_policy_builds_bounded_debug_entries() {
+        let request = filtered_request();
+        let entry = FlightAccessLogPolicy::DebugOnly
+            .scan_access_entry(FlightScanAccessLogInput {
+                call: FlightScanCall::GetFlightInfo,
+                request: &request,
+                grpc_code: Code::Ok,
+                row_count: Some(1),
+                flight_data_message_count: None,
+                auth_policy: &FlightAuthPolicy::HeaderToken {
+                    header_name: "x-ehdb-auth".to_string(),
+                    token: "local-secret".to_string(),
+                },
+                scan_scope_policy: &FlightScanScopePolicy::require_default_tenant_namespace(),
+                scan_grant_policy: &FlightScanGrantPolicy::require_default_principal(),
+            })
+            .unwrap();
+
+        assert_eq!(entry.call, FlightScanCall::GetFlightInfo);
+        assert_eq!(entry.call.as_str(), "get_flight_info");
+        assert_eq!(entry.grpc_code, Code::Ok);
+        assert_eq!(entry.row_count, Some(1));
+        assert_eq!(entry.flight_data_message_count, None);
+        assert_eq!(entry.projection_count, Some(1));
+        assert!(entry.predicate_present);
+        assert!(entry.auth_required);
+        assert!(entry.scan_scope_required);
+        assert!(entry.scan_grant_required);
+
+        let rendered = format!("{entry:?}");
+        assert!(!rendered.contains(request.tenant.as_str()));
+        assert!(!rendered.contains(request.namespace.as_str()));
+        assert!(!rendered.contains(request.table_name.as_str()));
+        assert!(!rendered.contains("local-secret"));
+        assert!(!rendered.contains(DEFAULT_FLIGHT_PRINCIPAL_HEADER));
+    }
+
+    #[test]
+    fn flight_access_log_policy_disabled_emits_no_entries() {
+        let request = filtered_request();
+        assert!(FlightAccessLogPolicy::Disabled
+            .scan_access_entry(FlightScanAccessLogInput {
+                call: FlightScanCall::DoGet,
+                request: &request,
+                grpc_code: Code::PermissionDenied,
+                row_count: None,
+                flight_data_message_count: Some(2),
+                auth_policy: &FlightAuthPolicy::DisabledForLocalReference,
+                scan_scope_policy: &FlightScanScopePolicy::DisabledForLocalReference,
+                scan_grant_policy: &FlightScanGrantPolicy::DisabledForLocalReference,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn local_flight_server_accepts_disabled_access_log_policy() {
+        let log_path = temp_log_path("local-flight-server-disabled-access-log");
+        let object_root = temp_object_root("local-flight-server-disabled-access-log");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let server = LocalArrowFlightServer::new_with_runtime_policies(
+            Arc::new(runtime),
+            Arc::new(store),
+            FlightAuthPolicy::DisabledForLocalReference,
+            FlightScanScopePolicy::DisabledForLocalReference,
+            FlightScanGrantPolicy::DisabledForLocalReference,
+            FlightAccessLogPolicy::Disabled,
+        );
+
+        assert_eq!(server.access_log_policy, FlightAccessLogPolicy::Disabled);
+
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
     }
 
     #[test]
