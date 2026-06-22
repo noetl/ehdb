@@ -164,6 +164,12 @@ read path yet.
 result. This proves the local result-stream contract for the future
 `do_get` path while remaining pre-network and pre-distributed.
 
+`ArrowScanResult` can also build a pre-network Arrow Flight `FlightInfo`
+value from a `ScanFlightTicket`. The fixture includes schema IPC bytes,
+a command descriptor, one endpoint ticket, ordered result metadata, row
+count, and encoded byte count. It is metadata only; no Flight server or
+gateway data-touch path is introduced.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over

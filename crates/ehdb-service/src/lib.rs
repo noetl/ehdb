@@ -4,8 +4,9 @@ use arrow_array::RecordBatch;
 use arrow_flight::{
     flight_descriptor::DescriptorType,
     utils::{batches_to_flight_data, flight_data_to_batches},
-    FlightData, FlightDescriptor, Ticket,
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
 use ehdb_core::{EhdbError, NamespaceName, Result, TableName, TenantId};
 use ehdb_reference::{
@@ -127,6 +128,47 @@ impl ArrowScanResult {
         })?;
         Self::from_batches(batches)
     }
+
+    pub fn to_flight_info(&self, ticket: &ScanFlightTicket) -> Result<FlightInfo> {
+        let stream = self.to_flight_data()?;
+        let schema = schema_ipc_bytes(self.schema.as_ref())?.into();
+        let total_records = i64::try_from(self.row_count).map_err(|_| {
+            EhdbError::InvalidState(format!("scan row count too large: {}", self.row_count))
+        })?;
+        let total_bytes = total_flight_data_bytes(&stream)?;
+
+        Ok(FlightInfo {
+            schema,
+            flight_descriptor: Some(ticket.command_descriptor()?),
+            endpoint: vec![FlightEndpoint {
+                ticket: Some(ticket.to_arrow_ticket()?),
+                location: Vec::new(),
+                expiration_time: None,
+                app_metadata: Vec::new().into(),
+            }],
+            total_records,
+            total_bytes,
+            ordered: true,
+            app_metadata: SCAN_FLIGHT_TICKET_VERSION.as_bytes().to_vec().into(),
+        })
+    }
+}
+
+fn schema_ipc_bytes(schema: &Schema) -> Result<Vec<u8>> {
+    let options = IpcWriteOptions::default();
+    let message: IpcMessage = SchemaAsIpc::new(schema, &options)
+        .try_into()
+        .map_err(|err| EhdbError::InvalidState(format!("encode flight info schema: {err}")))?;
+    Ok(message.0.to_vec())
+}
+
+fn total_flight_data_bytes(stream: &[FlightData]) -> Result<i64> {
+    let total: usize = stream
+        .iter()
+        .map(|data| data.data_header.len() + data.data_body.len() + data.app_metadata.len())
+        .sum();
+    i64::try_from(total)
+        .map_err(|_| EhdbError::InvalidState(format!("flight data byte count too large: {total}")))
 }
 
 #[derive(Debug, Default)]
@@ -436,6 +478,76 @@ mod tests {
     fn scan_result_flight_data_rejects_malformed_streams() {
         let error = ArrowScanResult::from_flight_data(&[FlightData::default()]).unwrap_err();
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn scan_result_builds_flight_info() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+
+        let info = result.to_flight_info(&ticket).unwrap();
+
+        assert!(!info.schema.is_empty());
+        assert_eq!(info.total_records, 3);
+        assert!(info.total_bytes > 0);
+        assert!(info.ordered);
+        assert_eq!(info.endpoint.len(), 1);
+        assert_eq!(
+            info.flight_descriptor.unwrap().r#type,
+            DescriptorType::Cmd as i32
+        );
+        let endpoint_ticket = info.endpoint[0].ticket.as_ref().unwrap();
+        assert_eq!(
+            ScanFlightTicket::from_arrow_ticket(endpoint_ticket)
+                .unwrap()
+                .request,
+            ticket.request
+        );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_matches_decodable_result_stream() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-stream");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request.clone())
+            .unwrap();
+
+        let info = result
+            .to_flight_info(&ScanFlightTicket::new(request))
+            .unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&result.to_flight_data().unwrap()).unwrap();
+
+        assert_eq!(info.total_records, decoded.row_count as i64);
+        assert_eq!(decoded.schema.field(0).name(), "execution_id");
+        assert_eq!(decoded.row_count, 1);
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
     }
 
     fn seeded_table(
