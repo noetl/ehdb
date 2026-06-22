@@ -570,6 +570,7 @@ dependencies = [
  "criterion",
  "ehdb-core",
  "ehdb-reference",
+ "ehdb-retrieval",
  "ehdb-storage",
  "ehdb-transaction",
  "futures-util",

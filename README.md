@@ -280,6 +280,14 @@ reference RAG primitive only; ANN indexes, retrieval services,
 production IAM, Qdrant adapters, and distributed query execution remain
 future surfaces.
 
+`ehdb-service` exposes that local vector lookup through
+`LocalRetrievalSearchService`, an in-process service-facing request and
+result boundary over replayed `LocalReferenceRuntime` retrieval state.
+`SearchSimilarChunksRequest` returns ranked chunk hits with document
+identity, text, checksum, model, dimensions, and score while avoiding raw
+embedding vectors in the response. This is not a network service,
+gateway route, production retrieval API, or persistent daemon.
+
 ## Replay Reference
 
 `ehdb-reference` applies replayed `TransactionRecord` values to the
