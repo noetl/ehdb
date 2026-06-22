@@ -151,6 +151,14 @@ count. This prepares the Arrow Flight read path without introducing a
 network server, SQL planner, distributed executor, or gateway direct
 read behavior.
 
+The service crate also includes the first Arrow Flight scan ticket
+codec. `ScanFlightTicket` serializes latest-table scan requests into a
+versioned payload, round-trips through Arrow Flight `Ticket`, and builds
+command `FlightDescriptor` values for the future Flight read API. This
+is still a contract fixture: there is no Flight server, client, SQL
+planner, predicate pushdown, distributed executor, or gateway direct
+read path yet.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over

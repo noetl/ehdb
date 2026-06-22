@@ -8,10 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 arrow-array.workspace = true
+arrow-flight.workspace = true
 arrow-schema.workspace = true
 ehdb-core.workspace = true
 ehdb-reference.workspace = true
 ehdb-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

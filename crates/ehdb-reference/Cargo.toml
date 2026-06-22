@@ -17,6 +17,7 @@ ehdb-storage.workspace = true
 ehdb-stream.workspace = true
 ehdb-system.workspace = true
 ehdb-transaction.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
