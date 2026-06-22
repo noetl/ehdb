@@ -19,6 +19,7 @@ use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
@@ -460,13 +461,14 @@ impl LocalArrowFlightServerConfig {
         S: ImmutableObjectStore + Send + Sync + 'static,
     {
         self.validate()?;
-        Ok(LocalArrowFlightServer::new_with_runtime_policies(
+        Ok(LocalArrowFlightServer::new_with_runtime_limits(
             runtime,
             store,
             self.auth_policy.clone(),
             self.scan_scope_policy.clone(),
             self.scan_grant_policy.clone(),
             self.access_log_policy.clone(),
+            self.max_concurrent_requests,
         )
         .into_server_with_config(self))
     }
@@ -768,6 +770,7 @@ pub struct LocalArrowFlightServer<S> {
     scan_scope_policy: FlightScanScopePolicy,
     scan_grant_policy: FlightScanGrantPolicy,
     access_log_policy: FlightAccessLogPolicy,
+    request_slots: Arc<Semaphore>,
 }
 
 impl<S> LocalArrowFlightServer<S>
@@ -831,6 +834,26 @@ where
         scan_grant_policy: FlightScanGrantPolicy,
         access_log_policy: FlightAccessLogPolicy,
     ) -> Self {
+        Self::new_with_runtime_limits(
+            runtime,
+            store,
+            auth_policy,
+            scan_scope_policy,
+            scan_grant_policy,
+            access_log_policy,
+            DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS,
+        )
+    }
+
+    pub fn new_with_runtime_limits(
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+        auth_policy: FlightAuthPolicy,
+        scan_scope_policy: FlightScanScopePolicy,
+        scan_grant_policy: FlightScanGrantPolicy,
+        access_log_policy: FlightAccessLogPolicy,
+        max_concurrent_requests: usize,
+    ) -> Self {
         Self {
             runtime,
             store,
@@ -839,6 +862,7 @@ where
             scan_scope_policy,
             scan_grant_policy,
             access_log_policy,
+            request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
         }
     }
 
@@ -877,6 +901,22 @@ where
             })
         {
             entry.emit_debug();
+        }
+    }
+
+    fn try_acquire_request_slot(&self) -> (Option<OwnedSemaphorePermit>, Option<Status>) {
+        match self.request_slots.clone().try_acquire_owned() {
+            Ok(permit) => (Some(permit), None),
+            Err(tokio::sync::TryAcquireError::NoPermits) => (
+                None,
+                Some(Status::resource_exhausted(
+                    "EHDB Flight concurrent request limit exceeded",
+                )),
+            ),
+            Err(tokio::sync::TryAcquireError::Closed) => (
+                None,
+                Some(Status::unavailable("EHDB Flight request limiter is closed")),
+            ),
         }
     }
 
@@ -928,6 +968,10 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let (_slot, slot_error) = self.try_acquire_request_slot();
+        if let Some(status) = slot_error {
+            return Err(status);
+        }
         let (metadata, _extensions, descriptor) = request.into_parts();
         if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
             return Err(status);
@@ -1000,6 +1044,10 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<SchemaResult>, Status> {
+        let (_slot, slot_error) = self.try_acquire_request_slot();
+        if let Some(status) = slot_error {
+            return Err(status);
+        }
         let (metadata, _extensions, descriptor) = request.into_parts();
         if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
             return Err(status);
@@ -1063,6 +1111,10 @@ where
         &self,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        let (_slot, slot_error) = self.try_acquire_request_slot();
+        if let Some(status) = slot_error {
+            return Err(status);
+        }
         let (metadata, _extensions, ticket) = request.into_parts();
         if let Some(status) = self.auth_policy.authorize_metadata(&metadata) {
             return Err(status);
@@ -1672,6 +1724,56 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_enforces_concurrent_request_limit() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-server-concurrency-limit");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+        let server = LocalArrowFlightServer::new_with_runtime_limits(
+            Arc::new(runtime),
+            Arc::new(store),
+            FlightAuthPolicy::DisabledForLocalReference,
+            FlightScanScopePolicy::DisabledForLocalReference,
+            FlightScanGrantPolicy::DisabledForLocalReference,
+            FlightAccessLogPolicy::Disabled,
+            1,
+        );
+        let _held_slot = server.request_slots.clone().try_acquire_owned().unwrap();
+
+        let info_error = server
+            .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        let schema_error = server
+            .get_schema(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        let do_get_error = match server
+            .do_get(Request::new(ticket.to_arrow_ticket().unwrap()))
+            .await
+        {
+            Ok(_) => panic!("exhausted Flight request slots must fail do_get"),
+            Err(error) => error,
+        };
+
+        assert_eq!(info_error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(schema_error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(do_get_error.code(), tonic::Code::ResourceExhausted);
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
