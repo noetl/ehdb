@@ -25,6 +25,7 @@ use ehdb_transaction::{
     CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
     StorageMutation, StreamMutation, SystemMutation, TransactionRecord,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
@@ -254,13 +255,13 @@ pub struct ScanArrowSnapshot {
     pub predicate: Option<ArrowEqualityPredicate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrowEqualityPredicate {
     pub column: String,
     pub value: ArrowScalarValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArrowScalarValue {
     Utf8(String),
     Int64(i64),

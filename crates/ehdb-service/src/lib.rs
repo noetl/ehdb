@@ -1,20 +1,85 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_flight::{flight_descriptor::DescriptorType, FlightDescriptor, Ticket};
 use arrow_schema::Schema;
 use ehdb_core::{EhdbError, NamespaceName, Result, TableName, TenantId};
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
 use ehdb_storage::ImmutableObjectStore;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanLatestTableRequest {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
     pub table_name: TableName,
     pub projection: Option<Vec<String>>,
     pub predicate: Option<ArrowEqualityPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanFlightTicket {
+    pub version: String,
+    pub request: ScanLatestTableRequest,
+}
+
+impl ScanFlightTicket {
+    pub fn new(request: ScanLatestTableRequest) -> Self {
+        Self {
+            version: SCAN_FLIGHT_TICKET_VERSION.to_string(),
+            request,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_version()?;
+        serde_json::to_vec(self)
+            .map_err(|err| EhdbError::InvalidState(format!("encode scan ticket: {err}")))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let ticket: Self = serde_json::from_slice(bytes)
+            .map_err(|err| EhdbError::InvalidState(format!("decode scan ticket: {err}")))?;
+        ticket.validate_version()?;
+        Ok(ticket)
+    }
+
+    pub fn to_arrow_ticket(&self) -> Result<Ticket> {
+        Ok(Ticket {
+            ticket: self.encode()?.into(),
+        })
+    }
+
+    pub fn from_arrow_ticket(ticket: &Ticket) -> Result<Self> {
+        Self::decode(ticket.ticket.as_ref())
+    }
+
+    pub fn command_descriptor(&self) -> Result<FlightDescriptor> {
+        Ok(FlightDescriptor {
+            r#type: DescriptorType::Cmd as i32,
+            cmd: self.encode()?.into(),
+            path: Vec::new(),
+        })
+    }
+
+    pub fn into_request(self) -> ScanLatestTableRequest {
+        self.request
+    }
+
+    fn validate_version(&self) -> Result<()> {
+        if self.version == SCAN_FLIGHT_TICKET_VERSION {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "unsupported scan ticket version: {}",
+                self.version
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +260,83 @@ mod tests {
         assert!(matches!(error, EhdbError::InvalidState(_)));
     }
 
+    #[test]
+    fn flight_scan_ticket_round_trips_request() {
+        let request = filtered_request();
+        let decoded =
+            ScanFlightTicket::decode(&ScanFlightTicket::new(request.clone()).encode().unwrap())
+                .unwrap();
+
+        assert_eq!(decoded.version, SCAN_FLIGHT_TICKET_VERSION);
+        assert_eq!(decoded.request, request);
+    }
+
+    #[test]
+    fn arrow_flight_ticket_round_trips_request() {
+        let request = filtered_request();
+        let arrow_ticket = ScanFlightTicket::new(request.clone())
+            .to_arrow_ticket()
+            .unwrap();
+        let decoded = ScanFlightTicket::from_arrow_ticket(&arrow_ticket).unwrap();
+
+        assert_eq!(decoded.request, request);
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_unsupported_versions() {
+        let mut ticket = ScanFlightTicket::new(filtered_request());
+        ticket.version = "ehdb.arrow.scan.v0".to_string();
+
+        let error = ticket.encode().unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_malformed_payloads() {
+        let error = ScanFlightTicket::decode(b"not-json").unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn flight_scan_ticket_builds_command_descriptor() {
+        let ticket = ScanFlightTicket::new(filtered_request());
+        let descriptor = ticket.command_descriptor().unwrap();
+
+        assert_eq!(descriptor.r#type, DescriptorType::Cmd as i32);
+        assert!(descriptor.path.is_empty());
+        assert_eq!(
+            ScanFlightTicket::decode(descriptor.cmd.as_ref())
+                .unwrap()
+                .version,
+            SCAN_FLIGHT_TICKET_VERSION
+        );
+    }
+
+    #[test]
+    fn local_scan_service_executes_decoded_flight_ticket() {
+        let (log_path, object_root, runtime, store, _, _, _) =
+            seeded_table("service-flight-ticket");
+        let request = ScanFlightTicket::decode(
+            ScanFlightTicket::new(filtered_request())
+                .to_arrow_ticket()
+                .unwrap()
+                .ticket
+                .as_ref(),
+        )
+        .unwrap()
+        .into_request();
+
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.schema.field(0).name(), "execution_id");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
     fn seeded_table(
         name: &str,
     ) -> (
@@ -240,6 +382,19 @@ mod tests {
             namespace,
             table_name,
         )
+    }
+
+    fn filtered_request() -> ScanLatestTableRequest {
+        ScanLatestTableRequest {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("system").unwrap(),
+            table_name: TableName::new("executions").unwrap(),
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        }
     }
 
     fn temp_log_path(name: &str) -> std::path::PathBuf {
