@@ -19,6 +19,7 @@ use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -29,7 +30,74 @@ pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
     DisabledForLocalReference,
+    HeaderToken { header_name: String, token: String },
     ExternalRequired,
+}
+
+impl FlightAuthPolicy {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::DisabledForLocalReference | Self::ExternalRequired => Ok(()),
+            Self::HeaderToken { header_name, token } => {
+                Self::header_key(header_name).map_err(|err| {
+                    EhdbError::InvalidState(format!("invalid Flight auth header name: {err}"))
+                })?;
+                if token.is_empty() {
+                    return Err(EhdbError::InvalidState(
+                        "Flight auth token must not be empty".to_string(),
+                    ));
+                }
+                if token.len() > 512 {
+                    return Err(EhdbError::InvalidState(
+                        "Flight auth token must not exceed 512 bytes".to_string(),
+                    ));
+                }
+                if token.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Err(EhdbError::InvalidState(
+                        "Flight auth token must not contain control characters".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn authorize_metadata(&self, metadata: &MetadataMap) -> Option<Status> {
+        match self {
+            Self::DisabledForLocalReference => None,
+            Self::HeaderToken { header_name, token } => {
+                let key = match Self::header_key(header_name) {
+                    Ok(key) => key,
+                    Err(_) => return Some(Status::internal("EHDB Flight auth policy is invalid")),
+                };
+                let Some(value) = metadata.get(&key) else {
+                    return Some(Status::unauthenticated(
+                        "EHDB Flight auth header is missing",
+                    ));
+                };
+                if value.to_str().ok() == Some(token.as_str()) {
+                    None
+                } else {
+                    Some(Status::unauthenticated(
+                        "EHDB Flight auth header is invalid",
+                    ))
+                }
+            }
+            Self::ExternalRequired => Some(Status::unimplemented(
+                "EHDB Flight external auth is not implemented",
+            )),
+        }
+    }
+
+    fn header_key(header_name: &str) -> std::result::Result<AsciiMetadataKey, String> {
+        if header_name.is_empty() {
+            return Err("header name must not be empty".to_string());
+        }
+        if header_name.ends_with("-bin") {
+            return Err("binary metadata headers are not supported".to_string());
+        }
+        AsciiMetadataKey::from_bytes(header_name.as_bytes()).map_err(|err| err.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +146,7 @@ impl LocalArrowFlightServerConfig {
                 "Flight max concurrent requests must be greater than zero".to_string(),
             ));
         }
+        self.auth_policy.validate()?;
         if self.auth_policy == FlightAuthPolicy::DisabledForLocalReference
             && !self.bind_addr.ip().is_loopback()
         {
@@ -97,7 +166,10 @@ impl LocalArrowFlightServerConfig {
         S: ImmutableObjectStore + Send + Sync + 'static,
     {
         self.validate()?;
-        Ok(LocalArrowFlightServer::new(runtime, store).into_server_with_config(self))
+        Ok(
+            LocalArrowFlightServer::new_with_auth(runtime, store, self.auth_policy.clone())
+                .into_server_with_config(self),
+        )
     }
 
     pub async fn bind_loopback_listener<S>(
@@ -376,6 +448,7 @@ pub struct LocalArrowFlightServer<S> {
     runtime: Arc<LocalReferenceRuntime>,
     store: Arc<S>,
     service: LocalArrowFlightService,
+    auth_policy: FlightAuthPolicy,
 }
 
 impl<S> LocalArrowFlightServer<S>
@@ -383,10 +456,19 @@ where
     S: ImmutableObjectStore + Send + Sync + 'static,
 {
     pub fn new(runtime: Arc<LocalReferenceRuntime>, store: Arc<S>) -> Self {
+        Self::new_with_auth(runtime, store, FlightAuthPolicy::DisabledForLocalReference)
+    }
+
+    pub fn new_with_auth(
+        runtime: Arc<LocalReferenceRuntime>,
+        store: Arc<S>,
+        auth_policy: FlightAuthPolicy,
+    ) -> Self {
         Self {
             runtime,
             store,
             service: LocalArrowFlightService::default(),
+            auth_policy,
         }
     }
 
@@ -451,6 +533,9 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
+        if let Some(status) = self.auth_policy.authorize_metadata(request.metadata()) {
+            return Err(status);
+        }
         let scan_request =
             Self::request_from_descriptor(request.into_inner()).map_err(error_to_status)?;
         let info = self
@@ -482,6 +567,9 @@ where
         &self,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        if let Some(status) = self.auth_policy.authorize_metadata(request.metadata()) {
+            return Err(status);
+        }
         let data = self
             .service
             .do_get(&self.runtime, self.store.as_ref(), request.get_ref())
@@ -1024,6 +1112,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_flight_server_enforces_header_token_auth() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-server-auth");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+        let server = LocalArrowFlightServer::new_with_auth(
+            Arc::new(runtime),
+            Arc::new(store),
+            FlightAuthPolicy::HeaderToken {
+                header_name: "x-ehdb-auth".to_string(),
+                token: "local-secret".to_string(),
+            },
+        );
+
+        let missing_error = server
+            .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_error.code(), tonic::Code::Unauthenticated);
+
+        let mut wrong_request = Request::new(ticket.command_descriptor().unwrap());
+        wrong_request
+            .metadata_mut()
+            .insert("x-ehdb-auth", "wrong-secret".parse().unwrap());
+        let wrong_error = server.get_flight_info(wrong_request).await.unwrap_err();
+        assert_eq!(wrong_error.code(), tonic::Code::Unauthenticated);
+
+        let mut info_request = Request::new(ticket.command_descriptor().unwrap());
+        info_request
+            .metadata_mut()
+            .insert("x-ehdb-auth", "local-secret".parse().unwrap());
+        let info = server
+            .get_flight_info(info_request)
+            .await
+            .unwrap()
+            .into_inner();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+
+        match server.do_get(Request::new(endpoint_ticket.clone())).await {
+            Ok(_) => panic!("missing Flight auth token must fail"),
+            Err(error) => assert_eq!(error.code(), tonic::Code::Unauthenticated),
+        }
+
+        let mut do_get_request = Request::new(endpoint_ticket);
+        do_get_request
+            .metadata_mut()
+            .insert("x-ehdb-auth", "local-secret".parse().unwrap());
+        let flight_data = server
+            .do_get(do_get_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(decoded.row_count, 1);
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_flight_server_rejects_non_command_descriptors() {
         let log_path = temp_log_path("local-flight-server-path-descriptor");
         let object_root = temp_object_root("local-flight-server-path-descriptor");
@@ -1188,6 +1350,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_client_uses_header_token_auth_over_loopback_listener() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-client-auth-smoke");
+        let config = LocalArrowFlightServerConfig {
+            auth_policy: FlightAuthPolicy::HeaderToken {
+                header_name: "x-ehdb-auth".to_string(),
+                token: "local-secret".to_string(),
+            },
+            ..LocalArrowFlightServerConfig::default()
+        };
+        let listener = config
+            .bind_loopback_listener(Arc::new(runtime), Arc::new(store))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(listener.serve_with_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let ticket = ScanFlightTicket::new(request);
+
+        let missing_error = FlightClient::new(channel.clone())
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap_err();
+        match missing_error {
+            arrow_flight::error::FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+            error => panic!("expected tonic unauthenticated error, got {error:?}"),
+        }
+
+        let mut client = FlightClient::new(channel);
+        client.add_header("x-ehdb-auth", "local-secret").unwrap();
+        let info = client
+            .get_flight_info(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
+        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let batches = client
+            .do_get(endpoint_ticket)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        drop(client);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn flight_listener_rejects_non_loopback_even_with_external_auth_policy() {
         let log_path = temp_log_path("local-flight-listener-non-loopback");
         let object_root = temp_object_root("local-flight-listener-non-loopback");
@@ -1277,6 +1518,66 @@ mod tests {
 
         config.auth_policy = FlightAuthPolicy::ExternalRequired;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn flight_header_token_auth_policy_validates_metadata() {
+        let policy = FlightAuthPolicy::HeaderToken {
+            header_name: "x-ehdb-auth".to_string(),
+            token: "local-secret".to_string(),
+        };
+        let mut metadata = MetadataMap::new();
+        metadata.insert("x-ehdb-auth", "local-secret".parse().unwrap());
+
+        policy.validate().unwrap();
+        assert!(policy.authorize_metadata(&metadata).is_none());
+
+        let missing = FlightAuthPolicy::HeaderToken {
+            header_name: "x-ehdb-auth".to_string(),
+            token: "local-secret".to_string(),
+        }
+        .authorize_metadata(&MetadataMap::new())
+        .unwrap();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn flight_header_token_auth_policy_rejects_invalid_contracts() {
+        let empty_header = FlightAuthPolicy::HeaderToken {
+            header_name: String::new(),
+            token: "local-secret".to_string(),
+        };
+        assert!(matches!(
+            empty_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let binary_header = FlightAuthPolicy::HeaderToken {
+            header_name: "x-ehdb-auth-bin".to_string(),
+            token: "local-secret".to_string(),
+        };
+        assert!(matches!(
+            binary_header.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let empty_token = FlightAuthPolicy::HeaderToken {
+            header_name: "x-ehdb-auth".to_string(),
+            token: String::new(),
+        };
+        assert!(matches!(
+            empty_token.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
+
+        let control_token = FlightAuthPolicy::HeaderToken {
+            header_name: "x-ehdb-auth".to_string(),
+            token: "bad\nsecret".to_string(),
+        };
+        assert!(matches!(
+            control_token.validate(),
+            Err(EhdbError::InvalidState(_))
+        ));
     }
 
     #[test]
