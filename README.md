@@ -271,6 +271,15 @@ that replayed metadata through `FlightScanGrantPolicy` for local Arrow
 Flight scan authorization. Production IAM, policy evaluation,
 revocation, and non-loopback service exposure remain future surfaces.
 
+`ehdb-retrieval` now includes a local exact cosine-similarity fixture
+over registered chunk embeddings. `VectorSearch` scopes candidates by
+tenant, namespace, and embedding model, validates finite non-zero query
+and embedding vectors, applies dimension compatibility, and returns
+deterministically ordered `VectorSearchHit` results. This is a local
+reference RAG primitive only; ANN indexes, retrieval services,
+production IAM, Qdrant adapters, and distributed query execution remain
+future surfaces.
+
 ## Replay Reference
 
 `ehdb-reference` applies replayed `TransactionRecord` values to the
