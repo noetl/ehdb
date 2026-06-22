@@ -4,6 +4,7 @@ members = [
     "crates/ehdb-core",
     "crates/ehdb-reference",
     "crates/ehdb-retrieval",
+    "crates/ehdb-service",
     "crates/ehdb-storage",
     "crates/ehdb-stream",
     "crates/ehdb-system",
@@ -26,6 +27,7 @@ ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
 ehdb-reference = { path = "crates/ehdb-reference" }
 ehdb-retrieval = { path = "crates/ehdb-retrieval" }
+ehdb-service = { path = "crates/ehdb-service" }
 ehdb-storage = { path = "crates/ehdb-storage" }
 ehdb-stream = { path = "crates/ehdb-stream" }
 ehdb-system = { path = "crates/ehdb-system" }
