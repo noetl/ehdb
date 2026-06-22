@@ -115,6 +115,14 @@ placement, and data-gravity shard together, rejects conflicting metadata
 for the same object path, and can feed `plan_replication` from registry
 state instead of caller-supplied arrays.
 
+`LocalReplicationExecutor` is the bounded local execution reference for
+copy-needed plans. It verifies source bytes through the immutable object
+store and records successful target replicas by appending
+`StorageMutation::RegisterReplica` transactions through
+`LocalReferenceRuntime`. Already-satisfied plans are no-ops. It does not
+add background schedulers, cloud transfer adapters, or gateway
+data-touch behavior.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
@@ -186,17 +194,18 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
-| `replication_plan_from_registry_1000` | 1000 three-target replication plans from registry state | ~3.82 ms |
-| `replication_plan_1000` | 1000 three-target replication plans | ~2.95 ms |
-| `replica_registry_register_1000` | 1000 object replica registrations | ~1.10 ms |
-| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.17 ms |
-| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~1.98 ms |
-| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~16.0 ms |
-| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~635 us |
-| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.16 ms |
-| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~509 ms |
-| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~507 ms |
-| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~516 ms |
+| `local_replication_executor/register_25` | 25 verified source reads + fsynced replica-registration transactions + reopen | ~139 ms |
+| `replication_plan_from_registry_1000` | 1000 three-target replication plans from registry state | ~3.75 ms |
+| `replication_plan_1000` | 1000 three-target replication plans | ~2.81 ms |
+| `replica_registry_register_1000` | 1000 object replica registrations | ~1.08 ms |
+| `placement_policy_validate_1000` | 1000 three-target placement policy validations | ~1.15 ms |
+| `catalog_commit_snapshots_1000` | 1000 catalog snapshot commits + latest lookup | ~2.00 ms |
+| `local_object_store/put_get_verified_100` | 100 immutable 4 KiB local object puts + verified reads | ~20.2 ms |
+| `stream_publish_replay_1000` | 1000 stream publishes + full replay | ~630 us |
+| `transaction_append_replay_1000` | 1000 replay-complete transaction appends + full replay | ~1.17 ms |
+| `local_reference_runtime/append_reopen_100` | create stream + 100 projection-validated fsynced transaction appends + reopen + replay | ~441 ms |
+| `local_transaction_jsonl/append_reopen_100` | 100 fsynced replay-complete JSONL appends + reopen + full replay | ~541 ms |
+| `local_stream_jsonl/publish_reopen_100` | 100 fsynced stream publishes + reopen + full replay | ~523 ms |
 
 ## Design
 
