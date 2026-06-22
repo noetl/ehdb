@@ -1,11 +1,23 @@
+use std::sync::Arc;
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+};
+
+use arrow_array::RecordBatch;
+use arrow_ipc::{reader::FileReader, writer::FileWriter};
+use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, InMemoryCatalog};
-use ehdb_core::{EhdbError, NamespaceName, Result, TenantId, TransactionId};
+use ehdb_core::{
+    ColumnSchema, EhdbError, NamespaceName, Result, SnapshotId, TableName, TableSchema, TenantId,
+    TransactionId,
+};
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
 use ehdb_storage::{
-    ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectRef, ObjectReplica,
-    ReplicationAction, ReplicationPlan,
+    table_snapshot_object_path, ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectRef,
+    ObjectReplica, ReplicationAction, ReplicationPlan,
 };
 use ehdb_stream::{InMemoryStreamLog, StreamConfig, StreamSequence};
 use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
@@ -13,7 +25,6 @@ use ehdb_transaction::{
     CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
     StorageMutation, StreamMutation, SystemMutation, TransactionRecord,
 };
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
@@ -113,6 +124,137 @@ impl LocalReplicationExecutor {
             registered: replicas,
             record: Some(record),
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteArrowIpcTable {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub table_name: TableName,
+    pub snapshot_id: SnapshotId,
+    pub create_transaction_id: TransactionId,
+    pub snapshot_transaction_id: TransactionId,
+    pub file_name: String,
+    pub batch: RecordBatch,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrowIpcTableSnapshot {
+    pub table: ehdb_catalog::CatalogTable,
+    pub snapshot: ehdb_catalog::CatalogSnapshot,
+    pub object: ObjectRef,
+    pub create_record: TransactionRecord,
+    pub snapshot_record: TransactionRecord,
+}
+
+#[derive(Debug, Default)]
+pub struct LocalArrowIpcTableStore;
+
+impl LocalArrowIpcTableStore {
+    pub fn write_batch<S: ImmutableObjectStore>(
+        &self,
+        runtime: &mut LocalReferenceRuntime,
+        store: &S,
+        request: WriteArrowIpcTable,
+    ) -> Result<ArrowIpcTableSnapshot> {
+        let table_id = ehdb_core::TableId::new(format!(
+            "{}_{}_{}",
+            request.tenant, request.namespace, request.table_name
+        ))?;
+        let object_path = table_snapshot_object_path(
+            &request.tenant,
+            &request.namespace,
+            &table_id,
+            &request.snapshot_id,
+            &request.file_name,
+        )?;
+        let bytes = encode_record_batch(&request.batch)?;
+        let object = store.put_if_absent(object_path, &bytes)?;
+        let schema = table_schema_from_batch(&request.batch)?;
+
+        let create_record = runtime.append(CommitTransaction {
+            transaction_id: request.create_transaction_id,
+            tenant: request.tenant.clone(),
+            namespace: request.namespace.clone(),
+            mutations: vec![Mutation::Catalog(CatalogMutation::CreateTable {
+                table_id: table_id.clone(),
+                table_name: request.table_name.clone(),
+                schema,
+            })],
+        })?;
+
+        let table = runtime
+            .state()
+            .catalog
+            .get_table(&request.tenant, &request.namespace, &request.table_name)?
+            .clone();
+
+        let parent_snapshot = runtime
+            .state()
+            .catalog
+            .latest_snapshot(&request.tenant, &request.namespace, &table.id)
+            .ok()
+            .map(|snapshot| snapshot.id.clone());
+        let snapshot_record = runtime.append(CommitTransaction {
+            transaction_id: request.snapshot_transaction_id,
+            tenant: request.tenant.clone(),
+            namespace: request.namespace.clone(),
+            mutations: vec![Mutation::Catalog(CatalogMutation::CommitSnapshot {
+                table_id: table.id.clone(),
+                snapshot_id: request.snapshot_id.clone(),
+                parent_snapshot,
+                files: vec![object.clone()],
+            })],
+        })?;
+
+        let snapshot = runtime
+            .state()
+            .catalog
+            .latest_snapshot(&request.tenant, &request.namespace, &table.id)?
+            .clone();
+
+        Ok(ArrowIpcTableSnapshot {
+            table,
+            snapshot,
+            object,
+            create_record,
+            snapshot_record,
+        })
+    }
+
+    pub fn read_latest<S: ImmutableObjectStore>(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        store: &S,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        table_name: &TableName,
+    ) -> Result<Vec<RecordBatch>> {
+        let table = runtime
+            .state()
+            .catalog
+            .get_table(tenant, namespace, table_name)?;
+        let snapshot = runtime
+            .state()
+            .catalog
+            .latest_snapshot(tenant, namespace, &table.id)?;
+        let expected_schema = arrow_schema_from_table(&table.schema);
+
+        let mut batches = Vec::new();
+        for object in &snapshot.files {
+            let bytes = store.get_verified(object)?;
+            for batch in decode_record_batches(&bytes)? {
+                if batch.schema().as_ref() != expected_schema.as_ref() {
+                    return Err(EhdbError::InvalidState(format!(
+                        "arrow ipc schema mismatch for {}",
+                        object.path.as_str()
+                    )));
+                }
+                batches.push(batch);
+            }
+        }
+        Ok(batches)
     }
 }
 
@@ -364,6 +506,63 @@ impl ReferenceDatabase {
     }
 }
 
+fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = FileWriter::try_new(&mut bytes, batch.schema().as_ref())
+            .map_err(|err| EhdbError::Storage(format!("arrow ipc writer init failed: {err}")))?;
+        writer
+            .write(batch)
+            .map_err(|err| EhdbError::Storage(format!("arrow ipc write failed: {err}")))?;
+        writer
+            .finish()
+            .map_err(|err| EhdbError::Storage(format!("arrow ipc finish failed: {err}")))?;
+    }
+    Ok(bytes)
+}
+
+fn decode_record_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    let reader = FileReader::try_new(Cursor::new(bytes), None)
+        .map_err(|err| EhdbError::Storage(format!("arrow ipc reader init failed: {err}")))?;
+    reader
+        .map(|batch| {
+            batch.map_err(|err| EhdbError::Storage(format!("arrow ipc read failed: {err}")))
+        })
+        .collect()
+}
+
+fn table_schema_from_batch(batch: &RecordBatch) -> Result<TableSchema> {
+    let columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            ColumnSchema::new(
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    TableSchema::new(columns)
+}
+
+fn arrow_schema_from_table(schema: &TableSchema) -> Arc<Schema> {
+    Arc::new(Schema::new(
+        schema
+            .columns()
+            .iter()
+            .map(|column| {
+                Field::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
 fn validate_plan_matches_source(source: &ObjectRef, plan: &ReplicationPlan) -> Result<()> {
     if plan.object_path != source.path {
         return Err(EhdbError::InvalidState(format!(
@@ -413,10 +612,15 @@ fn replicas_to_register(source: &ObjectRef, plan: &ReplicationPlan) -> Result<Ve
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{Field, Schema};
     use ehdb_core::{
         ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EmbeddingModelId, NamespaceName,
         SnapshotId, StreamName, TableId, TableName, TableSchema, TenantId, TransactionId,
@@ -483,6 +687,21 @@ mod tests {
             vec![
                 PlacementTarget::primary(ObjectPlacement::local_dev()),
                 PlacementTarget::replica(gcp_local_shard_replica()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn arrow_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("execution_id", DataType::Utf8, false),
+            Field::new("attempt", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["exec-1", "exec-2"])),
+                Arc::new(Int64Array::from(vec![1, 2])),
             ],
         )
         .unwrap()
@@ -733,6 +952,126 @@ mod tests {
         assert!(runtime.replay().is_empty());
         assert!(!log_path.exists());
 
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_ipc_fixture_writes_snapshot_and_reads_batch() {
+        let log_path = temp_log_path("arrow-ipc");
+        let object_root = temp_object_root("arrow-ipc");
+        let (tenant, namespace) = ids();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+        let written = LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: TableName::new("executions").unwrap(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(written.table.id.as_str(), "tenant-a_system_executions");
+        assert_eq!(written.snapshot.files, vec![written.object.clone()]);
+        assert_eq!(runtime.state().catalog.table_count(), 1);
+        assert_eq!(runtime.state().catalog.snapshot_count(), 1);
+
+        let batches = LocalArrowIpcTableStore
+            .read_latest(
+                &runtime,
+                &store,
+                &tenant,
+                &namespace,
+                &TableName::new("executions").unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        let execution_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let attempts = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-1");
+        assert_eq!(execution_ids.value(1), "exec-2");
+        assert_eq!(attempts.value(0), 1);
+        assert_eq!(attempts.value(1), 2);
+        drop(runtime);
+
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        assert_eq!(reopened.state().catalog.snapshot_count(), 1);
+        assert_eq!(
+            LocalArrowIpcTableStore
+                .read_latest(
+                    &reopened,
+                    &store,
+                    &tenant,
+                    &namespace,
+                    &TableName::new("executions").unwrap(),
+                )
+                .unwrap()[0]
+                .num_rows(),
+            2
+        );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_ipc_fixture_rejects_corrupt_object_before_decode() {
+        let log_path = temp_log_path("arrow-ipc-corrupt");
+        let object_root = temp_object_root("arrow-ipc-corrupt");
+        let (tenant, namespace) = ids();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+
+        let written = LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: TableName::new("executions").unwrap(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+        fs::write(object_root.join(written.object.path.as_str()), b"corrupt").unwrap();
+
+        let error = LocalArrowIpcTableStore
+            .read_latest(
+                &runtime,
+                &store,
+                &tenant,
+                &namespace,
+                &TableName::new("executions").unwrap(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
+
+        fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
     }
 

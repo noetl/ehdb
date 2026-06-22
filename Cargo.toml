@@ -18,6 +18,8 @@ repository = "https://github.com/noetl/ehdb"
 rust-version = "1.82"
 
 [workspace.dependencies]
+arrow-array = "53"
+arrow-ipc = "53"
 arrow-schema = { version = "53", features = ["serde"] }
 criterion = "0.5"
 ehdb-catalog = { path = "crates/ehdb-catalog" }
