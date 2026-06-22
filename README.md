@@ -198,6 +198,12 @@ TLS/auth implementation, request scheduling, gateway integration, SQL
 planning, predicate pushdown, and distributed execution remain out of
 scope.
 
+The loopback client smoke path starts that listener and connects with
+the Arrow Flight client over tonic/gRPC transport. It calls
+`get_flight_info`, follows the returned endpoint ticket with `do_get`,
+and decodes the returned Arrow batches. This remains a local-reference
+test path, not a gateway integration.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
