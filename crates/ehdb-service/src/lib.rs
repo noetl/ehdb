@@ -11,10 +11,14 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
-use ehdb_core::{EhdbError, NamespaceName, PrincipalId, Result, TableName, TenantId};
+use ehdb_core::{
+    ChunkId, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, PrincipalId, Result,
+    TableName, TenantId,
+};
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
+use ehdb_retrieval::VectorSearch;
 use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -721,6 +725,62 @@ impl LocalArrowScanService {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSimilarChunksRequest {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub model_id: EmbeddingModelId,
+    pub query: Vec<f32>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSimilarChunksHit {
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
+    pub ordinal: u32,
+    pub text: String,
+    pub checksum: String,
+    pub model_id: EmbeddingModelId,
+    pub dimensions: usize,
+    pub score: f32,
+}
+
+#[derive(Debug, Default)]
+pub struct LocalRetrievalSearchService;
+
+impl LocalRetrievalSearchService {
+    pub fn search_similar(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request: SearchSimilarChunksRequest,
+    ) -> Result<Vec<SearchSimilarChunksHit>> {
+        let hits = runtime
+            .state()
+            .retrieval
+            .search_similar(VectorSearch {
+                tenant: request.tenant,
+                namespace: request.namespace,
+                model_id: request.model_id,
+                query: request.query,
+                limit: request.limit,
+            })?
+            .into_iter()
+            .map(|hit| SearchSimilarChunksHit {
+                chunk_id: hit.chunk.id,
+                document_id: hit.chunk.document_id,
+                ordinal: hit.chunk.ordinal,
+                text: hit.chunk.text,
+                checksum: hit.chunk.checksum,
+                model_id: hit.embedding.model_id,
+                dimensions: hit.embedding.dimensions,
+                score: hit.score,
+            })
+            .collect();
+        Ok(hits)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LocalArrowFlightService {
     scan: LocalArrowScanService,
@@ -1240,14 +1300,14 @@ mod tests {
     use arrow_flight::FlightClient;
     use arrow_schema::{DataType, Field, Schema};
     use ehdb_core::{
-        EhdbError, NamespaceName, PrincipalId, SnapshotId, TableId, TableName, TenantId,
-        TransactionId,
+        ChunkId, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, PrincipalId, SnapshotId,
+        TableId, TableName, TenantId, TransactionId,
     };
     use ehdb_reference::{
         ArrowScalarValue, LocalArrowIpcTableStore, LocalReferenceRuntime, WriteArrowIpcTable,
     };
     use ehdb_storage::LocalObjectStore;
-    use ehdb_transaction::{CatalogMutation, CommitTransaction, Mutation};
+    use ehdb_transaction::{CatalogMutation, CommitTransaction, Mutation, RetrievalMutation};
     use futures_util::TryStreamExt;
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
@@ -1346,6 +1406,83 @@ mod tests {
         if object_root.exists() {
             fs::remove_dir_all(object_root).unwrap();
         }
+    }
+
+    #[test]
+    fn local_retrieval_search_service_returns_ranked_hits_from_replay() {
+        let log_path = temp_log_path("local-retrieval-search-service-ranked");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let hits = service
+            .search_similar(
+                &reopened,
+                SearchSimilarChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    limit: 10,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].chunk_id, ChunkId::new("chunk-close").unwrap());
+        assert_eq!(hits[0].document_id, DocumentId::new("doc-a").unwrap());
+        assert_eq!(hits[0].ordinal, 0);
+        assert_eq!(hits[0].text, "close local retrieval hit");
+        assert_eq!(hits[0].checksum, "sha256-close");
+        assert_eq!(
+            hits[0].model_id,
+            EmbeddingModelId::new("text-embedding-local").unwrap()
+        );
+        assert_eq!(hits[0].dimensions, 2);
+        assert_eq!(hits[0].score, 1.0);
+        assert_eq!(hits[1].chunk_id, ChunkId::new("chunk-farther").unwrap());
+        assert!(hits[1].score < hits[0].score);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_search_service_handles_empty_and_invalid_queries() {
+        let log_path = temp_log_path("local-retrieval-search-service-validation");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let empty = service
+            .search_similar(
+                &runtime,
+                SearchSimilarChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("missing").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let invalid = service
+            .search_similar(
+                &runtime,
+                SearchSimilarChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![0.0, 0.0],
+                    limit: 10,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(invalid, EhdbError::InvalidState(_)));
+
+        fs::remove_file(log_path).unwrap();
     }
 
     #[test]
@@ -2929,6 +3066,83 @@ mod tests {
                     table_id: TableId::new("tenant-a_system_executions")?,
                     principal: PrincipalId::new(principal)?,
                 })],
+            })
+            .map(|_| ())
+    }
+
+    fn seed_retrieval_vectors(runtime: &mut LocalReferenceRuntime) -> Result<()> {
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-retrieval-tenant-a")?,
+                tenant: TenantId::new("tenant-a")?,
+                namespace: NamespaceName::new("knowledge")?,
+                mutations: vec![
+                    Mutation::Retrieval(RetrievalMutation::RegisterDocument {
+                        document_id: DocumentId::new("doc-a")?,
+                        source_uri: "artifact://tenant-a/doc-a.md".to_string(),
+                        content_type: "text/markdown".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterChunk {
+                        document_id: DocumentId::new("doc-a")?,
+                        chunk_id: ChunkId::new("chunk-close")?,
+                        ordinal: 0,
+                        text: "close local retrieval hit".to_string(),
+                        checksum: "sha256-close".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterChunk {
+                        document_id: DocumentId::new("doc-a")?,
+                        chunk_id: ChunkId::new("chunk-farther")?,
+                        ordinal: 1,
+                        text: "farther local retrieval hit".to_string(),
+                        checksum: "sha256-farther".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
+                        chunk_id: ChunkId::new("chunk-close")?,
+                        model_id: EmbeddingModelId::new("text-embedding-local")?,
+                        dimensions: 2,
+                        vector: vec![1.0, 0.0],
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
+                        chunk_id: ChunkId::new("chunk-farther")?,
+                        model_id: EmbeddingModelId::new("text-embedding-local")?,
+                        dimensions: 2,
+                        vector: vec![0.5, 0.5],
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
+                        chunk_id: ChunkId::new("chunk-farther")?,
+                        model_id: EmbeddingModelId::new("text-embedding-other")?,
+                        dimensions: 2,
+                        vector: vec![1.0, 0.0],
+                    }),
+                ],
+            })
+            .map(|_| ())?;
+
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-retrieval-tenant-b")?,
+                tenant: TenantId::new("tenant-b")?,
+                namespace: NamespaceName::new("knowledge")?,
+                mutations: vec![
+                    Mutation::Retrieval(RetrievalMutation::RegisterDocument {
+                        document_id: DocumentId::new("doc-b")?,
+                        source_uri: "artifact://tenant-b/doc-b.md".to_string(),
+                        content_type: "text/markdown".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterChunk {
+                        document_id: DocumentId::new("doc-b")?,
+                        chunk_id: ChunkId::new("chunk-other-tenant")?,
+                        ordinal: 0,
+                        text: "other tenant retrieval hit".to_string(),
+                        checksum: "sha256-other-tenant".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
+                        chunk_id: ChunkId::new("chunk-other-tenant")?,
+                        model_id: EmbeddingModelId::new("text-embedding-local")?,
+                        dimensions: 2,
+                        vector: vec![1.0, 0.0],
+                    }),
+                ],
             })
             .map(|_| ())
     }
