@@ -198,6 +198,36 @@ impl LocalArrowScanService {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct LocalArrowFlightService {
+    scan: LocalArrowScanService,
+}
+
+impl LocalArrowFlightService {
+    pub fn get_flight_info<S: ImmutableObjectStore>(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        store: &S,
+        request: ScanLatestTableRequest,
+    ) -> Result<FlightInfo> {
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = self.scan.scan_latest(runtime, store, request)?;
+        result.to_flight_info(&ticket)
+    }
+
+    pub fn do_get<S: ImmutableObjectStore>(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        store: &S,
+        ticket: &Ticket,
+    ) -> Result<Vec<FlightData>> {
+        let request = ScanFlightTicket::from_arrow_ticket(ticket)?.into_request();
+        self.scan
+            .scan_latest(runtime, store, request)?
+            .to_flight_data()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -548,6 +578,87 @@ mod tests {
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_flight_service_returns_info_and_do_get_stream() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("local-flight-service");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: Some(vec!["execution_id".to_string()]),
+            predicate: Some(ArrowEqualityPredicate {
+                column: "attempt".to_string(),
+                value: ArrowScalarValue::Int64(2),
+            }),
+        };
+        let service = LocalArrowFlightService::default();
+
+        let info = service.get_flight_info(&runtime, &store, request).unwrap();
+        let endpoint_ticket = info.endpoint[0].ticket.as_ref().unwrap();
+        let flight_data = service.do_get(&runtime, &store, endpoint_ticket).unwrap();
+        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+
+        assert_eq!(info.total_records, 1);
+        assert_eq!(decoded.row_count, 1);
+        assert_eq!(decoded.schema.field(0).name(), "execution_id");
+        let execution_ids = decoded.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_flight_service_rejects_malformed_do_get_ticket() {
+        let log_path = temp_log_path("local-flight-service-bad-ticket");
+        let object_root = temp_object_root("local-flight-service-bad-ticket");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let ticket = Ticket {
+            ticket: b"not-json".to_vec().into(),
+        };
+
+        let error = LocalArrowFlightService::default()
+            .do_get(&runtime, &store, &ticket)
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_flight_service_propagates_missing_table_errors() {
+        let log_path = temp_log_path("local-flight-service-missing-table");
+        let object_root = temp_object_root("local-flight-service-missing-table");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let request = ScanLatestTableRequest {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("system").unwrap(),
+            table_name: TableName::new("missing").unwrap(),
+            projection: None,
+            predicate: None,
+        };
+
+        let error = LocalArrowFlightService::default()
+            .get_flight_info(&runtime, &store, request)
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::NotFound(_)));
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
     }
 
     fn seeded_table(
