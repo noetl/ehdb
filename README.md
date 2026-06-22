@@ -42,11 +42,12 @@ crates/
 |-- ehdb-stream    # stream logs, durable consumers, replay cursors
 |-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
 |-- ehdb-system    # system WASM library manifests and environment bindings
+|-- ehdb-service   # service-facing request/result boundaries
 `-- ehdb-transaction # transaction records, replay, local durable log
 ```
 
-Future workspace areas include analytical read paths, service APIs, and
-NoETL integration surfaces.
+Future workspace areas include network services, analytical execution,
+and NoETL integration surfaces.
 
 ## Local Durability
 
@@ -143,6 +144,13 @@ This is intentionally not predicate pushdown; object statistics,
 partition pruning, SQL planning, distributed execution, and Arrow Flight
 remain future work.
 
+`ehdb-service` adds the first service-facing scan boundary. Its local
+adapter wraps `LocalArrowSnapshotScanner` with a typed latest-table scan
+request and an `ArrowScanResult` carrying schema, batches, and row
+count. This prepares the Arrow Flight read path without introducing a
+network server, SQL planner, distributed executor, or gateway direct
+read behavior.
+
 ## Catalog Snapshots
 
 `ehdb-catalog` stores immutable table snapshot metadata over
@@ -207,6 +215,7 @@ cargo bench --workspace --no-run
 cargo bench -p ehdb-catalog --bench snapshots
 cargo bench -p ehdb-storage --bench local_store
 cargo bench -p ehdb-reference --bench local_runtime
+cargo bench -p ehdb-service --bench local_scan_service
 cargo bench -p ehdb-transaction --bench reference_models
 ```
 
@@ -214,6 +223,7 @@ Current reference benchmark baseline on the initial local models:
 
 | Benchmark | Workload | Baseline |
 |---|---|---|
+| `local_arrow_scan_service/filter_project_latest_100` | 100 service-boundary latest-snapshot scans with equality filter and two-column projection | ~12.0 ms |
 | `local_arrow_scan/filter_project_latest_100` | 100 verified latest-snapshot scans with equality filter and two-column projection | ~13.0 ms |
 | `local_arrow_ipc_table/write_read_10` | 10 Arrow IPC write + catalog snapshot + verified read cycles | ~111 ms |
 | `local_replication_executor/register_25` | 25 verified source reads + fsynced replica-registration transactions + reopen | ~159 ms |

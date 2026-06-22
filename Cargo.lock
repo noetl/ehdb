@@ -446,6 +446,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-service"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "criterion",
+ "ehdb-core",
+ "ehdb-reference",
+ "ehdb-storage",
+]
+
+[[package]]
 name = "ehdb-storage"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "ehdb-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+ehdb-core.workspace = true
+ehdb-reference.workspace = true
+ehdb-storage.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "local_scan_service"
+harness = false
