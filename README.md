@@ -197,6 +197,13 @@ and non-empty token, then requires that token on scan calls. This is an
 auth-boundary contract for tests and local harnesses, not production
 TLS, identity federation, ACL enforcement, or gateway read routing.
 
+The configured `max_concurrent_requests` value is enforced by a local
+fail-fast semaphore on implemented scan methods: `get_flight_info`,
+`get_schema`, and `do_get`. When the local request budget is exhausted,
+the generated service returns gRPC `RESOURCE_EXHAUSTED`. This is a
+local reference guard, not a request scheduler or distributed admission
+controller.
+
 `FlightAccessLogPolicy` keeps scan access summaries bounded and
 DEBUG-only by default. `DebugOnly` emits structured summaries for
 decoded `get_flight_info`, `get_schema`, and `do_get` requests with
