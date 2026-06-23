@@ -375,6 +375,7 @@ fn apply_journal_entry(
 
 impl InMemorySystemLibraryCatalog {
     pub fn publish(&mut self, request: PublishSystemLibrary) -> Result<WasmSystemLibrary> {
+        validate_publish_request(&request)?;
         if request.entry.is_empty() {
             return Err(EhdbError::InvalidIdentifier(
                 "system library entry export is required".to_string(),
@@ -421,6 +422,7 @@ impl InMemorySystemLibraryCatalog {
     }
 
     pub fn bind(&mut self, request: BindSystemLibrary) -> Result<SystemLibraryBinding> {
+        validate_bind_request(&request)?;
         self.library(&request.path, request.revision, &request.digest)?;
         let key = BindingKey {
             tenant: request.tenant.clone(),
@@ -486,6 +488,25 @@ impl InMemorySystemLibraryCatalog {
     }
 }
 
+fn validate_publish_request(request: &PublishSystemLibrary) -> Result<()> {
+    SystemLibraryPath::new(request.path.as_str()).map(|_| ())?;
+    SystemLibraryRevision::new(request.revision.value()).map(|_| ())?;
+    ModuleDigest::new(request.digest.as_str()).map(|_| ())?;
+    ObjectPath::new(request.object_path.as_str()).map(|_| ())?;
+    TransactionId::new(request.transaction_id.as_str()).map(|_| ())
+}
+
+fn validate_bind_request(request: &BindSystemLibrary) -> Result<()> {
+    TenantId::new(request.tenant.as_str()).map(|_| ())?;
+    NamespaceName::new(request.namespace.as_str()).map(|_| ())?;
+    EnvironmentName::new(request.environment.as_str()).map(|_| ())?;
+    ReleaseChannel::new(request.channel.as_str()).map(|_| ())?;
+    SystemLibraryPath::new(request.path.as_str()).map(|_| ())?;
+    SystemLibraryRevision::new(request.revision.value()).map(|_| ())?;
+    ModuleDigest::new(request.digest.as_str()).map(|_| ())?;
+    TransactionId::new(request.transaction_id.as_str()).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -530,6 +551,55 @@ mod tests {
             capabilities: vec![SystemCapability::EhdbCatalogWrite],
             transaction_id: TransactionId::new(format!("txn-publish-{revision}-{suffix}")).unwrap(),
         }
+    }
+
+    fn bind_request(
+        library: &WasmSystemLibrary,
+        tenant: TenantId,
+        namespace: NamespaceName,
+        transaction_id: &str,
+    ) -> BindSystemLibrary {
+        BindSystemLibrary {
+            tenant,
+            namespace,
+            environment: EnvironmentName::new("kind").unwrap(),
+            channel: ReleaseChannel::stable(),
+            path: library.path.clone(),
+            revision: library.revision,
+            digest: library.digest.clone(),
+            transaction_id: TransactionId::new(transaction_id).unwrap(),
+        }
+    }
+
+    fn write_raw_journal(path: &Path, entries: &[serde_json::Value]) {
+        let text = entries
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{text}\n")).unwrap();
+    }
+
+    fn publish_entry_json() -> serde_json::Value {
+        serde_json::to_value(SystemLibraryJournalEntry::Publish(publish_request(
+            "system/catalog/bootstrap",
+            1,
+            '1',
+        )))
+        .unwrap()
+    }
+
+    fn publish_bind_entry_json() -> (serde_json::Value, serde_json::Value) {
+        let (tenant, namespace) = tenant_namespace();
+        let mut catalog = InMemorySystemLibraryCatalog::default();
+        let publish = publish_request("system/catalog/bootstrap", 1, '1');
+        let library = catalog.publish(publish.clone()).unwrap();
+        let bind = bind_request(&library, tenant, namespace, "txn-bind-1");
+
+        (
+            serde_json::to_value(SystemLibraryJournalEntry::Publish(publish)).unwrap(),
+            serde_json::to_value(SystemLibraryJournalEntry::Bind(bind)).unwrap(),
+        )
     }
 
     #[test]
@@ -786,6 +856,81 @@ mod tests {
         assert_eq!(reopened.binding_count(), 1);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_catalog_rejects_invalid_publish_identifiers_on_replay() {
+        for (index, (pointer, value, invalid_identifier)) in [
+            ("/Publish/path", serde_json::json!("../escape"), true),
+            ("/Publish/revision", serde_json::json!(0), false),
+            (
+                "/Publish/digest",
+                serde_json::json!("sha256:not-a-valid-digest"),
+                true,
+            ),
+            (
+                "/Publish/object_path",
+                serde_json::json!("../unsafe/module.wasm"),
+                false,
+            ),
+            (
+                "/Publish/transaction_id",
+                serde_json::json!("txn publish bad"),
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temp_log_path(&format!("invalid-publish-{index}"));
+            let mut publish = publish_entry_json();
+            *publish.pointer_mut(pointer).unwrap() = value;
+
+            write_raw_journal(&path, &[publish]);
+
+            let error = LocalJsonlSystemLibraryCatalog::open(&path).unwrap_err();
+            if invalid_identifier {
+                assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+            } else {
+                assert!(matches!(
+                    error,
+                    EhdbError::InvalidState(_) | EhdbError::Storage(_)
+                ));
+            }
+
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_jsonl_catalog_rejects_invalid_bind_identifiers_on_replay() {
+        for (index, (pointer, value)) in [
+            ("/Bind/tenant", serde_json::json!("tenant a")),
+            ("/Bind/namespace", serde_json::json!("bad namespace")),
+            ("/Bind/environment", serde_json::json!("bad environment")),
+            ("/Bind/channel", serde_json::json!("stable.channel")),
+            ("/Bind/path", serde_json::json!("../escape")),
+            (
+                "/Bind/digest",
+                serde_json::json!("sha256:not-a-valid-digest"),
+            ),
+            ("/Bind/transaction_id", serde_json::json!("txn bind bad")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temp_log_path(&format!("invalid-bind-{index}"));
+            let (publish, mut bind) = publish_bind_entry_json();
+            *bind.pointer_mut(pointer).unwrap() = value;
+
+            write_raw_journal(&path, &[publish, bind]);
+
+            let error = LocalJsonlSystemLibraryCatalog::open(&path).unwrap_err();
+
+            assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
