@@ -338,6 +338,10 @@ context block.
 `RetrievalContextPayloadExecution::encode_receipt_payload` gives local
 worker/playbook tests a direct way to produce those receipt bytes from
 an execution result without reassembling the codec wrapper.
+`RetrievalContextPayloadExecutionArtifacts` is the bounded local
+handoff shape for returning result payload bytes together with redacted
+receipt payload bytes. `RetrievalContextPayloadExecutorConfig` now also
+limits receipt payload bytes before artifact helpers return.
 
 ## Replay Reference
 

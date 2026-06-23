@@ -40,6 +40,7 @@ pub const RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION: &str =
     "ehdb.retrieval.context.execution.receipt.v1";
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
@@ -927,6 +928,7 @@ impl RetrievalContextResultPayload {
 pub struct RetrievalContextPayloadExecutorConfig {
     pub max_request_payload_bytes: usize,
     pub max_result_payload_bytes: usize,
+    pub max_receipt_payload_bytes: usize,
 }
 
 impl Default for RetrievalContextPayloadExecutorConfig {
@@ -934,6 +936,7 @@ impl Default for RetrievalContextPayloadExecutorConfig {
         Self {
             max_request_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES,
             max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+            max_receipt_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
         }
     }
 }
@@ -947,6 +950,10 @@ impl RetrievalContextPayloadExecutorConfig {
         validate_payload_limit(
             "max retrieval context result payload bytes",
             self.max_result_payload_bytes,
+        )?;
+        validate_payload_limit(
+            "max retrieval context receipt payload bytes",
+            self.max_receipt_payload_bytes,
         )
     }
 }
@@ -1013,6 +1020,30 @@ impl RetrievalContextPayloadExecution {
     pub fn encode_receipt_payload(&self) -> Result<Vec<u8>> {
         RetrievalContextPayloadExecutionReceiptPayload::new(self.summary.clone()).encode()
     }
+
+    pub fn into_artifacts_with_config(
+        self,
+        config: RetrievalContextPayloadExecutorConfig,
+    ) -> Result<RetrievalContextPayloadExecutionArtifacts> {
+        config.validate()?;
+        let receipt_payload = self.encode_receipt_payload()?;
+        if receipt_payload.len() > config.max_receipt_payload_bytes {
+            return Err(EhdbError::InvalidState(format!(
+                "retrieval context receipt payload exceeds {} bytes",
+                config.max_receipt_payload_bytes
+            )));
+        }
+        Ok(RetrievalContextPayloadExecutionArtifacts {
+            result_payload: self.result_payload,
+            receipt_payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalContextPayloadExecutionArtifacts {
+    pub result_payload: Vec<u8>,
+    pub receipt_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1216,6 +1247,18 @@ impl LocalRetrievalSearchService {
         )
     }
 
+    pub fn execute_context_payload_artifacts(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+    ) -> Result<RetrievalContextPayloadExecutionArtifacts> {
+        self.execute_context_payload_artifacts_with_config(
+            runtime,
+            request_payload,
+            RetrievalContextPayloadExecutorConfig::default(),
+        )
+    }
+
     pub fn execute_context_payload_with_config(
         &self,
         runtime: &LocalReferenceRuntime,
@@ -1224,6 +1267,16 @@ impl LocalRetrievalSearchService {
     ) -> Result<Vec<u8>> {
         self.execute_context_payload_with_config_and_summary(runtime, request_payload, config)
             .map(|execution| execution.result_payload)
+    }
+
+    pub fn execute_context_payload_artifacts_with_config(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+    ) -> Result<RetrievalContextPayloadExecutionArtifacts> {
+        self.execute_context_payload_with_config_and_summary(runtime, request_payload, config)?
+            .into_artifacts_with_config(config)
     }
 
     pub fn execute_context_payload_with_config_and_summary(
@@ -1258,6 +1311,22 @@ impl LocalRetrievalSearchService {
     ) -> Result<Vec<u8>> {
         self.execute_context_payload_with_scope_and_summary(runtime, request_payload, config, scope)
             .map(|execution| execution.result_payload)
+    }
+
+    pub fn execute_context_payload_artifacts_with_scope(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+        scope: &RetrievalContextPayloadScope,
+    ) -> Result<RetrievalContextPayloadExecutionArtifacts> {
+        self.execute_context_payload_with_scope_and_summary(
+            runtime,
+            request_payload,
+            config,
+            scope,
+        )?
+        .into_artifacts_with_config(config)
     }
 
     pub fn execute_context_payload_with_scope_and_summary(
@@ -2726,16 +2795,27 @@ mod tests {
             config.max_result_payload_bytes,
             DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES
         );
+        assert_eq!(
+            config.max_receipt_payload_bytes,
+            DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES
+        );
         config.validate().unwrap();
 
         for config in [
             RetrievalContextPayloadExecutorConfig {
                 max_request_payload_bytes: 0,
                 max_result_payload_bytes: 1,
+                max_receipt_payload_bytes: 1,
             },
             RetrievalContextPayloadExecutorConfig {
                 max_request_payload_bytes: 1,
                 max_result_payload_bytes: 0,
+                max_receipt_payload_bytes: 1,
+            },
+            RetrievalContextPayloadExecutorConfig {
+                max_request_payload_bytes: 1,
+                max_result_payload_bytes: 1,
+                max_receipt_payload_bytes: 0,
             },
         ] {
             assert!(matches!(
@@ -2768,6 +2848,7 @@ mod tests {
         let config = RetrievalContextPayloadExecutorConfig {
             max_request_payload_bytes: request_payload.len() - 1,
             max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+            max_receipt_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
         };
 
         assert!(matches!(
@@ -2805,6 +2886,7 @@ mod tests {
         let config = RetrievalContextPayloadExecutorConfig {
             max_request_payload_bytes: request_payload.len(),
             max_result_payload_bytes: 1,
+            max_receipt_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
         };
 
         assert!(matches!(
@@ -2840,6 +2922,7 @@ mod tests {
         let config = RetrievalContextPayloadExecutorConfig {
             max_request_payload_bytes: request_payload.len(),
             max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+            max_receipt_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
         };
 
         let result_payload = LocalRetrievalSearchService
@@ -3160,6 +3243,127 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_context_payload_artifacts_return_result_and_receipt_payloads() {
+        let log_path = temp_log_path("retrieval-context-payload-artifacts");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+        let context = RetrievalContextResultPayload::decode(&artifacts.result_payload)
+            .unwrap()
+            .into_context();
+        let receipt =
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&artifacts.receipt_payload)
+                .unwrap();
+
+        assert_eq!(context.blocks.len(), 2);
+        assert_eq!(receipt.summary.request_payload_bytes, request_payload.len());
+        assert_eq!(
+            receipt.summary.result_payload_bytes,
+            artifacts.result_payload.len()
+        );
+        assert_eq!(receipt.summary.context_block_count, context.blocks.len());
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_artifacts_mark_scope_required() {
+        let log_path = temp_log_path("retrieval-context-payload-artifacts-scope");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let scope = RetrievalContextPayloadScope {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+        };
+
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts_with_scope(
+                &runtime,
+                &request_payload,
+                RetrievalContextPayloadExecutorConfig::default(),
+                &scope,
+            )
+            .unwrap();
+        let receipt =
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&artifacts.receipt_payload)
+                .unwrap();
+
+        assert!(receipt.summary.scope_required);
+        assert_eq!(receipt.summary.context_block_count, 2);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_artifacts_reject_oversized_receipts() {
+        let log_path = temp_log_path("retrieval-context-payload-artifacts-receipt-bound");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let config = RetrievalContextPayloadExecutorConfig {
+            max_request_payload_bytes: request_payload.len(),
+            max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+            max_receipt_payload_bytes: 1,
+        };
+
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_artifacts_with_config(&runtime, &request_payload, config)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
     fn retrieval_context_payload_executor_summary_reports_truncation() {
         let log_path = temp_log_path("retrieval-context-payload-executor-summary-truncated");
         let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
@@ -3222,6 +3426,8 @@ mod tests {
                         max_request_payload_bytes: request_payload.len() - 1,
                         max_result_payload_bytes:
                             DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+                        max_receipt_payload_bytes:
+                            DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
                     },
                 )
                 .unwrap_err(),
@@ -3235,6 +3441,8 @@ mod tests {
                     RetrievalContextPayloadExecutorConfig {
                         max_request_payload_bytes: request_payload.len(),
                         max_result_payload_bytes: 1,
+                        max_receipt_payload_bytes:
+                            DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
                     },
                 )
                 .unwrap_err(),
@@ -3412,6 +3620,7 @@ mod tests {
         let config = RetrievalContextPayloadExecutorConfig {
             max_request_payload_bytes: request_payload.len() - 1,
             max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+            max_receipt_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES,
         };
         assert!(matches!(
             LocalRetrievalSearchService
