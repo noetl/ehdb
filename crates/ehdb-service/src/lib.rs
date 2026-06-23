@@ -790,6 +790,43 @@ pub struct SearchHybridChunksHit {
     pub combined_score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssembleRetrievalContextRequest {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub model_id: EmbeddingModelId,
+    pub query: Vec<f32>,
+    pub text_query: String,
+    pub hit_limit: usize,
+    pub max_block_chars: usize,
+    pub max_total_chars: usize,
+    pub vector_weight: f32,
+    pub text_weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalContextBlock {
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
+    pub ordinal: u32,
+    pub checksum: String,
+    pub text: String,
+    pub original_text_chars: usize,
+    pub clipped: bool,
+    pub model_id: EmbeddingModelId,
+    pub dimensions: usize,
+    pub vector_score: f32,
+    pub text_match_count: usize,
+    pub combined_score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalContext {
+    pub blocks: Vec<RetrievalContextBlock>,
+    pub total_text_chars: usize,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -859,6 +896,70 @@ impl LocalRetrievalSearchService {
         Ok(hits)
     }
 
+    pub fn assemble_context(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request: AssembleRetrievalContextRequest,
+    ) -> Result<RetrievalContext> {
+        validate_context_budget("max block chars", request.max_block_chars)?;
+        validate_context_budget("max total chars", request.max_total_chars)?;
+
+        let hits = self.search_hybrid(
+            runtime,
+            SearchHybridChunksRequest {
+                tenant: request.tenant,
+                namespace: request.namespace,
+                model_id: request.model_id,
+                query: request.query,
+                text_query: request.text_query,
+                limit: request.hit_limit,
+                vector_weight: request.vector_weight,
+                text_weight: request.text_weight,
+            },
+        )?;
+
+        let mut blocks = Vec::new();
+        let mut total_text_chars = 0;
+        let mut truncated = false;
+
+        for hit in hits {
+            if total_text_chars >= request.max_total_chars {
+                truncated = true;
+                break;
+            }
+
+            let remaining_total = request.max_total_chars - total_text_chars;
+            let block_budget = request.max_block_chars.min(remaining_total);
+            let original_text_chars = hit.text.chars().count();
+            let text = take_char_prefix(&hit.text, block_budget);
+            let text_chars = text.chars().count();
+            let clipped = original_text_chars > text_chars;
+            truncated |= clipped;
+            total_text_chars += text_chars;
+
+            blocks.push(RetrievalContextBlock {
+                chunk_id: hit.chunk_id,
+                document_id: hit.document_id,
+                ordinal: hit.ordinal,
+                checksum: hit.checksum,
+                text,
+                original_text_chars,
+                clipped,
+                model_id: hit.model_id,
+                dimensions: hit.dimensions,
+                vector_score: hit.vector_score,
+                text_match_count: hit.text_match_count,
+                combined_score: hit.combined_score,
+            });
+        }
+
+        Ok(RetrievalContext {
+            blocks,
+            total_text_chars,
+            truncated,
+        })
+    }
+
     pub fn search_text(
         &self,
         runtime: &LocalReferenceRuntime,
@@ -885,6 +986,19 @@ impl LocalRetrievalSearchService {
             .collect();
         Ok(hits)
     }
+}
+
+fn validate_context_budget(label: &str, budget: usize) -> Result<()> {
+    if budget == 0 {
+        return Err(EhdbError::InvalidState(format!(
+            "{label} must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
+fn take_char_prefix(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 #[derive(Debug, Default)]
@@ -1764,6 +1878,224 @@ mod tests {
         ] {
             assert!(matches!(
                 service.search_hybrid(&runtime, request).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_context_assembly_returns_ordered_blocks_from_replay() {
+        let log_path = temp_log_path("local-retrieval-context-assembly-ranked");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let context = service
+            .assemble_context(
+                &reopened,
+                AssembleRetrievalContextRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "local".to_string(),
+                    hit_limit: 10,
+                    max_block_chars: 64,
+                    max_total_chars: 128,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(context.blocks.len(), 2);
+        assert!(!context.truncated);
+        assert_eq!(
+            context.total_text_chars,
+            context
+                .blocks
+                .iter()
+                .map(|block| block.text.chars().count())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            context.blocks[0].chunk_id,
+            ChunkId::new("chunk-close").unwrap()
+        );
+        assert_eq!(
+            context.blocks[0].document_id,
+            DocumentId::new("doc-a").unwrap()
+        );
+        assert_eq!(context.blocks[0].ordinal, 0);
+        assert_eq!(context.blocks[0].checksum, "sha256-close");
+        assert_eq!(context.blocks[0].text, "close local retrieval hit");
+        assert_eq!(
+            context.blocks[0].original_text_chars,
+            "close local retrieval hit".chars().count()
+        );
+        assert!(!context.blocks[0].clipped);
+        assert_eq!(
+            context.blocks[0].model_id,
+            EmbeddingModelId::new("text-embedding-local").unwrap()
+        );
+        assert_eq!(context.blocks[0].dimensions, 2);
+        assert_eq!(context.blocks[0].text_match_count, 1);
+        assert!(context.blocks[0].combined_score > context.blocks[1].combined_score);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_context_assembly_clips_blocks_to_text_budgets() {
+        let log_path = temp_log_path("local-retrieval-context-assembly-budget");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let context = service
+            .assemble_context(
+                &runtime,
+                AssembleRetrievalContextRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "local".to_string(),
+                    hit_limit: 10,
+                    max_block_chars: 5,
+                    max_total_chars: 8,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(context.blocks.len(), 2);
+        assert_eq!(context.blocks[0].text, "close");
+        assert_eq!(context.blocks[1].text, "far");
+        assert_eq!(context.total_text_chars, 8);
+        assert!(context.truncated);
+        assert!(context.blocks.iter().all(|block| block.clipped));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_context_assembly_scopes_candidates_and_handles_empty_results() {
+        let log_path = temp_log_path("local-retrieval-context-assembly-scope");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let scoped = service
+            .assemble_context(
+                &runtime,
+                AssembleRetrievalContextRequest {
+                    tenant: TenantId::new("tenant-b").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "other".to_string(),
+                    hit_limit: 10,
+                    max_block_chars: 64,
+                    max_total_chars: 128,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+        assert_eq!(scoped.blocks.len(), 1);
+        assert_eq!(
+            scoped.blocks[0].chunk_id,
+            ChunkId::new("chunk-other-tenant").unwrap()
+        );
+
+        let empty = service
+            .assemble_context(
+                &runtime,
+                AssembleRetrievalContextRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("missing").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "local".to_string(),
+                    hit_limit: 10,
+                    max_block_chars: 64,
+                    max_total_chars: 128,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+        assert!(empty.blocks.is_empty());
+        assert_eq!(empty.total_text_chars, 0);
+        assert!(!empty.truncated);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_context_assembly_validates_budgets_and_search_inputs() {
+        let log_path = temp_log_path("local-retrieval-context-assembly-validation");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        for request in [
+            AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 0,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 0,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 0,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: " ".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+        ] {
+            assert!(matches!(
+                service.assemble_context(&runtime, request).unwrap_err(),
                 EhdbError::InvalidState(_)
             ));
         }
