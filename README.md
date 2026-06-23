@@ -362,6 +362,11 @@ event stream records from caller-supplied local logs. Replay validates
 the stable subject and event payload while preserving stream sequence
 and transaction id for local audit assertions; it does not start a
 consumer loop, subscription, network API, or service process.
+`RetrievalContextReceiptEventDurableConsumerLog` adds explicit local
+durable-consumer helpers for creating a consumer, replaying pending
+receipt events for that consumer, and acking a receipt event sequence.
+Consumer state is caller-driven and local-log backed; there is still no
+background consumer, scheduler, gateway path, or persistent process.
 
 ## Replay Reference
 
