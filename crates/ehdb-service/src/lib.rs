@@ -34,6 +34,8 @@ pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
 pub const DEFAULT_FLIGHT_TENANT_SCOPE_HEADER: &str = "x-ehdb-tenant";
 pub const DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER: &str = "x-ehdb-namespace";
 pub const DEFAULT_FLIGHT_PRINCIPAL_HEADER: &str = "x-ehdb-principal";
+pub const RETRIEVAL_CONTEXT_REQUEST_VERSION: &str = "ehdb.retrieval.context.request.v1";
+pub const RETRIEVAL_CONTEXT_RESULT_VERSION: &str = "ehdb.retrieval.context.result.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
@@ -790,7 +792,7 @@ pub struct SearchHybridChunksHit {
     pub combined_score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssembleRetrievalContextRequest {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -804,7 +806,7 @@ pub struct AssembleRetrievalContextRequest {
     pub text_weight: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalContextBlock {
     pub chunk_id: ChunkId,
     pub document_id: DocumentId,
@@ -820,11 +822,101 @@ pub struct RetrievalContextBlock {
     pub combined_score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalContext {
     pub blocks: Vec<RetrievalContextBlock>,
     pub total_text_chars: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalContextRequestPayload {
+    pub version: String,
+    pub request: AssembleRetrievalContextRequest,
+}
+
+impl RetrievalContextRequestPayload {
+    pub fn new(request: AssembleRetrievalContextRequest) -> Self {
+        Self {
+            version: RETRIEVAL_CONTEXT_REQUEST_VERSION.to_string(),
+            request,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_version()?;
+        serde_json::to_vec(self).map_err(|err| {
+            EhdbError::InvalidState(format!("encode retrieval context request: {err}"))
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
+            EhdbError::InvalidState(format!("decode retrieval context request: {err}"))
+        })?;
+        payload.validate_version()?;
+        Ok(payload)
+    }
+
+    pub fn into_request(self) -> AssembleRetrievalContextRequest {
+        self.request
+    }
+
+    fn validate_version(&self) -> Result<()> {
+        if self.version == RETRIEVAL_CONTEXT_REQUEST_VERSION {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "unsupported retrieval context request version: {}",
+                self.version
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalContextResultPayload {
+    pub version: String,
+    pub context: RetrievalContext,
+}
+
+impl RetrievalContextResultPayload {
+    pub fn new(context: RetrievalContext) -> Self {
+        Self {
+            version: RETRIEVAL_CONTEXT_RESULT_VERSION.to_string(),
+            context,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_version()?;
+        serde_json::to_vec(self).map_err(|err| {
+            EhdbError::InvalidState(format!("encode retrieval context result: {err}"))
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
+            EhdbError::InvalidState(format!("decode retrieval context result: {err}"))
+        })?;
+        payload.validate_version()?;
+        Ok(payload)
+    }
+
+    pub fn into_context(self) -> RetrievalContext {
+        self.context
+    }
+
+    fn validate_version(&self) -> Result<()> {
+        if self.version == RETRIEVAL_CONTEXT_RESULT_VERSION {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "unsupported retrieval context result version: {}",
+                self.version
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2101,6 +2193,118 @@ mod tests {
         }
 
         fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_request_payload_round_trips() {
+        let request = AssembleRetrievalContextRequest {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+            query: vec![1.0, 0.0],
+            text_query: "local".to_string(),
+            hit_limit: 10,
+            max_block_chars: 64,
+            max_total_chars: 128,
+            vector_weight: 1.0,
+            text_weight: 1.0,
+        };
+
+        let encoded = RetrievalContextRequestPayload::new(request.clone())
+            .encode()
+            .unwrap();
+        let decoded = RetrievalContextRequestPayload::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.version, RETRIEVAL_CONTEXT_REQUEST_VERSION);
+        assert_eq!(decoded.into_request(), request);
+    }
+
+    #[test]
+    fn retrieval_context_result_payload_round_trips_assembled_context() {
+        let log_path = temp_log_path("retrieval-context-result-payload");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let context = LocalRetrievalSearchService
+            .assemble_context(
+                &runtime,
+                AssembleRetrievalContextRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "local".to_string(),
+                    hit_limit: 10,
+                    max_block_chars: 64,
+                    max_total_chars: 128,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+
+        let encoded = RetrievalContextResultPayload::new(context.clone())
+            .encode()
+            .unwrap();
+        let decoded = RetrievalContextResultPayload::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.version, RETRIEVAL_CONTEXT_RESULT_VERSION);
+        assert_eq!(decoded.into_context(), context);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payloads_reject_malformed_json() {
+        for error in [
+            RetrievalContextRequestPayload::decode(b"not-json").unwrap_err(),
+            RetrievalContextResultPayload::decode(b"not-json").unwrap_err(),
+        ] {
+            assert!(matches!(error, EhdbError::InvalidState(_)));
+        }
+    }
+
+    #[test]
+    fn retrieval_context_payloads_reject_unsupported_versions() {
+        let request = AssembleRetrievalContextRequest {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+            query: vec![1.0, 0.0],
+            text_query: "local".to_string(),
+            hit_limit: 10,
+            max_block_chars: 64,
+            max_total_chars: 128,
+            vector_weight: 1.0,
+            text_weight: 1.0,
+        };
+        let mut request_payload = RetrievalContextRequestPayload::new(request);
+        request_payload.version = "ehdb.retrieval.context.request.v0".to_string();
+        assert!(matches!(
+            request_payload.encode().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        let unsupported_request = serde_json::to_vec(&request_payload).unwrap();
+        assert!(matches!(
+            RetrievalContextRequestPayload::decode(&unsupported_request).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let context = RetrievalContext {
+            blocks: Vec::new(),
+            total_text_chars: 0,
+            truncated: false,
+        };
+        let mut result_payload = RetrievalContextResultPayload::new(context);
+        result_payload.version = "ehdb.retrieval.context.result.v0".to_string();
+        assert!(matches!(
+            result_payload.encode().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        let unsupported_result = serde_json::to_vec(&result_payload).unwrap();
+        assert!(matches!(
+            RetrievalContextResultPayload::decode(&unsupported_result).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
     }
 
     #[test]

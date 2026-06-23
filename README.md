@@ -303,6 +303,11 @@ document identity, checksums, score metadata, clipped text, and total
 text budget accounting. This remains a local worker/playbook-shaped
 fixture; it does not invoke an LLM, render prompt templates, open a
 network API, or add a persistent retrieval daemon.
+`RetrievalContextRequestPayload` and `RetrievalContextResultPayload`
+add versioned JSON byte codecs for those local worker/playbook
+boundaries, rejecting malformed payloads and unsupported versions before
+execution or handoff. They are not an RPC protocol, Arrow Flight
+endpoint, gateway route, prompt engine, or production retrieval API.
 
 ## Replay Reference
 
