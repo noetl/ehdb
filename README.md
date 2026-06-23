@@ -320,6 +320,14 @@ rejected before returning bytes.
 guard for worker/playbook execution, rejecting decoded request payloads
 whose embedded scope does not match the expected execution scope. This
 is not production IAM, an ACL engine, or gateway authorization.
+`RetrievalContextPayloadExecutionSummary` adds a redacted local
+execution summary for the same handoff, reporting request/result byte
+counts, context block count, total text chars, truncation status, and
+whether a local scope guard was required. It intentionally excludes
+tenant IDs, namespace values, query text, chunk text, tokens, vectors,
+payload bytes, object paths, and principals; it is metrics/audit
+metadata for local worker/playbook tests, not a logging sink or
+production policy surface.
 
 ## Replay Reference
 
