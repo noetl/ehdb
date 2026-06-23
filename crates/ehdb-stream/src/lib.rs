@@ -179,6 +179,10 @@ fn validate_stream_config(config: &StreamConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_stream_record(record: &StreamRecord) -> Result<()> {
+    Subject::new(record.subject.as_str()).map(|_| ())
+}
+
 #[derive(Debug, Clone)]
 struct StreamState {
     config: StreamConfig,
@@ -251,6 +255,7 @@ impl InMemoryStreamLog {
         stream: &StreamName,
         record: StreamRecord,
     ) -> Result<()> {
+        validate_stream_record(&record)?;
         let state = self.stream_mut(tenant, namespace, stream)?;
         if record.sequence != state.next_sequence {
             return Err(EhdbError::InvalidState(format!(
@@ -739,6 +744,42 @@ mod tests {
         ))
     }
 
+    fn write_journal_with_invalid_record_subject(
+        path: &Path,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        subject: &str,
+    ) {
+        let entries = [
+            StreamJournalEntry::CreateStream {
+                config: StreamConfig {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    name: stream.clone(),
+                    retention: RetentionPolicy::KeepAll,
+                },
+            },
+            StreamJournalEntry::Publish {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                stream: stream.clone(),
+                record: StreamRecord {
+                    sequence: StreamSequence::first(),
+                    subject: Subject(subject.to_string()),
+                    payload: b"event".to_vec(),
+                    transaction_id: TransactionId::new("txn-0001").unwrap(),
+                },
+            },
+        ];
+        let text = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{text}\n")).unwrap();
+    }
+
     #[test]
     fn publishes_and_replays_noetl_subjects() {
         let (tenant, namespace, stream) = ids();
@@ -1198,6 +1239,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(third.sequence.value(), 3);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_wildcard_subjects_on_replay() {
+        let path = temp_log_path("wildcard-subject");
+        let (tenant, namespace, stream) = ids();
+        write_journal_with_invalid_record_subject(&path, &tenant, &namespace, &stream, "noetl.*");
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_empty_token_subjects_on_replay() {
+        let path = temp_log_path("empty-token-subject");
+        let (tenant, namespace, stream) = ids();
+        write_journal_with_invalid_record_subject(
+            &path,
+            &tenant,
+            &namespace,
+            &stream,
+            "noetl..event",
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
 
         fs::remove_file(path).unwrap();
     }
