@@ -332,7 +332,9 @@ production policy surface.
 summary in a versioned JSON byte codec so future event-log/audit
 plumbing has a durable receipt shape. It still contains only summary
 fields and does not publish events, emit logs, expose a network API, or
-carry retrieval-sensitive content.
+carry retrieval-sensitive content. Receipt encode/decode validates
+positive request/result byte counts and rejects text chars without a
+context block.
 `RetrievalContextPayloadExecution::encode_receipt_payload` gives local
 worker/playbook tests a direct way to produce those receipt bytes from
 an execution result without reassembling the codec wrapper.
