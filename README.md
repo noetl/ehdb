@@ -316,6 +316,10 @@ in-process worker/playbook executor, not a daemon or network endpoint.
 positive request/result byte limits. Oversized request payloads are
 rejected before decode, and oversized encoded result payloads are
 rejected before returning bytes.
+`RetrievalContextPayloadScope` adds an optional local tenant/namespace
+guard for worker/playbook execution, rejecting decoded request payloads
+whose embedded scope does not match the expected execution scope. This
+is not production IAM, an ACL engine, or gateway authorization.
 
 ## Replay Reference
 
