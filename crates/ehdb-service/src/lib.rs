@@ -18,7 +18,7 @@ use ehdb_core::{
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
-use ehdb_retrieval::VectorSearch;
+use ehdb_retrieval::{TextSearch, VectorSearch};
 use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -746,6 +746,24 @@ pub struct SearchSimilarChunksHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTextChunksRequest {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTextChunksHit {
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
+    pub ordinal: u32,
+    pub text: String,
+    pub checksum: String,
+    pub match_count: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -775,6 +793,33 @@ impl LocalRetrievalSearchService {
                 model_id: hit.embedding.model_id,
                 dimensions: hit.embedding.dimensions,
                 score: hit.score,
+            })
+            .collect();
+        Ok(hits)
+    }
+
+    pub fn search_text(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request: SearchTextChunksRequest,
+    ) -> Result<Vec<SearchTextChunksHit>> {
+        let hits = runtime
+            .state()
+            .retrieval
+            .search_text(TextSearch {
+                tenant: request.tenant,
+                namespace: request.namespace,
+                query: request.query,
+                limit: request.limit,
+            })?
+            .into_iter()
+            .map(|hit| SearchTextChunksHit {
+                chunk_id: hit.chunk.id,
+                document_id: hit.chunk.document_id,
+                ordinal: hit.chunk.ordinal,
+                text: hit.chunk.text,
+                checksum: hit.chunk.checksum,
+                match_count: hit.match_count,
             })
             .collect();
         Ok(hits)
@@ -1481,6 +1526,80 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(invalid, EhdbError::InvalidState(_)));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_search_service_returns_text_hits_from_replay() {
+        let log_path = temp_log_path("local-retrieval-text-search-service-ranked");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let hits = service
+            .search_text(
+                &reopened,
+                SearchTextChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    query: "LOCAL".to_string(),
+                    limit: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, ChunkId::new("chunk-close").unwrap());
+        assert_eq!(hits[0].document_id, DocumentId::new("doc-a").unwrap());
+        assert_eq!(hits[0].ordinal, 0);
+        assert_eq!(hits[0].text, "close local retrieval hit");
+        assert_eq!(hits[0].checksum, "sha256-close");
+        assert_eq!(hits[0].match_count, 1);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_search_service_handles_empty_and_invalid_text_queries() {
+        let log_path = temp_log_path("local-retrieval-text-search-service-validation");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let empty = service
+            .search_text(
+                &runtime,
+                SearchTextChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    query: "missing".to_string(),
+                    limit: 10,
+                },
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        for request in [
+            SearchTextChunksRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                query: " ".to_string(),
+                limit: 10,
+            },
+            SearchTextChunksRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                query: "local".to_string(),
+                limit: 0,
+            },
+        ] {
+            assert!(matches!(
+                service.search_text(&runtime, request).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
 
         fs::remove_file(log_path).unwrap();
     }
