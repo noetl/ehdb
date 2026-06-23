@@ -171,6 +171,7 @@ fn stream_key(tenant: &TenantId, namespace: &NamespaceName, stream: &StreamName)
 }
 
 fn validate_stream_config(config: &StreamConfig) -> Result<()> {
+    validate_stream_coordinates(&config.tenant, &config.namespace, &config.name)?;
     if matches!(config.retention, RetentionPolicy::MaxRecords(0)) {
         return Err(EhdbError::InvalidState(
             "stream max-record retention must be greater than zero".to_string(),
@@ -179,8 +180,23 @@ fn validate_stream_config(config: &StreamConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_stream_coordinates(
+    tenant: &TenantId,
+    namespace: &NamespaceName,
+    stream: &StreamName,
+) -> Result<()> {
+    TenantId::new(tenant.as_str()).map(|_| ())?;
+    NamespaceName::new(namespace.as_str()).map(|_| ())?;
+    StreamName::new(stream.as_str()).map(|_| ())
+}
+
+fn validate_consumer(consumer: &ConsumerName) -> Result<()> {
+    ConsumerName::new(consumer.as_str()).map(|_| ())
+}
+
 fn validate_stream_record(record: &StreamRecord) -> Result<()> {
-    Subject::new(record.subject.as_str()).map(|_| ())
+    Subject::new(record.subject.as_str()).map(|_| ())?;
+    TransactionId::new(record.transaction_id.as_str()).map(|_| ())
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +253,7 @@ impl InMemoryStreamLog {
         payload: impl Into<Vec<u8>>,
         transaction_id: TransactionId,
     ) -> Result<StreamRecord> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
         let record = StreamRecord {
             sequence: self.stream(tenant, namespace, stream)?.next_sequence,
             subject,
@@ -278,6 +295,8 @@ impl InMemoryStreamLog {
         stream: &StreamName,
         consumer: ConsumerName,
     ) -> Result<DurableConsumer> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
+        validate_consumer(&consumer)?;
         self.ensure_consumer_absent(tenant, namespace, stream, &consumer)?;
         let state = self.stream_mut(tenant, namespace, stream)?;
 
@@ -375,6 +394,8 @@ impl InMemoryStreamLog {
         consumer: &ConsumerName,
         sequence: StreamSequence,
     ) -> Result<DurableConsumer> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
+        validate_consumer(consumer)?;
         self.validate_ack(tenant, namespace, stream, consumer, sequence)?;
         let state = self.stream_mut(tenant, namespace, stream)?;
         let consumer_state = state
@@ -556,6 +577,8 @@ impl LocalJsonlStreamLog {
         stream: &StreamName,
         consumer: ConsumerName,
     ) -> Result<DurableConsumer> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
+        validate_consumer(&consumer)?;
         self.inner
             .ensure_consumer_absent(tenant, namespace, stream, &consumer)?;
         let entry = StreamJournalEntry::CreateConsumer {
@@ -578,12 +601,14 @@ impl LocalJsonlStreamLog {
         payload: impl Into<Vec<u8>>,
         transaction_id: TransactionId,
     ) -> Result<StreamRecord> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
         let record = StreamRecord {
             sequence: self.inner.stream(tenant, namespace, stream)?.next_sequence,
             subject,
             payload: payload.into(),
             transaction_id,
         };
+        validate_stream_record(&record)?;
         let entry = StreamJournalEntry::Publish {
             tenant: tenant.clone(),
             namespace: namespace.clone(),
@@ -649,6 +674,8 @@ impl LocalJsonlStreamLog {
         consumer: &ConsumerName,
         sequence: StreamSequence,
     ) -> Result<DurableConsumer> {
+        validate_stream_coordinates(tenant, namespace, stream)?;
+        validate_consumer(consumer)?;
         self.inner
             .validate_ack(tenant, namespace, stream, consumer, sequence)?;
         let entry = StreamJournalEntry::Ack {
@@ -778,6 +805,88 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(path, format!("{text}\n")).unwrap();
+    }
+
+    fn write_raw_journal(path: &Path, entries: &[serde_json::Value]) {
+        let text = entries
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{text}\n")).unwrap();
+    }
+
+    fn create_stream_json(
+        tenant: impl AsRef<str>,
+        namespace: impl AsRef<str>,
+        stream: impl AsRef<str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "CreateStream": {
+                "config": {
+                    "tenant": tenant.as_ref(),
+                    "namespace": namespace.as_ref(),
+                    "name": stream.as_ref(),
+                    "retention": "KeepAll"
+                }
+            }
+        })
+    }
+
+    fn create_consumer_json(
+        tenant: impl AsRef<str>,
+        namespace: impl AsRef<str>,
+        stream: impl AsRef<str>,
+        consumer: impl AsRef<str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "CreateConsumer": {
+                "tenant": tenant.as_ref(),
+                "namespace": namespace.as_ref(),
+                "stream": stream.as_ref(),
+                "consumer": consumer.as_ref()
+            }
+        })
+    }
+
+    fn publish_json(
+        tenant: impl AsRef<str>,
+        namespace: impl AsRef<str>,
+        stream: impl AsRef<str>,
+        subject: impl AsRef<str>,
+        transaction_id: impl AsRef<str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "Publish": {
+                "tenant": tenant.as_ref(),
+                "namespace": namespace.as_ref(),
+                "stream": stream.as_ref(),
+                "record": {
+                    "sequence": 1,
+                    "subject": subject.as_ref(),
+                    "payload": [101, 118, 101, 110, 116],
+                    "transaction_id": transaction_id.as_ref()
+                }
+            }
+        })
+    }
+
+    fn ack_json(
+        tenant: impl AsRef<str>,
+        namespace: impl AsRef<str>,
+        stream: impl AsRef<str>,
+        consumer: impl AsRef<str>,
+        sequence: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "Ack": {
+                "tenant": tenant.as_ref(),
+                "namespace": namespace.as_ref(),
+                "stream": stream.as_ref(),
+                "consumer": consumer.as_ref(),
+                "sequence": sequence
+            }
+        })
     }
 
     #[test]
@@ -1266,6 +1375,113 @@ mod tests {
             &namespace,
             &stream,
             "noetl..event",
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_invalid_stream_config_identifiers_on_replay() {
+        let path = temp_log_path("invalid-config-identifier");
+        let (_, namespace, stream) = ids();
+        write_raw_journal(
+            &path,
+            &[create_stream_json(
+                "tenant a",
+                namespace.as_str(),
+                stream.as_str(),
+            )],
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_invalid_consumer_identifiers_on_replay() {
+        let path = temp_log_path("invalid-consumer-identifier");
+        let (tenant, namespace, stream) = ids();
+        write_raw_journal(
+            &path,
+            &[
+                create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                create_consumer_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    "bad consumer",
+                ),
+            ],
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_invalid_publish_identifiers_on_replay() {
+        let path = temp_log_path("invalid-publish-identifier");
+        let (tenant, namespace, stream) = ids();
+        write_raw_journal(
+            &path,
+            &[
+                create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                publish_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    "noetl.event",
+                    "txn bad",
+                ),
+            ],
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_invalid_ack_coordinates_on_replay() {
+        let path = temp_log_path("invalid-ack-coordinate");
+        let (tenant, namespace, stream) = ids();
+        write_raw_journal(
+            &path,
+            &[
+                create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                create_consumer_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    "materializer",
+                ),
+                publish_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    "noetl.event",
+                    "txn-0001",
+                ),
+                ack_json(
+                    "tenant a",
+                    namespace.as_str(),
+                    stream.as_str(),
+                    "materializer",
+                    1,
+                ),
+            ],
         );
 
         let error = LocalJsonlStreamLog::open(&path).unwrap_err();
