@@ -104,6 +104,15 @@ fn stream_key(tenant: &TenantId, namespace: &NamespaceName, stream: &StreamName)
     }
 }
 
+fn validate_stream_config(config: &StreamConfig) -> Result<()> {
+    if matches!(config.retention, RetentionPolicy::MaxRecords(0)) {
+        return Err(EhdbError::InvalidState(
+            "stream max-record retention must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct StreamState {
     config: StreamConfig,
@@ -142,6 +151,7 @@ pub struct InMemoryStreamLog {
 
 impl InMemoryStreamLog {
     pub fn create_stream(&mut self, config: StreamConfig) -> Result<()> {
+        validate_stream_config(&config)?;
         self.ensure_stream_absent(&config)?;
         let key = stream_key(&config.tenant, &config.namespace, &config.name);
         self.streams.insert(key, StreamState::new(config));
@@ -412,6 +422,7 @@ impl LocalJsonlStreamLog {
     }
 
     pub fn create_stream(&mut self, config: StreamConfig) -> Result<()> {
+        validate_stream_config(&config)?;
         self.inner.ensure_stream_absent(&config)?;
         let entry = StreamJournalEntry::CreateStream {
             config: config.clone(),
@@ -718,6 +729,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_max_record_retention() {
+        let (tenant, namespace, stream) = ids();
+        let mut log = InMemoryStreamLog::default();
+        let error = log
+            .create_stream(StreamConfig {
+                tenant,
+                namespace,
+                name: stream,
+                retention: RetentionPolicy::MaxRecords(0),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
     fn rejects_duplicate_stream_and_consumer() {
         let (tenant, namespace, stream) = ids();
         let consumer = ConsumerName::new("materializer").unwrap();
@@ -917,6 +944,38 @@ mod tests {
             reopened.replay(&tenant, &namespace, &stream, None).unwrap(),
             vec![third]
         );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_zero_max_record_retention_before_journal_write() {
+        let path = temp_log_path("zero-retention");
+        let (tenant, namespace, stream) = ids();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+
+        let error = log
+            .create_stream(StreamConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: stream.clone(),
+                retention: RetentionPolicy::MaxRecords(0),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+        assert!(!path.exists());
+        drop(log);
+
+        let mut reopened = LocalJsonlStreamLog::open(&path).unwrap();
+        reopened
+            .create_stream(StreamConfig {
+                tenant,
+                namespace,
+                name: stream,
+                retention: RetentionPolicy::KeepAll,
+            })
+            .unwrap();
 
         fs::remove_file(path).unwrap();
     }

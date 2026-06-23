@@ -62,7 +62,9 @@ in-memory log.
 stream journal for the local developer loop and restart tests. It
 persists create-stream, create-consumer, publish, and ack operations;
 on open it rebuilds stream records, retention state, next sequence, and
-durable consumer cursors.
+durable consumer cursors. Keep-all retention is supported, and bounded
+max-record retention must be positive before any stream is created or
+journaled.
 
 These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries
