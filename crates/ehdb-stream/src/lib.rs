@@ -59,6 +59,33 @@ impl Subject {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn matches(&self, subject: &Subject) -> bool {
+        let filter_tokens = self.0.split('.').collect::<Vec<_>>();
+        let subject_tokens = subject.0.split('.').collect::<Vec<_>>();
+        let mut filter_index = 0;
+        let mut subject_index = 0;
+
+        while filter_index < filter_tokens.len() && subject_index < subject_tokens.len() {
+            match filter_tokens[filter_index] {
+                ">" => {
+                    return filter_index == filter_tokens.len() - 1
+                        && subject_index < subject_tokens.len();
+                }
+                "*" => {
+                    filter_index += 1;
+                    subject_index += 1;
+                }
+                token if token == subject_tokens[subject_index] => {
+                    filter_index += 1;
+                    subject_index += 1;
+                }
+                _ => return false,
+            }
+        }
+
+        filter_index == filter_tokens.len() && subject_index == subject_tokens.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,11 +252,36 @@ impl InMemoryStreamLog {
         stream: &StreamName,
         after: Option<StreamSequence>,
     ) -> Result<Vec<StreamRecord>> {
+        self.replay_records(tenant, namespace, stream, after, None)
+    }
+
+    pub fn replay_matching(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        subject_filter: &Subject,
+        after: Option<StreamSequence>,
+    ) -> Result<Vec<StreamRecord>> {
+        self.replay_records(tenant, namespace, stream, after, Some(subject_filter))
+    }
+
+    fn replay_records(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        after: Option<StreamSequence>,
+        subject_filter: Option<&Subject>,
+    ) -> Result<Vec<StreamRecord>> {
         let state = self.stream(tenant, namespace, stream)?;
         Ok(state
             .records
             .iter()
             .filter(|(sequence, _)| after.is_none_or(|cursor| **sequence > cursor))
+            .filter(|(_, record)| {
+                subject_filter.is_none_or(|filter| filter.matches(&record.subject))
+            })
             .map(|(_, record)| record.clone())
             .collect())
     }
@@ -488,6 +540,18 @@ impl LocalJsonlStreamLog {
         self.inner.replay(tenant, namespace, stream, after)
     }
 
+    pub fn replay_matching(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        subject_filter: &Subject,
+        after: Option<StreamSequence>,
+    ) -> Result<Vec<StreamRecord>> {
+        self.inner
+            .replay_matching(tenant, namespace, stream, subject_filter, after)
+    }
+
     pub fn replay_for_consumer(
         &self,
         tenant: &TenantId,
@@ -641,6 +705,92 @@ mod tests {
             log.replay(&tenant, &namespace, &stream, Some(first.sequence))
                 .unwrap(),
             vec![second]
+        );
+    }
+
+    #[test]
+    fn subject_filters_match_exact_single_token_and_tail_wildcards() {
+        let command = Subject::new("noetl.execution.command.completed").unwrap();
+        let command_prefix = Subject::new("noetl.execution.command").unwrap();
+        let playbook = Subject::new("noetl.execution.playbook.completed").unwrap();
+        let exact = Subject::new("noetl.execution.command.completed").unwrap();
+        let single_token = Subject::new("noetl.execution.*.completed").unwrap();
+        let tail = Subject::new("noetl.execution.>").unwrap();
+        let zero_tail = Subject::new("noetl.execution.command.>").unwrap();
+        let misplaced_tail = Subject::new("noetl.>.completed").unwrap();
+
+        assert!(exact.matches(&command));
+        assert!(!exact.matches(&playbook));
+        assert!(single_token.matches(&command));
+        assert!(single_token.matches(&playbook));
+        assert!(tail.matches(&command));
+        assert!(tail.matches(&playbook));
+        assert!(zero_tail.matches(&command));
+        assert!(!zero_tail.matches(&command_prefix));
+        assert!(!misplaced_tail.matches(&command));
+    }
+
+    #[test]
+    fn replays_records_matching_subject_filter_after_cursor() {
+        let (tenant, namespace, stream) = ids();
+        let mut log = InMemoryStreamLog::default();
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+
+        let first_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.started").unwrap(),
+                b"command-started".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        let playbook = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.playbook.completed").unwrap(),
+                b"playbook-completed".to_vec(),
+                TransactionId::new("txn-0002").unwrap(),
+            )
+            .unwrap();
+        let second_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.completed").unwrap(),
+                b"command-completed".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+
+        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+        let execution_filter = Subject::new("noetl.execution.>").unwrap();
+
+        assert_eq!(
+            log.replay_matching(&tenant, &namespace, &stream, &command_filter, None)
+                .unwrap(),
+            vec![first_command.clone(), second_command.clone()]
+        );
+        assert_eq!(
+            log.replay_matching(
+                &tenant,
+                &namespace,
+                &stream,
+                &execution_filter,
+                Some(first_command.sequence),
+            )
+            .unwrap(),
+            vec![playbook, second_command]
         );
     }
 
@@ -885,6 +1035,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(third.sequence.value(), 3);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_replays_records_matching_subject_filter_after_reopen() {
+        let path = temp_log_path("subject-filter-replay");
+        let (tenant, namespace, stream) = ids();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        let first_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.started").unwrap(),
+                b"command-started".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        log.publish(
+            &tenant,
+            &namespace,
+            &stream,
+            Subject::new("noetl.execution.playbook.completed").unwrap(),
+            b"playbook-completed".to_vec(),
+            TransactionId::new("txn-0002").unwrap(),
+        )
+        .unwrap();
+        let second_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.completed").unwrap(),
+                b"command-completed".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+        drop(log);
+
+        let reopened = LocalJsonlStreamLog::open(&path).unwrap();
+        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+
+        assert_eq!(
+            reopened
+                .replay_matching(
+                    &tenant,
+                    &namespace,
+                    &stream,
+                    &command_filter,
+                    Some(first_command.sequence),
+                )
+                .unwrap(),
+            vec![second_command]
+        );
 
         fs::remove_file(path).unwrap();
     }
