@@ -989,6 +989,12 @@ pub struct RetrievalContextPayloadExecution {
     pub summary: RetrievalContextPayloadExecutionSummary,
 }
 
+impl RetrievalContextPayloadExecution {
+    pub fn encode_receipt_payload(&self) -> Result<Vec<u8>> {
+        RetrievalContextPayloadExecutionReceiptPayload::new(self.summary.clone()).encode()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalContextPayloadExecutionReceiptPayload {
     pub version: String,
@@ -2986,6 +2992,84 @@ mod tests {
                 .into_summary(),
             execution.summary
         );
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_execution_encodes_matching_receipt_payload() {
+        let log_path = temp_log_path("retrieval-context-execution-receipt-helper");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let execution = LocalRetrievalSearchService
+            .execute_context_payload_with_summary(&runtime, &request_payload)
+            .unwrap();
+        let receipt_payload = execution.encode_receipt_payload().unwrap();
+        let receipt =
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&receipt_payload).unwrap();
+
+        assert_eq!(receipt.version, RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION);
+        assert_eq!(receipt.into_summary(), execution.summary);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_helper_keeps_redaction_boundary() {
+        let log_path = temp_log_path("retrieval-context-execution-receipt-helper-redaction");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let receipt_payload = LocalRetrievalSearchService
+            .execute_context_payload_with_summary(&runtime, &request_payload)
+            .unwrap()
+            .encode_receipt_payload()
+            .unwrap();
+        let receipt_text = String::from_utf8(receipt_payload).unwrap();
+
+        for sensitive in [
+            "tenant-a",
+            "knowledge",
+            "text-embedding-local",
+            "local",
+            "close local retrieval hit",
+            "chunk-close",
+            "doc-a",
+            "sha256-close",
+        ] {
+            assert!(!receipt_text.contains(sensitive));
+        }
 
         fs::remove_file(log_path).unwrap();
     }
