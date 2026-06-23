@@ -353,7 +353,9 @@ payload/context bytes.
 `RetrievalContextReceiptEventStreamTarget` can build and explicitly
 create the receipt event stream with caller-selected retention before
 publication. Stream setup is caller-driven; publish helpers do not
-auto-create streams.
+auto-create streams. Convenience helpers create keep-all streams or
+positive bounded-retention streams; zero bounded retention is rejected
+before touching the stream log.
 `RetrievalContextReceiptEventStreamTarget` and
 `RetrievalContextReceiptEventStreamLog` add an explicit local publisher
 contract for worker/playbook tests that choose to write that event
