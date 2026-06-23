@@ -71,7 +71,9 @@ and terminal `>` tail wildcards. Subject filters also reject empty
 tokens. Durable consumer replay can use the same filters over records
 pending after the consumer ack cursor without moving that cursor.
 JSONL replay revalidates persisted stream record subjects before
-rebuilding state.
+rebuilding state. It also revalidates persisted stream coordinates,
+consumer names, and stream record transaction IDs before applying
+journal entries.
 
 These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries
