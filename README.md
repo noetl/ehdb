@@ -308,6 +308,10 @@ add versioned JSON byte codecs for those local worker/playbook
 boundaries, rejecting malformed payloads and unsupported versions before
 execution or handoff. They are not an RPC protocol, Arrow Flight
 endpoint, gateway route, prompt engine, or production retrieval API.
+`LocalRetrievalSearchService::execute_context_payload` completes the
+local handoff loop by decoding a request payload, assembling context
+from replayed state, and returning an encoded result payload. This is an
+in-process worker/playbook executor, not a daemon or network endpoint.
 
 ## Replay Reference
 
