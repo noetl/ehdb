@@ -40,11 +40,16 @@ impl StreamSequence {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Subject(String);
 
+fn has_non_empty_subject_tokens(value: &str) -> bool {
+    value.split('.').all(|token| !token.is_empty())
+}
+
 impl Subject {
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         let valid = !value.is_empty()
             && value.len() <= 256
+            && has_non_empty_subject_tokens(&value)
             && value
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
@@ -69,6 +74,7 @@ impl SubjectFilter {
         let value = value.into();
         let valid = !value.is_empty()
             && value.len() <= 256
+            && has_non_empty_subject_tokens(&value)
             && value
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '*' | '>'))
@@ -1118,8 +1124,14 @@ mod tests {
         assert!(Subject::new("noetl.event").is_ok());
         assert!(Subject::new("noetl event").is_err());
         assert!(Subject::new("").is_err());
+        assert!(Subject::new(".noetl.event").is_err());
+        assert!(Subject::new("noetl..event").is_err());
+        assert!(Subject::new("noetl.event.").is_err());
         assert!(Subject::new("noetl.*").is_err());
         assert!(Subject::new("noetl.>").is_err());
+        assert!(SubjectFilter::new(".noetl.*").is_err());
+        assert!(SubjectFilter::new("noetl..*").is_err());
+        assert!(SubjectFilter::new("noetl.*.").is_err());
         assert!(SubjectFilter::new("noetl.*").is_ok());
         assert!(SubjectFilter::new("noetl.>").is_ok());
         assert!(StreamSequence::new(0).is_err());
