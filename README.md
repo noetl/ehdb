@@ -328,6 +328,11 @@ tenant IDs, namespace values, query text, chunk text, tokens, vectors,
 payload bytes, object paths, and principals; it is metrics/audit
 metadata for local worker/playbook tests, not a logging sink or
 production policy surface.
+`RetrievalContextPayloadExecutionReceiptPayload` wraps that redacted
+summary in a versioned JSON byte codec so future event-log/audit
+plumbing has a durable receipt shape. It still contains only summary
+fields and does not publish events, emit logs, expose a network API, or
+carry retrieval-sensitive content.
 
 ## Replay Reference
 

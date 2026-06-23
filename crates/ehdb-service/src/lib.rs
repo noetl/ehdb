@@ -36,6 +36,8 @@ pub const DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER: &str = "x-ehdb-namespace";
 pub const DEFAULT_FLIGHT_PRINCIPAL_HEADER: &str = "x-ehdb-principal";
 pub const RETRIEVAL_CONTEXT_REQUEST_VERSION: &str = "ehdb.retrieval.context.request.v1";
 pub const RETRIEVAL_CONTEXT_RESULT_VERSION: &str = "ehdb.retrieval.context.result.v1";
+pub const RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION: &str =
+    "ehdb.retrieval.context.execution.receipt.v1";
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
@@ -971,7 +973,7 @@ impl RetrievalContextPayloadScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalContextPayloadExecutionSummary {
     pub request_payload_bytes: usize,
     pub result_payload_bytes: usize,
@@ -985,6 +987,51 @@ pub struct RetrievalContextPayloadExecutionSummary {
 pub struct RetrievalContextPayloadExecution {
     pub result_payload: Vec<u8>,
     pub summary: RetrievalContextPayloadExecutionSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalContextPayloadExecutionReceiptPayload {
+    pub version: String,
+    pub summary: RetrievalContextPayloadExecutionSummary,
+}
+
+impl RetrievalContextPayloadExecutionReceiptPayload {
+    pub fn new(summary: RetrievalContextPayloadExecutionSummary) -> Self {
+        Self {
+            version: RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION.to_string(),
+            summary,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_version()?;
+        serde_json::to_vec(self).map_err(|err| {
+            EhdbError::InvalidState(format!("encode retrieval context execution receipt: {err}"))
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
+            EhdbError::InvalidState(format!("decode retrieval context execution receipt: {err}"))
+        })?;
+        payload.validate_version()?;
+        Ok(payload)
+    }
+
+    pub fn into_summary(self) -> RetrievalContextPayloadExecutionSummary {
+        self.summary
+    }
+
+    fn validate_version(&self) -> Result<()> {
+        if self.version == RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "unsupported retrieval context execution receipt version: {}",
+                self.version
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2836,6 +2883,109 @@ mod tests {
         ] {
             assert!(!debug_summary.contains(sensitive));
         }
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payload_round_trips_summary() {
+        let summary = RetrievalContextPayloadExecutionSummary {
+            request_payload_bytes: 128,
+            result_payload_bytes: 512,
+            context_block_count: 3,
+            total_text_chars: 256,
+            truncated: true,
+            scope_required: true,
+        };
+
+        let encoded = RetrievalContextPayloadExecutionReceiptPayload::new(summary.clone())
+            .encode()
+            .unwrap();
+        let decoded = RetrievalContextPayloadExecutionReceiptPayload::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.version, RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION);
+        assert_eq!(decoded.into_summary(), summary);
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payloads_reject_invalid_bytes() {
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptPayload::decode(b"not-json").unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut payload = RetrievalContextPayloadExecutionReceiptPayload::new(
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 512,
+                context_block_count: 3,
+                total_text_chars: 256,
+                truncated: true,
+                scope_required: false,
+            },
+        );
+        payload.version = "ehdb.retrieval.context.execution.receipt.v0".to_string();
+        assert!(matches!(
+            payload.encode().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let unsupported_payload = serde_json::to_vec(&payload).unwrap();
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&unsupported_payload)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payload_excludes_sensitive_context() {
+        let log_path = temp_log_path("retrieval-context-execution-receipt-redaction");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let execution = LocalRetrievalSearchService
+            .execute_context_payload_with_summary(&runtime, &request_payload)
+            .unwrap();
+        let receipt_payload =
+            RetrievalContextPayloadExecutionReceiptPayload::new(execution.summary.clone())
+                .encode()
+                .unwrap();
+        let receipt_text = String::from_utf8(receipt_payload.clone()).unwrap();
+
+        for sensitive in [
+            "tenant-a",
+            "knowledge",
+            "text-embedding-local",
+            "local",
+            "close local retrieval hit",
+            "chunk-close",
+            "doc-a",
+            "sha256-close",
+        ] {
+            assert!(!receipt_text.contains(sensitive));
+        }
+        assert_eq!(
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&receipt_payload)
+                .unwrap()
+                .into_summary(),
+            execution.summary
+        );
 
         fs::remove_file(log_path).unwrap();
     }
