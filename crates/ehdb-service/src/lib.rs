@@ -983,6 +983,26 @@ pub struct RetrievalContextPayloadExecutionSummary {
     pub scope_required: bool,
 }
 
+impl RetrievalContextPayloadExecutionSummary {
+    pub fn validate(&self) -> Result<()> {
+        validate_payload_limit(
+            "retrieval context receipt request payload bytes",
+            self.request_payload_bytes,
+        )?;
+        validate_payload_limit(
+            "retrieval context receipt result payload bytes",
+            self.result_payload_bytes,
+        )?;
+        if self.context_block_count == 0 && self.total_text_chars != 0 {
+            return Err(EhdbError::InvalidState(
+                "retrieval context receipt total text chars require at least one context block"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalContextPayloadExecution {
     pub result_payload: Vec<u8>,
@@ -1011,6 +1031,7 @@ impl RetrievalContextPayloadExecutionReceiptPayload {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate_version()?;
+        self.summary.validate()?;
         serde_json::to_vec(self).map_err(|err| {
             EhdbError::InvalidState(format!("encode retrieval context execution receipt: {err}"))
         })
@@ -1021,6 +1042,7 @@ impl RetrievalContextPayloadExecutionReceiptPayload {
             EhdbError::InvalidState(format!("decode retrieval context execution receipt: {err}"))
         })?;
         payload.validate_version()?;
+        payload.summary.validate()?;
         Ok(payload)
     }
 
@@ -2914,6 +2936,27 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_context_execution_receipt_payload_accepts_empty_context_summary() {
+        let summary = RetrievalContextPayloadExecutionSummary {
+            request_payload_bytes: 128,
+            result_payload_bytes: 64,
+            context_block_count: 0,
+            total_text_chars: 0,
+            truncated: false,
+            scope_required: true,
+        };
+
+        let encoded = RetrievalContextPayloadExecutionReceiptPayload::new(summary.clone())
+            .encode()
+            .unwrap();
+        let decoded = RetrievalContextPayloadExecutionReceiptPayload::decode(&encoded)
+            .unwrap()
+            .into_summary();
+
+        assert_eq!(decoded, summary);
+    }
+
+    #[test]
     fn retrieval_context_execution_receipt_payloads_reject_invalid_bytes() {
         assert!(matches!(
             RetrievalContextPayloadExecutionReceiptPayload::decode(b"not-json").unwrap_err(),
@@ -2942,6 +2985,48 @@ mod tests {
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payloads_reject_invalid_summaries() {
+        for summary in [
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 0,
+                result_payload_bytes: 512,
+                context_block_count: 3,
+                total_text_chars: 256,
+                truncated: true,
+                scope_required: false,
+            },
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 0,
+                context_block_count: 3,
+                total_text_chars: 256,
+                truncated: true,
+                scope_required: false,
+            },
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 512,
+                context_block_count: 0,
+                total_text_chars: 1,
+                truncated: true,
+                scope_required: false,
+            },
+        ] {
+            let payload = RetrievalContextPayloadExecutionReceiptPayload::new(summary.clone());
+            assert!(matches!(
+                payload.encode().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+
+            let invalid_bytes = serde_json::to_vec(&payload).unwrap();
+            assert!(matches!(
+                RetrievalContextPayloadExecutionReceiptPayload::decode(&invalid_bytes).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]
