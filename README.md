@@ -312,6 +312,10 @@ endpoint, gateway route, prompt engine, or production retrieval API.
 local handoff loop by decoding a request payload, assembling context
 from replayed state, and returning an encoded result payload. This is an
 in-process worker/playbook executor, not a daemon or network endpoint.
+`RetrievalContextPayloadExecutorConfig` bounds that local handoff with
+positive request/result byte limits. Oversized request payloads are
+rejected before decode, and oversized encoded result payloads are
+rejected before returning bytes.
 
 ## Replay Reference
 
