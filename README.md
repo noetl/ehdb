@@ -344,6 +344,12 @@ receipt payload bytes. `RetrievalContextPayloadExecutorConfig` now also
 limits receipt payload bytes before artifact helpers return. Artifact
 validation decodes the receipt and rejects empty payloads or result-byte
 length mismatches.
+`RetrievalContextPayloadExecutionReceiptEventPayload` wraps the
+validated receipt bytes in a versioned JSON event envelope with the
+stable subject `ehdb.retrieval.context.execution.receipt`. This is a
+local stream-ready payload shape for future EHDB audit/event plumbing;
+it does not publish to a stream, log, expose a service, or carry result
+payload/context bytes.
 
 ## Replay Reference
 

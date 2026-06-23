@@ -38,6 +38,10 @@ pub const RETRIEVAL_CONTEXT_REQUEST_VERSION: &str = "ehdb.retrieval.context.requ
 pub const RETRIEVAL_CONTEXT_RESULT_VERSION: &str = "ehdb.retrieval.context.result.v1";
 pub const RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_VERSION: &str =
     "ehdb.retrieval.context.execution.receipt.v1";
+pub const RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_VERSION: &str =
+    "ehdb.retrieval.context.execution.receipt.event.v1";
+pub const RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_SUBJECT: &str =
+    "ehdb.retrieval.context.execution.receipt";
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -1053,6 +1057,16 @@ impl RetrievalContextPayloadExecutionArtifacts {
         Ok(RetrievalContextPayloadExecutionReceiptPayload::decode(&self.receipt_payload)?.summary)
     }
 
+    pub fn receipt_event_payload(
+        &self,
+    ) -> Result<RetrievalContextPayloadExecutionReceiptEventPayload> {
+        RetrievalContextPayloadExecutionReceiptEventPayload::from_artifacts(self)
+    }
+
+    pub fn encode_receipt_event_payload(&self) -> Result<Vec<u8>> {
+        self.receipt_event_payload()?.encode()
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_payload_limit(
             "retrieval context artifact result payload bytes",
@@ -1070,6 +1084,80 @@ impl RetrievalContextPayloadExecutionArtifacts {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalContextPayloadExecutionReceiptEventPayload {
+    pub version: String,
+    pub receipt_payload: Vec<u8>,
+}
+
+impl RetrievalContextPayloadExecutionReceiptEventPayload {
+    pub fn new(receipt_payload: Vec<u8>) -> Result<Self> {
+        let payload = Self {
+            version: RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_VERSION.to_string(),
+            receipt_payload,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn from_artifacts(artifacts: &RetrievalContextPayloadExecutionArtifacts) -> Result<Self> {
+        artifacts.validate()?;
+        Self::new(artifacts.receipt_payload.clone())
+    }
+
+    pub fn subject(&self) -> &'static str {
+        RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_SUBJECT
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|err| {
+            EhdbError::InvalidState(format!(
+                "encode retrieval context execution receipt event: {err}"
+            ))
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
+            EhdbError::InvalidState(format!(
+                "decode retrieval context execution receipt event: {err}"
+            ))
+        })?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn receipt_summary(&self) -> Result<RetrievalContextPayloadExecutionSummary> {
+        Ok(RetrievalContextPayloadExecutionReceiptPayload::decode(&self.receipt_payload)?.summary)
+    }
+
+    pub fn into_receipt_payload(self) -> Vec<u8> {
+        self.receipt_payload
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_version()?;
+        validate_payload_limit(
+            "retrieval context receipt event receipt payload bytes",
+            self.receipt_payload.len(),
+        )?;
+        RetrievalContextPayloadExecutionReceiptPayload::decode(&self.receipt_payload)?;
+        Ok(())
+    }
+
+    fn validate_version(&self) -> Result<()> {
+        if self.version == RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_VERSION {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "unsupported retrieval context execution receipt event version: {}",
+                self.version
+            )))
+        }
     }
 }
 
@@ -3451,6 +3539,132 @@ mod tests {
             artifacts.validate().unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_payload_round_trips_from_artifacts() {
+        let log_path = temp_log_path("retrieval-context-receipt-event-payload");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+
+        let event = artifacts.receipt_event_payload().unwrap();
+        let encoded = artifacts.encode_receipt_event_payload().unwrap();
+        let decoded =
+            RetrievalContextPayloadExecutionReceiptEventPayload::decode(&encoded).unwrap();
+
+        assert_eq!(
+            event.version,
+            RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_VERSION
+        );
+        assert_eq!(
+            event.subject(),
+            RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_SUBJECT
+        );
+        assert_eq!(decoded, event);
+        assert_eq!(
+            decoded.receipt_summary().unwrap(),
+            artifacts.receipt_summary().unwrap()
+        );
+        assert_eq!(decoded.into_receipt_payload(), artifacts.receipt_payload);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_payload_rejects_invalid_payloads() {
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptEventPayload::new(Vec::new()).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptEventPayload::new(b"not-json".to_vec())
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let receipt_payload = RetrievalContextPayloadExecutionReceiptPayload::new(
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 256,
+                context_block_count: 1,
+                total_text_chars: 32,
+                truncated: false,
+                scope_required: false,
+            },
+        )
+        .encode()
+        .unwrap();
+        let mut event =
+            RetrievalContextPayloadExecutionReceiptEventPayload::new(receipt_payload).unwrap();
+        event.version = "ehdb.retrieval.context.execution.receipt.event.v0".to_string();
+
+        let unsupported_event = serde_json::to_vec(&event).unwrap();
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptEventPayload::decode(&unsupported_event)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_payload_keeps_redaction_boundary() {
+        let log_path = temp_log_path("retrieval-context-receipt-event-redaction");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let event_payload = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap()
+            .encode_receipt_event_payload()
+            .unwrap();
+        let event_text = String::from_utf8(event_payload).unwrap();
+
+        for sensitive in [
+            "tenant-a",
+            "knowledge",
+            "text-embedding-local",
+            "local",
+            "close local retrieval hit",
+            "chunk-close",
+            "doc-a",
+            "sha256-close",
+        ] {
+            assert!(!event_text.contains(sensitive));
+        }
+
+        fs::remove_file(log_path).unwrap();
     }
 
     #[test]
