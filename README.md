@@ -297,6 +297,12 @@ text match counts with caller-provided non-negative weights, producing
 deterministic hybrid RAG hits over replayed retrieval state. This is a
 local scoring fixture, not an ANN index, full-text engine, query
 planner, gateway route, or distributed retrieval service.
+`AssembleRetrievalContextRequest` builds on that hybrid path to produce
+bounded, citation-ready `RetrievalContextBlock` values with chunk and
+document identity, checksums, score metadata, clipped text, and total
+text budget accounting. This remains a local worker/playbook-shaped
+fixture; it does not invoke an LLM, render prompt templates, open a
+network API, or add a persistent retrieval daemon.
 
 ## Replay Reference
 
