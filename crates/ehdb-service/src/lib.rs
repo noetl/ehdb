@@ -577,6 +577,7 @@ impl ScanFlightTicket {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate_version()?;
+        validate_scan_latest_table_request(&self.request)?;
         serde_json::to_vec(self)
             .map_err(|err| EhdbError::InvalidState(format!("encode scan ticket: {err}")))
     }
@@ -585,6 +586,7 @@ impl ScanFlightTicket {
         let ticket: Self = serde_json::from_slice(bytes)
             .map_err(|err| EhdbError::InvalidState(format!("decode scan ticket: {err}")))?;
         ticket.validate_version()?;
+        validate_scan_latest_table_request(&ticket.request)?;
         Ok(ticket)
     }
 
@@ -620,6 +622,12 @@ impl ScanFlightTicket {
             )))
         }
     }
+}
+
+fn validate_scan_latest_table_request(request: &ScanLatestTableRequest) -> Result<()> {
+    TenantId::new(request.tenant.as_str()).map(|_| ())?;
+    NamespaceName::new(request.namespace.as_str()).map(|_| ())?;
+    TableName::new(request.table_name.as_str()).map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5313,6 +5321,25 @@ mod tests {
     fn flight_scan_ticket_rejects_malformed_payloads() {
         let error = ScanFlightTicket::decode(b"not-json").unwrap_err();
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_invalid_request_identifiers() {
+        for (pointer, value) in [
+            ("/request/tenant", serde_json::json!("tenant a")),
+            ("/request/namespace", serde_json::json!("bad namespace")),
+            ("/request/table_name", serde_json::json!("bad table")),
+        ] {
+            let mut ticket =
+                serde_json::to_value(ScanFlightTicket::new(filtered_request())).unwrap();
+            *ticket.pointer_mut(pointer).unwrap() = value;
+            let encoded = serde_json::to_vec(&ticket).unwrap();
+
+            assert!(matches!(
+                ScanFlightTicket::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidIdentifier(_)
+            ));
+        }
     }
 
     #[test]
