@@ -572,6 +572,7 @@ dependencies = [
  "ehdb-reference",
  "ehdb-retrieval",
  "ehdb-storage",
+ "ehdb-stream",
  "ehdb-transaction",
  "futures-util",
  "serde",

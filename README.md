@@ -350,6 +350,12 @@ stable subject `ehdb.retrieval.context.execution.receipt`. This is a
 local stream-ready payload shape for future EHDB audit/event plumbing;
 it does not publish to a stream, log, expose a service, or carry result
 payload/context bytes.
+`RetrievalContextReceiptEventStreamTarget` and
+`RetrievalContextReceiptEventStreamLog` add an explicit local publisher
+contract for worker/playbook tests that choose to write that event
+payload into an EHDB stream log. The caller supplies tenant, namespace,
+stream, mutable stream log, and transaction id; no background task,
+gateway path, or automatic publication is introduced.
 
 ## Replay Reference
 
