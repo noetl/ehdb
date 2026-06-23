@@ -93,6 +93,27 @@ pub struct TextSearchHit {
     pub match_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridSearch {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub model_id: EmbeddingModelId,
+    pub query: Vec<f32>,
+    pub text_query: String,
+    pub limit: usize,
+    pub vector_weight: f32,
+    pub text_weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridSearchHit {
+    pub chunk: Chunk,
+    pub embedding: Embedding,
+    pub vector_score: f32,
+    pub text_match_count: usize,
+    pub combined_score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DocumentKey {
     tenant: TenantId,
@@ -314,6 +335,61 @@ impl InMemoryRetrievalCatalog {
         Ok(hits)
     }
 
+    pub fn search_hybrid(&self, request: HybridSearch) -> Result<Vec<HybridSearchHit>> {
+        let text_query = normalized_text_query(&request.text_query)?;
+        validate_search_limit("hybrid search", request.limit)?;
+        validate_vector("hybrid query vector", &request.query)?;
+        validate_hybrid_weights(request.vector_weight, request.text_weight)?;
+
+        let query_norm = vector_norm(&request.query);
+        let document_ids = self.document_ids_for_scope(&request.tenant, &request.namespace);
+        let mut hits: Vec<_> = self
+            .embeddings
+            .values()
+            .filter_map(|embedding| {
+                if embedding.model_id != request.model_id
+                    || embedding.dimensions != request.query.len()
+                {
+                    return None;
+                }
+                let chunk = self.chunks.get(&embedding.chunk_id)?;
+                if !document_ids
+                    .iter()
+                    .any(|document_id| document_id == &chunk.document_id)
+                {
+                    return None;
+                }
+                let vector_score = cosine_similarity(&request.query, &embedding.vector, query_norm);
+                let text_match_count = count_text_matches(&chunk.text, &text_query);
+                let combined_score = request.vector_weight * vector_score
+                    + request.text_weight * text_match_count as f32;
+                if combined_score == 0.0 {
+                    return None;
+                }
+                Some(HybridSearchHit {
+                    chunk: chunk.clone(),
+                    embedding: embedding.clone(),
+                    vector_score,
+                    text_match_count,
+                    combined_score,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|left, right| {
+            right
+                .combined_score
+                .total_cmp(&left.combined_score)
+                .then_with(|| right.vector_score.total_cmp(&left.vector_score))
+                .then_with(|| right.text_match_count.cmp(&left.text_match_count))
+                .then_with(|| left.chunk.document_id.cmp(&right.chunk.document_id))
+                .then_with(|| left.chunk.ordinal.cmp(&right.chunk.ordinal))
+                .then_with(|| left.chunk.id.cmp(&right.chunk.id))
+        });
+        hits.truncate(request.limit);
+        Ok(hits)
+    }
+
     fn document_by_id(&self, document_id: &DocumentId) -> Result<&Document> {
         self.documents
             .values()
@@ -342,6 +418,34 @@ fn normalized_text_query(query: &str) -> Result<String> {
         ));
     }
     Ok(query)
+}
+
+fn validate_search_limit(label: &str, limit: usize) -> Result<()> {
+    if limit == 0 {
+        return Err(EhdbError::InvalidState(format!(
+            "{label} limit must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hybrid_weights(vector_weight: f32, text_weight: f32) -> Result<()> {
+    if !vector_weight.is_finite() || !text_weight.is_finite() {
+        return Err(EhdbError::InvalidState(
+            "hybrid search weights must be finite".to_string(),
+        ));
+    }
+    if vector_weight < 0.0 || text_weight < 0.0 {
+        return Err(EhdbError::InvalidState(
+            "hybrid search weights must not be negative".to_string(),
+        ));
+    }
+    if vector_weight == 0.0 && text_weight == 0.0 {
+        return Err(EhdbError::InvalidState(
+            "at least one hybrid search weight must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn count_text_matches(text: &str, normalized_query: &str) -> usize {
@@ -806,6 +910,267 @@ mod tests {
         ] {
             assert!(matches!(
                 catalog.search_text(request).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn hybrid_search_combines_vector_and_text_scores() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let tenant = TenantId::new("tenant-a").unwrap();
+        let namespace = NamespaceName::new("knowledge").unwrap();
+        let model = EmbeddingModelId::new("text-embedding-local").unwrap();
+        let document = register_scoped_doc(
+            &mut catalog,
+            tenant.clone(),
+            namespace.clone(),
+            "doc-hybrid",
+            "txn-doc-hybrid",
+        );
+        let text_match = register_chunk_with_text(
+            &mut catalog,
+            document.id.clone(),
+            "chunk-text-match",
+            0,
+            "retrieval retrieval lineage".to_string(),
+            "txn-chunk-text-match",
+        );
+        let vector_match = register_chunk_with_text(
+            &mut catalog,
+            document.id,
+            "chunk-vector-match",
+            1,
+            "lineage only".to_string(),
+            "txn-chunk-vector-match",
+        );
+        register_embedding(
+            &mut catalog,
+            text_match.id.clone(),
+            &model,
+            vec![0.5, 0.5],
+            "txn-embedding-text-match",
+        );
+        register_embedding(
+            &mut catalog,
+            vector_match.id.clone(),
+            &model,
+            vec![1.0, 0.0],
+            "txn-embedding-vector-match",
+        );
+
+        let hits = catalog
+            .search_hybrid(HybridSearch {
+                tenant,
+                namespace,
+                model_id: model,
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 10,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].chunk.id, ChunkId::new("chunk-text-match").unwrap());
+        assert_eq!(hits[0].text_match_count, 2);
+        assert!(hits[0].combined_score > hits[1].combined_score);
+        assert_eq!(
+            hits[1].chunk.id,
+            ChunkId::new("chunk-vector-match").unwrap()
+        );
+        assert_eq!(hits[1].text_match_count, 0);
+    }
+
+    #[test]
+    fn hybrid_search_scopes_candidates_and_applies_limit() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+        let namespace = NamespaceName::new("knowledge").unwrap();
+        let model = EmbeddingModelId::new("text-embedding-local").unwrap();
+        let other_model = EmbeddingModelId::new("text-embedding-other").unwrap();
+        let doc_a = register_scoped_doc(
+            &mut catalog,
+            tenant_a.clone(),
+            namespace.clone(),
+            "doc-a",
+            "txn-doc-a",
+        );
+        let doc_b = register_scoped_doc(
+            &mut catalog,
+            tenant_b,
+            namespace.clone(),
+            "doc-b",
+            "txn-doc-b",
+        );
+        let wanted = register_chunk_with_text(
+            &mut catalog,
+            doc_a.id.clone(),
+            "chunk-wanted",
+            0,
+            "retrieval wanted".to_string(),
+            "txn-chunk-wanted",
+        );
+        let other_dimension = register_chunk_with_text(
+            &mut catalog,
+            doc_a.id.clone(),
+            "chunk-other-dimension",
+            1,
+            "retrieval wrong dimension".to_string(),
+            "txn-chunk-other-dimension",
+        );
+        let other_tenant = register_chunk_with_text(
+            &mut catalog,
+            doc_b.id,
+            "chunk-other-tenant",
+            0,
+            "retrieval other tenant".to_string(),
+            "txn-chunk-other-tenant",
+        );
+        register_embedding(
+            &mut catalog,
+            wanted.id.clone(),
+            &model,
+            vec![1.0, 0.0],
+            "txn-embedding-wanted",
+        );
+        register_embedding(
+            &mut catalog,
+            wanted.id,
+            &other_model,
+            vec![1.0, 0.0],
+            "txn-embedding-other-model",
+        );
+        register_embedding(
+            &mut catalog,
+            other_dimension.id,
+            &model,
+            vec![1.0, 0.0, 0.0],
+            "txn-embedding-other-dimension",
+        );
+        register_embedding(
+            &mut catalog,
+            other_tenant.id,
+            &model,
+            vec![1.0, 0.0],
+            "txn-embedding-other-tenant",
+        );
+
+        let hits = catalog
+            .search_hybrid(HybridSearch {
+                tenant: tenant_a,
+                namespace,
+                model_id: model,
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 1,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk.id, ChunkId::new("chunk-wanted").unwrap());
+    }
+
+    #[test]
+    fn hybrid_search_handles_empty_results_and_validation() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let (tenant, namespace) = ids();
+        let model = EmbeddingModelId::new("text-embedding-local").unwrap();
+        let document = register_scoped_doc(
+            &mut catalog,
+            tenant.clone(),
+            namespace.clone(),
+            "doc-hybrid-validation",
+            "txn-doc-hybrid-validation",
+        );
+        let chunk = register_chunk_with_text(
+            &mut catalog,
+            document.id,
+            "chunk-hybrid-validation",
+            0,
+            "lineage only".to_string(),
+            "txn-chunk-hybrid-validation",
+        );
+        register_embedding(
+            &mut catalog,
+            chunk.id,
+            &model,
+            vec![1.0, 0.0],
+            "txn-embedding-hybrid-validation",
+        );
+
+        let empty = catalog
+            .search_hybrid(HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 10,
+                vector_weight: 0.0,
+                text_weight: 1.0,
+            })
+            .unwrap();
+        assert!(empty.is_empty());
+
+        for request in [
+            HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                text_query: " ".to_string(),
+                limit: 10,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![0.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 10,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 0,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 10,
+                vector_weight: f32::NAN,
+                text_weight: 1.0,
+            },
+            HybridSearch {
+                tenant: tenant.clone(),
+                namespace,
+                model_id: model,
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 10,
+                vector_weight: 0.0,
+                text_weight: 0.0,
+            },
+        ] {
+            assert!(matches!(
+                catalog.search_hybrid(request).unwrap_err(),
                 EhdbError::InvalidState(_)
             ));
         }

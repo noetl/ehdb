@@ -292,6 +292,11 @@ The same service boundary also exposes exact local text matching through
 counts for tenant/namespace-scoped RAG lookup fixtures. Full-text
 indexes, BM25 ranking, external search adapters, and distributed query
 execution remain future surfaces.
+`SearchHybridChunksRequest` combines exact cosine similarity and exact
+text match counts with caller-provided non-negative weights, producing
+deterministic hybrid RAG hits over replayed retrieval state. This is a
+local scoring fixture, not an ANN index, full-text engine, query
+planner, gateway route, or distributed retrieval service.
 
 ## Replay Reference
 

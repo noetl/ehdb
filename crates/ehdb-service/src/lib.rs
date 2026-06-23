@@ -18,7 +18,7 @@ use ehdb_core::{
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
-use ehdb_retrieval::{TextSearch, VectorSearch};
+use ehdb_retrieval::{HybridSearch, TextSearch, VectorSearch};
 use ehdb_storage::ImmutableObjectStore;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -764,6 +764,32 @@ pub struct SearchTextChunksHit {
     pub match_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHybridChunksRequest {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub model_id: EmbeddingModelId,
+    pub query: Vec<f32>,
+    pub text_query: String,
+    pub limit: usize,
+    pub vector_weight: f32,
+    pub text_weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHybridChunksHit {
+    pub chunk_id: ChunkId,
+    pub document_id: DocumentId,
+    pub ordinal: u32,
+    pub text: String,
+    pub checksum: String,
+    pub model_id: EmbeddingModelId,
+    pub dimensions: usize,
+    pub vector_score: f32,
+    pub text_match_count: usize,
+    pub combined_score: f32,
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -793,6 +819,41 @@ impl LocalRetrievalSearchService {
                 model_id: hit.embedding.model_id,
                 dimensions: hit.embedding.dimensions,
                 score: hit.score,
+            })
+            .collect();
+        Ok(hits)
+    }
+
+    pub fn search_hybrid(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request: SearchHybridChunksRequest,
+    ) -> Result<Vec<SearchHybridChunksHit>> {
+        let hits = runtime
+            .state()
+            .retrieval
+            .search_hybrid(HybridSearch {
+                tenant: request.tenant,
+                namespace: request.namespace,
+                model_id: request.model_id,
+                query: request.query,
+                text_query: request.text_query,
+                limit: request.limit,
+                vector_weight: request.vector_weight,
+                text_weight: request.text_weight,
+            })?
+            .into_iter()
+            .map(|hit| SearchHybridChunksHit {
+                chunk_id: hit.chunk.id,
+                document_id: hit.chunk.document_id,
+                ordinal: hit.chunk.ordinal,
+                text: hit.chunk.text,
+                checksum: hit.chunk.checksum,
+                model_id: hit.embedding.model_id,
+                dimensions: hit.embedding.dimensions,
+                vector_score: hit.vector_score,
+                text_match_count: hit.text_match_count,
+                combined_score: hit.combined_score,
             })
             .collect();
         Ok(hits)
@@ -1597,6 +1658,112 @@ mod tests {
         ] {
             assert!(matches!(
                 service.search_text(&runtime, request).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_search_service_returns_hybrid_hits_from_replay() {
+        let log_path = temp_log_path("local-retrieval-hybrid-search-service-ranked");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let reopened = LocalReferenceRuntime::open(&log_path).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let hits = service
+            .search_hybrid(
+                &reopened,
+                SearchHybridChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "local".to_string(),
+                    limit: 10,
+                    vector_weight: 1.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].chunk_id, ChunkId::new("chunk-close").unwrap());
+        assert_eq!(hits[0].document_id, DocumentId::new("doc-a").unwrap());
+        assert_eq!(hits[0].ordinal, 0);
+        assert_eq!(hits[0].text, "close local retrieval hit");
+        assert_eq!(hits[0].checksum, "sha256-close");
+        assert_eq!(
+            hits[0].model_id,
+            EmbeddingModelId::new("text-embedding-local").unwrap()
+        );
+        assert_eq!(hits[0].dimensions, 2);
+        assert_eq!(hits[0].text_match_count, 1);
+        assert!(hits[0].combined_score > hits[1].combined_score);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn local_retrieval_search_service_handles_empty_and_invalid_hybrid_queries() {
+        let log_path = temp_log_path("local-retrieval-hybrid-search-service-validation");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        let empty = service
+            .search_hybrid(
+                &runtime,
+                SearchHybridChunksRequest {
+                    tenant: TenantId::new("tenant-a").unwrap(),
+                    namespace: NamespaceName::new("knowledge").unwrap(),
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    query: vec![1.0, 0.0],
+                    text_query: "missing".to_string(),
+                    limit: 10,
+                    vector_weight: 0.0,
+                    text_weight: 1.0,
+                },
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        for request in [
+            SearchHybridChunksRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: " ".to_string(),
+                limit: 10,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            SearchHybridChunksRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![0.0, 0.0],
+                text_query: "local".to_string(),
+                limit: 10,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            },
+            SearchHybridChunksRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                limit: 10,
+                vector_weight: -1.0,
+                text_weight: 1.0,
+            },
+        ] {
+            assert!(matches!(
+                service.search_hybrid(&runtime, request).unwrap_err(),
                 EhdbError::InvalidState(_)
             ));
         }
