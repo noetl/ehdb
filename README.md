@@ -85,7 +85,8 @@ once the metadata, stream, and NoETL integration contracts stabilize.
 append-only journal for system WASM library manifests and bindings. It
 persists publish and bind operations, then rebuilds immutable manifests
 and environment/channel bindings on open so hot-replacement state
-survives restart.
+survives restart. Replay revalidates persisted manifest and binding
+identifiers before rebuilding system-library state.
 
 ## Immutable Objects
 
