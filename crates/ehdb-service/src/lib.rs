@@ -36,6 +36,8 @@ pub const DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER: &str = "x-ehdb-namespace";
 pub const DEFAULT_FLIGHT_PRINCIPAL_HEADER: &str = "x-ehdb-principal";
 pub const RETRIEVAL_CONTEXT_REQUEST_VERSION: &str = "ehdb.retrieval.context.request.v1";
 pub const RETRIEVAL_CONTEXT_RESULT_VERSION: &str = "ehdb.retrieval.context.result.v1";
+pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
@@ -919,6 +921,34 @@ impl RetrievalContextResultPayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalContextPayloadExecutorConfig {
+    pub max_request_payload_bytes: usize,
+    pub max_result_payload_bytes: usize,
+}
+
+impl Default for RetrievalContextPayloadExecutorConfig {
+    fn default() -> Self {
+        Self {
+            max_request_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES,
+            max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+        }
+    }
+}
+
+impl RetrievalContextPayloadExecutorConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_payload_limit(
+            "max retrieval context request payload bytes",
+            self.max_request_payload_bytes,
+        )?;
+        validate_payload_limit(
+            "max retrieval context result payload bytes",
+            self.max_result_payload_bytes,
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -1057,9 +1087,36 @@ impl LocalRetrievalSearchService {
         runtime: &LocalReferenceRuntime,
         request_payload: &[u8],
     ) -> Result<Vec<u8>> {
+        self.execute_context_payload_with_config(
+            runtime,
+            request_payload,
+            RetrievalContextPayloadExecutorConfig::default(),
+        )
+    }
+
+    pub fn execute_context_payload_with_config(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+    ) -> Result<Vec<u8>> {
+        config.validate()?;
+        if request_payload.len() > config.max_request_payload_bytes {
+            return Err(EhdbError::InvalidState(format!(
+                "retrieval context request payload exceeds {} bytes",
+                config.max_request_payload_bytes
+            )));
+        }
         let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
         let context = self.assemble_context(runtime, request)?;
-        RetrievalContextResultPayload::new(context).encode()
+        let result = RetrievalContextResultPayload::new(context).encode()?;
+        if result.len() > config.max_result_payload_bytes {
+            return Err(EhdbError::InvalidState(format!(
+                "retrieval context result payload exceeds {} bytes",
+                config.max_result_payload_bytes
+            )));
+        }
+        Ok(result)
     }
 
     pub fn search_text(
@@ -1101,6 +1158,15 @@ fn validate_context_budget(label: &str, budget: usize) -> Result<()> {
 
 fn take_char_prefix(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
+}
+
+fn validate_payload_limit(label: &str, limit: usize) -> Result<()> {
+    if limit == 0 {
+        return Err(EhdbError::InvalidState(format!(
+            "{label} must be greater than zero"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -2447,6 +2513,144 @@ mod tests {
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_config_defaults_and_validates() {
+        let config = RetrievalContextPayloadExecutorConfig::default();
+        assert_eq!(
+            config.max_request_payload_bytes,
+            DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            config.max_result_payload_bytes,
+            DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES
+        );
+        config.validate().unwrap();
+
+        for config in [
+            RetrievalContextPayloadExecutorConfig {
+                max_request_payload_bytes: 0,
+                max_result_payload_bytes: 1,
+            },
+            RetrievalContextPayloadExecutorConfig {
+                max_request_payload_bytes: 1,
+                max_result_payload_bytes: 0,
+            },
+        ] {
+            assert!(matches!(
+                config.validate().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_rejects_oversized_request_payloads() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-request-bound");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let config = RetrievalContextPayloadExecutorConfig {
+            max_request_payload_bytes: request_payload.len() - 1,
+            max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+        };
+
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_config(&runtime, &request_payload, config)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        if log_path.exists() {
+            fs::remove_file(log_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_rejects_oversized_result_payloads() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-result-bound");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let config = RetrievalContextPayloadExecutorConfig {
+            max_request_payload_bytes: request_payload.len(),
+            max_result_payload_bytes: 1,
+        };
+
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_config(&runtime, &request_payload, config)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_accepts_configured_bounds() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-configured");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let config = RetrievalContextPayloadExecutorConfig {
+            max_request_payload_bytes: request_payload.len(),
+            max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+        };
+
+        let result_payload = LocalRetrievalSearchService
+            .execute_context_payload_with_config(&runtime, &request_payload, config)
+            .unwrap();
+        let context = RetrievalContextResultPayload::decode(&result_payload)
+            .unwrap()
+            .into_context();
+        assert_eq!(context.blocks.len(), 2);
 
         fs::remove_file(log_path).unwrap();
     }
