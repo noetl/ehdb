@@ -1052,6 +1052,16 @@ impl LocalRetrievalSearchService {
         })
     }
 
+    pub fn execute_context_payload(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
+        let context = self.assemble_context(runtime, request)?;
+        RetrievalContextResultPayload::new(context).encode()
+    }
+
     pub fn search_text(
         &self,
         runtime: &LocalReferenceRuntime,
@@ -2305,6 +2315,140 @@ mod tests {
             RetrievalContextResultPayload::decode(&unsupported_result).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_returns_result_payload() {
+        let log_path = temp_log_path("retrieval-context-payload-executor");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let response_payload = LocalRetrievalSearchService
+            .execute_context_payload(&runtime, &request_payload)
+            .unwrap();
+        let response = RetrievalContextResultPayload::decode(&response_payload).unwrap();
+        let context = response.into_context();
+
+        assert_eq!(context.blocks.len(), 2);
+        assert_eq!(
+            context.blocks[0].chunk_id,
+            ChunkId::new("chunk-close").unwrap()
+        );
+        assert_eq!(context.blocks[0].text, "close local retrieval hit");
+        assert!(!context.truncated);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_returns_empty_result_payload() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-empty");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("missing").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let response_payload = LocalRetrievalSearchService
+            .execute_context_payload(&runtime, &request_payload)
+            .unwrap();
+        let context = RetrievalContextResultPayload::decode(&response_payload)
+            .unwrap()
+            .into_context();
+
+        assert!(context.blocks.is_empty());
+        assert_eq!(context.total_text_chars, 0);
+        assert!(!context.truncated);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_propagates_payload_and_validation_errors() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-errors");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let service = LocalRetrievalSearchService;
+
+        assert!(matches!(
+            service
+                .execute_context_payload(&runtime, b"not-json")
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut unsupported =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            });
+        unsupported.version = "ehdb.retrieval.context.request.v0".to_string();
+        let unsupported_payload = serde_json::to_vec(&unsupported).unwrap();
+        assert!(matches!(
+            service
+                .execute_context_payload(&runtime, &unsupported_payload)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let invalid_request =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 0,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        assert!(matches!(
+            service
+                .execute_context_payload(&runtime, &invalid_request)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
     }
 
     #[test]
