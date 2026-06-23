@@ -79,6 +79,20 @@ pub struct VectorSearchHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSearch {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSearchHit {
+    pub chunk: Chunk,
+    pub match_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DocumentKey {
     tenant: TenantId,
@@ -258,6 +272,48 @@ impl InMemoryRetrievalCatalog {
         Ok(hits)
     }
 
+    pub fn search_text(&self, request: TextSearch) -> Result<Vec<TextSearchHit>> {
+        let query = normalized_text_query(&request.query)?;
+        if request.limit == 0 {
+            return Err(EhdbError::InvalidState(
+                "text search limit must be greater than zero".to_string(),
+            ));
+        }
+
+        let document_ids = self.document_ids_for_scope(&request.tenant, &request.namespace);
+        let mut hits: Vec<_> = self
+            .chunks
+            .values()
+            .filter_map(|chunk| {
+                if !document_ids
+                    .iter()
+                    .any(|document_id| document_id == &chunk.document_id)
+                {
+                    return None;
+                }
+                let match_count = count_text_matches(&chunk.text, &query);
+                if match_count == 0 {
+                    return None;
+                }
+                Some(TextSearchHit {
+                    chunk: chunk.clone(),
+                    match_count,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|left, right| {
+            right
+                .match_count
+                .cmp(&left.match_count)
+                .then_with(|| left.chunk.document_id.cmp(&right.chunk.document_id))
+                .then_with(|| left.chunk.ordinal.cmp(&right.chunk.ordinal))
+                .then_with(|| left.chunk.id.cmp(&right.chunk.id))
+        });
+        hits.truncate(request.limit);
+        Ok(hits)
+    }
+
     fn document_by_id(&self, document_id: &DocumentId) -> Result<&Document> {
         self.documents
             .values()
@@ -276,6 +332,20 @@ impl InMemoryRetrievalCatalog {
             .map(|document| document.id.clone())
             .collect()
     }
+}
+
+fn normalized_text_query(query: &str) -> Result<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "text search query must not be empty".to_string(),
+        ));
+    }
+    Ok(query)
+}
+
+fn count_text_matches(text: &str, normalized_query: &str) -> usize {
+    text.to_lowercase().matches(normalized_query).count()
 }
 
 fn validate_vector(label: &str, vector: &[f32]) -> Result<()> {
@@ -365,12 +435,30 @@ mod tests {
         ordinal: u32,
         txn: &str,
     ) -> Chunk {
+        register_chunk_with_text(
+            catalog,
+            document_id,
+            id,
+            ordinal,
+            format!("retrieval chunk {id}"),
+            txn,
+        )
+    }
+
+    fn register_chunk_with_text(
+        catalog: &mut InMemoryRetrievalCatalog,
+        document_id: DocumentId,
+        id: &str,
+        ordinal: u32,
+        text: String,
+        txn: &str,
+    ) -> Chunk {
         catalog
             .register_chunk(RegisterChunk {
                 id: ChunkId::new(id).unwrap(),
                 document_id,
                 ordinal,
-                text: format!("retrieval chunk {id}"),
+                text,
                 checksum: format!("sha256-{id}"),
                 transaction_id: TransactionId::new(txn).unwrap(),
             })
@@ -590,6 +678,137 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.id, ChunkId::new("chunk-dim-two").unwrap());
+    }
+
+    #[test]
+    fn text_search_returns_tenant_scoped_ranked_hits() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+        let namespace = NamespaceName::new("knowledge").unwrap();
+        let doc_a = register_scoped_doc(
+            &mut catalog,
+            tenant_a.clone(),
+            namespace.clone(),
+            "doc-a",
+            "txn-doc-a",
+        );
+        let doc_b = register_scoped_doc(
+            &mut catalog,
+            tenant_b,
+            namespace.clone(),
+            "doc-b",
+            "txn-doc-b",
+        );
+        register_chunk_with_text(
+            &mut catalog,
+            doc_a.id.clone(),
+            "chunk-two-matches",
+            0,
+            "NoETL retrieval stores retrieval context".to_string(),
+            "txn-chunk-two-matches",
+        );
+        register_chunk_with_text(
+            &mut catalog,
+            doc_a.id,
+            "chunk-one-match",
+            1,
+            "NoETL retrieval stores lineage context".to_string(),
+            "txn-chunk-one-match",
+        );
+        register_chunk_with_text(
+            &mut catalog,
+            doc_b.id,
+            "chunk-other-tenant",
+            0,
+            "retrieval retrieval should stay tenant-scoped".to_string(),
+            "txn-chunk-other-tenant",
+        );
+
+        let hits = catalog
+            .search_text(TextSearch {
+                tenant: tenant_a,
+                namespace,
+                query: " Retrieval ".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].chunk.id, ChunkId::new("chunk-two-matches").unwrap());
+        assert_eq!(hits[0].match_count, 2);
+        assert_eq!(hits[1].chunk.id, ChunkId::new("chunk-one-match").unwrap());
+        assert_eq!(hits[1].match_count, 1);
+    }
+
+    #[test]
+    fn text_search_applies_limit_empty_results_and_validation() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let (tenant, namespace) = ids();
+        let document = register_scoped_doc(
+            &mut catalog,
+            tenant.clone(),
+            namespace.clone(),
+            "doc-text",
+            "txn-doc-text",
+        );
+        register_chunk_with_text(
+            &mut catalog,
+            document.id.clone(),
+            "chunk-a",
+            0,
+            "retrieval alpha".to_string(),
+            "txn-chunk-a",
+        );
+        register_chunk_with_text(
+            &mut catalog,
+            document.id,
+            "chunk-b",
+            1,
+            "retrieval beta".to_string(),
+            "txn-chunk-b",
+        );
+
+        let limited = catalog
+            .search_text(TextSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                query: "retrieval".to_string(),
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].chunk.id, ChunkId::new("chunk-a").unwrap());
+
+        let empty = catalog
+            .search_text(TextSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                query: "missing".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+        assert!(empty.is_empty());
+
+        for request in [
+            TextSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                query: " ".to_string(),
+                limit: 10,
+            },
+            TextSearch {
+                tenant,
+                namespace,
+                query: "retrieval".to_string(),
+                limit: 0,
+            },
+        ] {
+            assert!(matches!(
+                catalog.search_text(request).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]

@@ -287,6 +287,11 @@ result boundary over replayed `LocalReferenceRuntime` retrieval state.
 identity, text, checksum, model, dimensions, and score while avoiding raw
 embedding vectors in the response. This is not a network service,
 gateway route, production retrieval API, or persistent daemon.
+The same service boundary also exposes exact local text matching through
+`SearchTextChunksRequest`, returning deterministic chunk hits with match
+counts for tenant/namespace-scoped RAG lookup fixtures. Full-text
+indexes, BM25 ranking, external search adapters, and distributed query
+execution remain future surfaces.
 
 ## Replay Reference
 
