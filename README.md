@@ -319,9 +319,10 @@ fixture; it does not invoke an LLM, render prompt templates, open a
 network API, or add a persistent retrieval daemon.
 `RetrievalContextRequestPayload` and `RetrievalContextResultPayload`
 add versioned JSON byte codecs for those local worker/playbook
-boundaries, rejecting malformed payloads and unsupported versions before
-execution or handoff. They are not an RPC protocol, Arrow Flight
-endpoint, gateway route, prompt engine, or production retrieval API.
+boundaries, rejecting malformed payloads, unsupported versions, and
+invalid decoded identifiers before execution or handoff. They are not
+an RPC protocol, Arrow Flight endpoint, gateway route, prompt engine, or
+production retrieval API.
 `LocalRetrievalSearchService::execute_context_payload` completes the
 local handoff loop by decoding a request payload, assembling context
 from replayed state, and returning an encoded result payload. This is an

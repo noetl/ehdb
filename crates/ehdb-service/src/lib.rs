@@ -858,6 +858,7 @@ impl RetrievalContextRequestPayload {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate_version()?;
+        validate_retrieval_context_request(&self.request)?;
         serde_json::to_vec(self).map_err(|err| {
             EhdbError::InvalidState(format!("encode retrieval context request: {err}"))
         })
@@ -868,6 +869,7 @@ impl RetrievalContextRequestPayload {
             EhdbError::InvalidState(format!("decode retrieval context request: {err}"))
         })?;
         payload.validate_version()?;
+        validate_retrieval_context_request(&payload.request)?;
         Ok(payload)
     }
 
@@ -903,6 +905,7 @@ impl RetrievalContextResultPayload {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate_version()?;
+        validate_retrieval_context(&self.context)?;
         serde_json::to_vec(self).map_err(|err| {
             EhdbError::InvalidState(format!("encode retrieval context result: {err}"))
         })
@@ -913,6 +916,7 @@ impl RetrievalContextResultPayload {
             EhdbError::InvalidState(format!("decode retrieval context result: {err}"))
         })?;
         payload.validate_version()?;
+        validate_retrieval_context(&payload.context)?;
         Ok(payload)
     }
 
@@ -930,6 +934,21 @@ impl RetrievalContextResultPayload {
             )))
         }
     }
+}
+
+fn validate_retrieval_context_request(request: &AssembleRetrievalContextRequest) -> Result<()> {
+    TenantId::new(request.tenant.as_str()).map(|_| ())?;
+    NamespaceName::new(request.namespace.as_str()).map(|_| ())?;
+    EmbeddingModelId::new(request.model_id.as_str()).map(|_| ())
+}
+
+fn validate_retrieval_context(context: &RetrievalContext) -> Result<()> {
+    for block in &context.blocks {
+        ChunkId::new(block.chunk_id.as_str()).map(|_| ())?;
+        DocumentId::new(block.document_id.as_str()).map(|_| ())?;
+        EmbeddingModelId::new(block.model_id.as_str()).map(|_| ())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3107,6 +3126,77 @@ mod tests {
             RetrievalContextResultPayload::decode(&unsupported_result).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_request_payload_rejects_invalid_identifiers() {
+        for (pointer, value) in [
+            ("/request/tenant", serde_json::json!("tenant a")),
+            ("/request/namespace", serde_json::json!("bad namespace")),
+            ("/request/model_id", serde_json::json!("bad model")),
+        ] {
+            let request = AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            };
+            let mut payload =
+                serde_json::to_value(RetrievalContextRequestPayload::new(request)).unwrap();
+            *payload.pointer_mut(pointer).unwrap() = value;
+            let encoded = serde_json::to_vec(&payload).unwrap();
+
+            assert!(matches!(
+                RetrievalContextRequestPayload::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidIdentifier(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn retrieval_context_result_payload_rejects_invalid_block_identifiers() {
+        for (pointer, value) in [
+            ("/context/blocks/0/chunk_id", serde_json::json!("bad chunk")),
+            (
+                "/context/blocks/0/document_id",
+                serde_json::json!("bad document"),
+            ),
+            ("/context/blocks/0/model_id", serde_json::json!("bad model")),
+        ] {
+            let context = RetrievalContext {
+                blocks: vec![RetrievalContextBlock {
+                    chunk_id: ChunkId::new("chunk-0001").unwrap(),
+                    document_id: DocumentId::new("doc-0001").unwrap(),
+                    ordinal: 0,
+                    checksum: "sha256:test".to_string(),
+                    text: "NoETL retrieval context".to_string(),
+                    original_text_chars: 23,
+                    clipped: false,
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    dimensions: 2,
+                    vector_score: 1.0,
+                    text_match_count: 1,
+                    combined_score: 2.0,
+                }],
+                total_text_chars: 23,
+                truncated: false,
+            };
+            let mut payload =
+                serde_json::to_value(RetrievalContextResultPayload::new(context)).unwrap();
+            *payload.pointer_mut(pointer).unwrap() = value;
+            let encoded = serde_json::to_vec(&payload).unwrap();
+
+            assert!(matches!(
+                RetrievalContextResultPayload::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidIdentifier(_)
+            ));
+        }
     }
 
     #[test]
