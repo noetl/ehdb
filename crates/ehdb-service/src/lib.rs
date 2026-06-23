@@ -13,13 +13,14 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
 use ehdb_core::{
     ChunkId, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, PrincipalId, Result,
-    TableName, TenantId,
+    StreamName, TableName, TenantId, TransactionId,
 };
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
 };
 use ehdb_retrieval::{HybridSearch, TextSearch, VectorSearch};
 use ehdb_storage::ImmutableObjectStore;
+use ehdb_stream::{InMemoryStreamLog, LocalJsonlStreamLog, StreamRecord, Subject};
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -1067,6 +1068,15 @@ impl RetrievalContextPayloadExecutionArtifacts {
         self.receipt_event_payload()?.encode()
     }
 
+    pub fn publish_receipt_event<L: RetrievalContextReceiptEventStreamLog>(
+        &self,
+        stream_log: &mut L,
+        target: &RetrievalContextReceiptEventStreamTarget,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord> {
+        target.publish_artifacts(stream_log, self, transaction_id)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_payload_limit(
             "retrieval context artifact result payload bytes",
@@ -1084,6 +1094,72 @@ impl RetrievalContextPayloadExecutionArtifacts {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalContextReceiptEventStreamTarget {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+    pub stream: StreamName,
+}
+
+impl RetrievalContextReceiptEventStreamTarget {
+    pub fn publish_artifacts<L: RetrievalContextReceiptEventStreamLog>(
+        &self,
+        stream_log: &mut L,
+        artifacts: &RetrievalContextPayloadExecutionArtifacts,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord> {
+        let event = artifacts.receipt_event_payload()?;
+        stream_log.publish_receipt_event(
+            &self.tenant,
+            &self.namespace,
+            &self.stream,
+            event,
+            transaction_id,
+        )
+    }
+}
+
+pub trait RetrievalContextReceiptEventStreamLog {
+    fn publish_receipt_event(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        event: RetrievalContextPayloadExecutionReceiptEventPayload,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord>;
+}
+
+impl RetrievalContextReceiptEventStreamLog for InMemoryStreamLog {
+    fn publish_receipt_event(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        event: RetrievalContextPayloadExecutionReceiptEventPayload,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord> {
+        let subject = Subject::new(event.subject())?;
+        let payload = event.encode()?;
+        self.publish(tenant, namespace, stream, subject, payload, transaction_id)
+    }
+}
+
+impl RetrievalContextReceiptEventStreamLog for LocalJsonlStreamLog {
+    fn publish_receipt_event(
+        &mut self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        event: RetrievalContextPayloadExecutionReceiptEventPayload,
+        transaction_id: TransactionId,
+    ) -> Result<StreamRecord> {
+        let subject = Subject::new(event.subject())?;
+        let payload = event.encode()?;
+        self.publish(tenant, namespace, stream, subject, payload, transaction_id)
     }
 }
 
@@ -3665,6 +3741,197 @@ mod tests {
         }
 
         fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_publisher_writes_and_replays_stream_record() {
+        let log_path = temp_log_path("retrieval-context-receipt-event-publisher");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let mut stream_log = InMemoryStreamLog::default();
+        stream_log
+            .create_stream(ehdb_stream::StreamConfig {
+                tenant: target.tenant.clone(),
+                namespace: target.namespace.clone(),
+                name: target.stream.clone(),
+                retention: ehdb_stream::RetentionPolicy::KeepAll,
+            })
+            .unwrap();
+
+        let record = artifacts
+            .publish_receipt_event(
+                &mut stream_log,
+                &target,
+                TransactionId::new("txn-retrieval-receipt-event").unwrap(),
+            )
+            .unwrap();
+        let event =
+            RetrievalContextPayloadExecutionReceiptEventPayload::decode(&record.payload).unwrap();
+        let replayed = stream_log
+            .replay(&target.tenant, &target.namespace, &target.stream, None)
+            .unwrap();
+
+        assert_eq!(
+            record.subject.as_str(),
+            RETRIEVAL_CONTEXT_EXECUTION_RECEIPT_EVENT_SUBJECT
+        );
+        assert_eq!(
+            event.receipt_summary().unwrap(),
+            artifacts.receipt_summary().unwrap()
+        );
+        assert_eq!(replayed, vec![record]);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_publisher_persists_jsonl_stream_record() {
+        let runtime_log_path =
+            temp_log_path("retrieval-context-receipt-event-publisher-jsonl-runtime");
+        let stream_log_path =
+            temp_log_path("retrieval-context-receipt-event-publisher-jsonl-stream");
+        let mut runtime = LocalReferenceRuntime::open(&runtime_log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let mut stream_log = LocalJsonlStreamLog::open(&stream_log_path).unwrap();
+        stream_log
+            .create_stream(ehdb_stream::StreamConfig {
+                tenant: target.tenant.clone(),
+                namespace: target.namespace.clone(),
+                name: target.stream.clone(),
+                retention: ehdb_stream::RetentionPolicy::KeepAll,
+            })
+            .unwrap();
+
+        let record = target
+            .publish_artifacts(
+                &mut stream_log,
+                &artifacts,
+                TransactionId::new("txn-retrieval-receipt-event-jsonl").unwrap(),
+            )
+            .unwrap();
+        drop(stream_log);
+
+        let reopened = LocalJsonlStreamLog::open(&stream_log_path).unwrap();
+        let replayed = reopened
+            .replay(&target.tenant, &target.namespace, &target.stream, None)
+            .unwrap();
+
+        assert_eq!(replayed, vec![record]);
+
+        fs::remove_file(runtime_log_path).unwrap();
+        fs::remove_file(stream_log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_publisher_rejects_missing_stream_and_bad_artifacts() {
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let receipt_payload = RetrievalContextPayloadExecutionReceiptPayload::new(
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 5,
+                context_block_count: 1,
+                total_text_chars: 32,
+                truncated: false,
+                scope_required: false,
+            },
+        )
+        .encode()
+        .unwrap();
+        let artifacts = RetrievalContextPayloadExecutionArtifacts {
+            result_payload: b"valid".to_vec(),
+            receipt_payload,
+        };
+        let mut missing_stream_log = InMemoryStreamLog::default();
+
+        assert!(matches!(
+            artifacts
+                .publish_receipt_event(
+                    &mut missing_stream_log,
+                    &target,
+                    TransactionId::new("txn-missing-stream").unwrap(),
+                )
+                .unwrap_err(),
+            EhdbError::NotFound(_)
+        ));
+
+        let mut stream_log = InMemoryStreamLog::default();
+        stream_log
+            .create_stream(ehdb_stream::StreamConfig {
+                tenant: target.tenant.clone(),
+                namespace: target.namespace.clone(),
+                name: target.stream.clone(),
+                retention: ehdb_stream::RetentionPolicy::KeepAll,
+            })
+            .unwrap();
+        let bad_artifacts = RetrievalContextPayloadExecutionArtifacts {
+            result_payload: b"valid".to_vec(),
+            receipt_payload: b"not-json".to_vec(),
+        };
+
+        assert!(matches!(
+            target
+                .publish_artifacts(
+                    &mut stream_log,
+                    &bad_artifacts,
+                    TransactionId::new("txn-bad-artifacts").unwrap(),
+                )
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(stream_log
+            .replay(&target.tenant, &target.namespace, &target.stream, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

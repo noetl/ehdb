@@ -15,6 +15,7 @@ ehdb-core.workspace = true
 ehdb-reference.workspace = true
 ehdb-retrieval.workspace = true
 ehdb-storage.workspace = true
+ehdb-stream.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
