@@ -971,6 +971,22 @@ impl RetrievalContextPayloadScope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalContextPayloadExecutionSummary {
+    pub request_payload_bytes: usize,
+    pub result_payload_bytes: usize,
+    pub context_block_count: usize,
+    pub total_text_chars: usize,
+    pub truncated: bool,
+    pub scope_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalContextPayloadExecution {
+    pub result_payload: Vec<u8>,
+    pub summary: RetrievalContextPayloadExecutionSummary,
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -1109,7 +1125,16 @@ impl LocalRetrievalSearchService {
         runtime: &LocalReferenceRuntime,
         request_payload: &[u8],
     ) -> Result<Vec<u8>> {
-        self.execute_context_payload_with_config(
+        self.execute_context_payload_with_summary(runtime, request_payload)
+            .map(|execution| execution.result_payload)
+    }
+
+    pub fn execute_context_payload_with_summary(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+    ) -> Result<RetrievalContextPayloadExecution> {
+        self.execute_context_payload_with_config_and_summary(
             runtime,
             request_payload,
             RetrievalContextPayloadExecutorConfig::default(),
@@ -1122,6 +1147,16 @@ impl LocalRetrievalSearchService {
         request_payload: &[u8],
         config: RetrievalContextPayloadExecutorConfig,
     ) -> Result<Vec<u8>> {
+        self.execute_context_payload_with_config_and_summary(runtime, request_payload, config)
+            .map(|execution| execution.result_payload)
+    }
+
+    pub fn execute_context_payload_with_config_and_summary(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+    ) -> Result<RetrievalContextPayloadExecution> {
         config.validate()?;
         if request_payload.len() > config.max_request_payload_bytes {
             return Err(EhdbError::InvalidState(format!(
@@ -1130,7 +1165,13 @@ impl LocalRetrievalSearchService {
             )));
         }
         let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
-        self.execute_context_request_with_config(runtime, request, config)
+        self.execute_context_request_with_config_and_summary(
+            runtime,
+            request,
+            config,
+            request_payload.len(),
+            false,
+        )
     }
 
     pub fn execute_context_payload_with_scope(
@@ -1140,6 +1181,17 @@ impl LocalRetrievalSearchService {
         config: RetrievalContextPayloadExecutorConfig,
         scope: &RetrievalContextPayloadScope,
     ) -> Result<Vec<u8>> {
+        self.execute_context_payload_with_scope_and_summary(runtime, request_payload, config, scope)
+            .map(|execution| execution.result_payload)
+    }
+
+    pub fn execute_context_payload_with_scope_and_summary(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+        scope: &RetrievalContextPayloadScope,
+    ) -> Result<RetrievalContextPayloadExecution> {
         config.validate()?;
         if request_payload.len() > config.max_request_payload_bytes {
             return Err(EhdbError::InvalidState(format!(
@@ -1149,16 +1201,27 @@ impl LocalRetrievalSearchService {
         }
         let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
         scope.validate_request(&request)?;
-        self.execute_context_request_with_config(runtime, request, config)
+        self.execute_context_request_with_config_and_summary(
+            runtime,
+            request,
+            config,
+            request_payload.len(),
+            true,
+        )
     }
 
-    fn execute_context_request_with_config(
+    fn execute_context_request_with_config_and_summary(
         &self,
         runtime: &LocalReferenceRuntime,
         request: AssembleRetrievalContextRequest,
         config: RetrievalContextPayloadExecutorConfig,
-    ) -> Result<Vec<u8>> {
+        request_payload_bytes: usize,
+        scope_required: bool,
+    ) -> Result<RetrievalContextPayloadExecution> {
         let context = self.assemble_context(runtime, request)?;
+        let context_block_count = context.blocks.len();
+        let total_text_chars = context.total_text_chars;
+        let truncated = context.truncated;
         let result = RetrievalContextResultPayload::new(context).encode()?;
         if result.len() > config.max_result_payload_bytes {
             return Err(EhdbError::InvalidState(format!(
@@ -1166,7 +1229,17 @@ impl LocalRetrievalSearchService {
                 config.max_result_payload_bytes
             )));
         }
-        Ok(result)
+        Ok(RetrievalContextPayloadExecution {
+            summary: RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes,
+                result_payload_bytes: result.len(),
+                context_block_count,
+                total_text_chars,
+                truncated,
+                scope_required,
+            },
+            result_payload: result,
+        })
     }
 
     pub fn search_text(
@@ -2706,6 +2779,153 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_context_payload_executor_returns_redacted_summary() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-summary");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let execution = LocalRetrievalSearchService
+            .execute_context_payload_with_config_and_summary(
+                &runtime,
+                &request_payload,
+                RetrievalContextPayloadExecutorConfig::default(),
+            )
+            .unwrap();
+        let context = RetrievalContextResultPayload::decode(&execution.result_payload)
+            .unwrap()
+            .into_context();
+
+        assert_eq!(
+            execution.summary.request_payload_bytes,
+            request_payload.len()
+        );
+        assert_eq!(
+            execution.summary.result_payload_bytes,
+            execution.result_payload.len()
+        );
+        assert_eq!(execution.summary.context_block_count, context.blocks.len());
+        assert_eq!(execution.summary.total_text_chars, context.total_text_chars);
+        assert!(!execution.summary.truncated);
+        assert!(!execution.summary.scope_required);
+
+        let debug_summary = format!("{:?}", execution.summary);
+        for sensitive in [
+            "tenant-a",
+            "knowledge",
+            "text-embedding-local",
+            "local",
+            "close local retrieval hit",
+            "chunk-close",
+            "doc-a",
+            "sha256-close",
+        ] {
+            assert!(!debug_summary.contains(sensitive));
+        }
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_summary_reports_truncation() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-summary-truncated");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 5,
+                max_total_chars: 8,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        let execution = LocalRetrievalSearchService
+            .execute_context_payload_with_summary(&runtime, &request_payload)
+            .unwrap();
+
+        assert_eq!(execution.summary.context_block_count, 2);
+        assert_eq!(execution.summary.total_text_chars, 8);
+        assert!(execution.summary.truncated);
+        assert!(!execution.summary.scope_required);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_executor_summary_propagates_bounds() {
+        let log_path = temp_log_path("retrieval-context-payload-executor-summary-bounds");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_config_and_summary(
+                    &runtime,
+                    &request_payload,
+                    RetrievalContextPayloadExecutorConfig {
+                        max_request_payload_bytes: request_payload.len() - 1,
+                        max_result_payload_bytes:
+                            DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+                    },
+                )
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_config_and_summary(
+                    &runtime,
+                    &request_payload,
+                    RetrievalContextPayloadExecutorConfig {
+                        max_request_payload_bytes: request_payload.len(),
+                        max_result_payload_bytes: 1,
+                    },
+                )
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
     fn retrieval_context_payload_scope_accepts_matching_request() {
         let log_path = temp_log_path("retrieval-context-payload-scope");
         let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
@@ -2742,6 +2962,46 @@ mod tests {
             .unwrap()
             .into_context();
         assert_eq!(context.blocks.len(), 2);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_scope_summary_marks_scope_required() {
+        let log_path = temp_log_path("retrieval-context-payload-scope-summary");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let scope = RetrievalContextPayloadScope {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+        };
+
+        let execution = LocalRetrievalSearchService
+            .execute_context_payload_with_scope_and_summary(
+                &runtime,
+                &request_payload,
+                RetrievalContextPayloadExecutorConfig::default(),
+                &scope,
+            )
+            .unwrap();
+
+        assert_eq!(execution.summary.context_block_count, 2);
+        assert!(execution.summary.scope_required);
 
         fs::remove_file(log_path).unwrap();
     }
