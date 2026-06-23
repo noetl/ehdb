@@ -64,10 +64,11 @@ persists create-stream, create-consumer, publish, and ack operations;
 on open it rebuilds stream records, retention state, next sequence, and
 durable consumer cursors. Keep-all retention is supported, and bounded
 max-record retention must be positive before any stream is created or
-journaled. Replay can be filtered by subject using exact matches,
-single-token `*` wildcards, and terminal `>` tail wildcards. Durable
-consumer replay can use the same filters over records pending after the
-consumer ack cursor without moving that cursor.
+journaled. Published stream records use concrete `Subject` values that
+reject wildcard tokens; replay uses `SubjectFilter` values for exact
+matches, single-token `*` wildcards, and terminal `>` tail wildcards.
+Durable consumer replay can use the same filters over records pending
+after the consumer ack cursor without moving that cursor.
 
 These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries

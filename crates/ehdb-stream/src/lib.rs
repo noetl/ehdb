@@ -47,7 +47,7 @@ impl Subject {
             && value.len() <= 256
             && value
                 .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '*' | '>'));
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
 
         if valid {
             Ok(Self(value))
@@ -58,6 +58,35 @@ impl Subject {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SubjectFilter(String);
+
+impl SubjectFilter {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.len() <= 256
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '*' | '>'))
+            && value.split('.').enumerate().all(|(index, token)| {
+                if token.contains('*') && token != "*" {
+                    return false;
+                }
+                if token.contains('>') && (token != ">" || index != value.split('.').count() - 1) {
+                    return false;
+                }
+                true
+            });
+
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(EhdbError::InvalidIdentifier(value))
+        }
     }
 
     pub fn matches(&self, subject: &Subject) -> bool {
@@ -85,6 +114,10 @@ impl Subject {
         }
 
         filter_index == filter_tokens.len() && subject_index == subject_tokens.len()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -260,7 +293,7 @@ impl InMemoryStreamLog {
         tenant: &TenantId,
         namespace: &NamespaceName,
         stream: &StreamName,
-        subject_filter: &Subject,
+        subject_filter: &SubjectFilter,
         after: Option<StreamSequence>,
     ) -> Result<Vec<StreamRecord>> {
         self.replay_records(tenant, namespace, stream, after, Some(subject_filter))
@@ -272,7 +305,7 @@ impl InMemoryStreamLog {
         namespace: &NamespaceName,
         stream: &StreamName,
         after: Option<StreamSequence>,
-        subject_filter: Option<&Subject>,
+        subject_filter: Option<&SubjectFilter>,
     ) -> Result<Vec<StreamRecord>> {
         let state = self.stream(tenant, namespace, stream)?;
         Ok(state
@@ -307,7 +340,7 @@ impl InMemoryStreamLog {
         namespace: &NamespaceName,
         stream: &StreamName,
         consumer: &ConsumerName,
-        subject_filter: &Subject,
+        subject_filter: &SubjectFilter,
     ) -> Result<Vec<StreamRecord>> {
         let state = self.stream(tenant, namespace, stream)?;
         let consumer = state
@@ -567,7 +600,7 @@ impl LocalJsonlStreamLog {
         tenant: &TenantId,
         namespace: &NamespaceName,
         stream: &StreamName,
-        subject_filter: &Subject,
+        subject_filter: &SubjectFilter,
         after: Option<StreamSequence>,
     ) -> Result<Vec<StreamRecord>> {
         self.inner
@@ -591,7 +624,7 @@ impl LocalJsonlStreamLog {
         namespace: &NamespaceName,
         stream: &StreamName,
         consumer: &ConsumerName,
-        subject_filter: &Subject,
+        subject_filter: &SubjectFilter,
     ) -> Result<Vec<StreamRecord>> {
         self.inner
             .replay_matching_for_consumer(tenant, namespace, stream, consumer, subject_filter)
@@ -747,11 +780,10 @@ mod tests {
         let command = Subject::new("noetl.execution.command.completed").unwrap();
         let command_prefix = Subject::new("noetl.execution.command").unwrap();
         let playbook = Subject::new("noetl.execution.playbook.completed").unwrap();
-        let exact = Subject::new("noetl.execution.command.completed").unwrap();
-        let single_token = Subject::new("noetl.execution.*.completed").unwrap();
-        let tail = Subject::new("noetl.execution.>").unwrap();
-        let zero_tail = Subject::new("noetl.execution.command.>").unwrap();
-        let misplaced_tail = Subject::new("noetl.>.completed").unwrap();
+        let exact = SubjectFilter::new("noetl.execution.command.completed").unwrap();
+        let single_token = SubjectFilter::new("noetl.execution.*.completed").unwrap();
+        let tail = SubjectFilter::new("noetl.execution.>").unwrap();
+        let zero_tail = SubjectFilter::new("noetl.execution.command.>").unwrap();
 
         assert!(exact.matches(&command));
         assert!(!exact.matches(&playbook));
@@ -761,7 +793,9 @@ mod tests {
         assert!(tail.matches(&playbook));
         assert!(zero_tail.matches(&command));
         assert!(!zero_tail.matches(&command_prefix));
-        assert!(!misplaced_tail.matches(&command));
+        assert!(SubjectFilter::new("noetl.>.completed").is_err());
+        assert!(SubjectFilter::new("noetl.execution.command>").is_err());
+        assert!(SubjectFilter::new("noetl.execution.*suffix").is_err());
     }
 
     #[test]
@@ -807,8 +841,8 @@ mod tests {
             )
             .unwrap();
 
-        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
-        let execution_filter = Subject::new("noetl.execution.>").unwrap();
+        let command_filter = SubjectFilter::new("noetl.execution.command.*").unwrap();
+        let execution_filter = SubjectFilter::new("noetl.execution.>").unwrap();
 
         assert_eq!(
             log.replay_matching(&tenant, &namespace, &stream, &command_filter, None)
@@ -928,7 +962,7 @@ mod tests {
         )
         .unwrap();
 
-        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+        let command_filter = SubjectFilter::new("noetl.execution.command.*").unwrap();
         let matched = log
             .replay_matching_for_consumer(&tenant, &namespace, &stream, &consumer, &command_filter)
             .unwrap();
@@ -1084,6 +1118,10 @@ mod tests {
         assert!(Subject::new("noetl.event").is_ok());
         assert!(Subject::new("noetl event").is_err());
         assert!(Subject::new("").is_err());
+        assert!(Subject::new("noetl.*").is_err());
+        assert!(Subject::new("noetl.>").is_err());
+        assert!(SubjectFilter::new("noetl.*").is_ok());
+        assert!(SubjectFilter::new("noetl.>").is_ok());
         assert!(StreamSequence::new(0).is_err());
         assert_eq!(StreamSequence::new(1).unwrap(), StreamSequence::first());
     }
@@ -1208,7 +1246,7 @@ mod tests {
         drop(log);
 
         let reopened = LocalJsonlStreamLog::open(&path).unwrap();
-        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+        let command_filter = SubjectFilter::new("noetl.execution.command.*").unwrap();
 
         assert_eq!(
             reopened
@@ -1271,7 +1309,7 @@ mod tests {
         drop(log);
 
         let reopened = LocalJsonlStreamLog::open(&path).unwrap();
-        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+        let command_filter = SubjectFilter::new("noetl.execution.command.*").unwrap();
 
         assert_eq!(
             reopened
