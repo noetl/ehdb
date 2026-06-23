@@ -21,7 +21,8 @@ use ehdb_reference::{
 use ehdb_retrieval::{HybridSearch, TextSearch, VectorSearch};
 use ehdb_storage::ImmutableObjectStore;
 use ehdb_stream::{
-    DurableConsumer, InMemoryStreamLog, LocalJsonlStreamLog, StreamRecord, StreamSequence, Subject,
+    DurableConsumer, InMemoryStreamLog, LocalJsonlStreamLog, RetentionPolicy, StreamConfig,
+    StreamRecord, StreamSequence, Subject,
 };
 use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -1107,6 +1108,23 @@ pub struct RetrievalContextReceiptEventStreamTarget {
 }
 
 impl RetrievalContextReceiptEventStreamTarget {
+    pub fn stream_config(&self, retention: RetentionPolicy) -> StreamConfig {
+        StreamConfig {
+            tenant: self.tenant.clone(),
+            namespace: self.namespace.clone(),
+            name: self.stream.clone(),
+            retention,
+        }
+    }
+
+    pub fn create_stream<L: RetrievalContextReceiptEventStreamSetupLog>(
+        &self,
+        stream_log: &mut L,
+        retention: RetentionPolicy,
+    ) -> Result<()> {
+        stream_log.create_receipt_event_stream(self.stream_config(retention))
+    }
+
     pub fn publish_artifacts<L: RetrievalContextReceiptEventStreamLog>(
         &self,
         stream_log: &mut L,
@@ -1178,6 +1196,22 @@ impl RetrievalContextReceiptEventStreamTarget {
             consumer,
             sequence,
         )
+    }
+}
+
+pub trait RetrievalContextReceiptEventStreamSetupLog {
+    fn create_receipt_event_stream(&mut self, config: StreamConfig) -> Result<()>;
+}
+
+impl RetrievalContextReceiptEventStreamSetupLog for InMemoryStreamLog {
+    fn create_receipt_event_stream(&mut self, config: StreamConfig) -> Result<()> {
+        self.create_stream(config)
+    }
+}
+
+impl RetrievalContextReceiptEventStreamSetupLog for LocalJsonlStreamLog {
+    fn create_receipt_event_stream(&mut self, config: StreamConfig) -> Result<()> {
+        self.create_stream(config)
     }
 }
 
@@ -3956,6 +3990,137 @@ mod tests {
         }
 
         fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_stream_setup_creates_publishable_stream() {
+        let log_path = temp_log_path("retrieval-context-receipt-event-stream-setup");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let mut stream_log = InMemoryStreamLog::default();
+        let config = target.stream_config(RetentionPolicy::KeepAll);
+
+        assert_eq!(config.tenant, target.tenant);
+        assert_eq!(config.namespace, target.namespace);
+        assert_eq!(config.name, target.stream);
+        assert_eq!(config.retention, RetentionPolicy::KeepAll);
+
+        target
+            .create_stream(&mut stream_log, RetentionPolicy::KeepAll)
+            .unwrap();
+        let record = target
+            .publish_artifacts(
+                &mut stream_log,
+                &artifacts,
+                TransactionId::new("txn-retrieval-receipt-stream-setup").unwrap(),
+            )
+            .unwrap();
+        let replayed = target.replay_events(&stream_log, None).unwrap();
+
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].sequence, record.sequence);
+        assert_eq!(
+            replayed[0].receipt_summary().unwrap(),
+            artifacts.receipt_summary().unwrap()
+        );
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_stream_setup_rejects_duplicate_stream() {
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let mut stream_log = InMemoryStreamLog::default();
+
+        target
+            .create_stream(&mut stream_log, RetentionPolicy::KeepAll)
+            .unwrap();
+
+        assert!(matches!(
+            target
+                .create_stream(&mut stream_log, RetentionPolicy::KeepAll)
+                .unwrap_err(),
+            EhdbError::AlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_stream_setup_persists_jsonl_stream() {
+        let runtime_log_path = temp_log_path("retrieval-context-receipt-stream-setup-runtime");
+        let stream_log_path = temp_log_path("retrieval-context-receipt-stream-setup-jsonl");
+        let mut runtime = LocalReferenceRuntime::open(&runtime_log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let artifacts = LocalRetrievalSearchService
+            .execute_context_payload_artifacts(&runtime, &request_payload)
+            .unwrap();
+        let target = RetrievalContextReceiptEventStreamTarget {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            stream: StreamName::new("retrieval-receipts").unwrap(),
+        };
+        let mut stream_log = LocalJsonlStreamLog::open(&stream_log_path).unwrap();
+        target
+            .create_stream(&mut stream_log, RetentionPolicy::KeepAll)
+            .unwrap();
+        drop(stream_log);
+
+        let mut reopened = LocalJsonlStreamLog::open(&stream_log_path).unwrap();
+        let record = target
+            .publish_artifacts(
+                &mut reopened,
+                &artifacts,
+                TransactionId::new("txn-retrieval-receipt-stream-setup-jsonl").unwrap(),
+            )
+            .unwrap();
+        let replayed = target.replay_events(&reopened, None).unwrap();
+
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].sequence, record.sequence);
+
+        fs::remove_file(runtime_log_path).unwrap();
+        fs::remove_file(stream_log_path).unwrap();
     }
 
     #[test]
