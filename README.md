@@ -356,6 +356,12 @@ contract for worker/playbook tests that choose to write that event
 payload into an EHDB stream log. The caller supplies tenant, namespace,
 stream, mutable stream log, and transaction id; no background task,
 gateway path, or automatic publication is introduced.
+`RetrievalContextReceiptEventStreamRecord` and the read-side
+`RetrievalContextReceiptEventStreamReadLog` replay validated receipt
+event stream records from caller-supplied local logs. Replay validates
+the stable subject and event payload while preserving stream sequence
+and transaction id for local audit assertions; it does not start a
+consumer loop, subscription, network API, or service process.
 
 ## Replay Reference
 
