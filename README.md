@@ -341,7 +341,9 @@ an execution result without reassembling the codec wrapper.
 `RetrievalContextPayloadExecutionArtifacts` is the bounded local
 handoff shape for returning result payload bytes together with redacted
 receipt payload bytes. `RetrievalContextPayloadExecutorConfig` now also
-limits receipt payload bytes before artifact helpers return.
+limits receipt payload bytes before artifact helpers return. Artifact
+validation decodes the receipt and rejects empty payloads or result-byte
+length mismatches.
 
 ## Replay Reference
 
