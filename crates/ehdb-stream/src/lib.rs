@@ -301,6 +301,28 @@ impl InMemoryStreamLog {
         self.replay(tenant, namespace, stream, consumer.acked_sequence)
     }
 
+    pub fn replay_matching_for_consumer(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+        subject_filter: &Subject,
+    ) -> Result<Vec<StreamRecord>> {
+        let state = self.stream(tenant, namespace, stream)?;
+        let consumer = state
+            .consumers
+            .get(consumer)
+            .ok_or_else(|| EhdbError::NotFound(consumer.to_string()))?;
+        self.replay_matching(
+            tenant,
+            namespace,
+            stream,
+            subject_filter,
+            consumer.acked_sequence,
+        )
+    }
+
     pub fn ack(
         &mut self,
         tenant: &TenantId,
@@ -561,6 +583,18 @@ impl LocalJsonlStreamLog {
     ) -> Result<Vec<StreamRecord>> {
         self.inner
             .replay_for_consumer(tenant, namespace, stream, consumer)
+    }
+
+    pub fn replay_matching_for_consumer(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+        subject_filter: &Subject,
+    ) -> Result<Vec<StreamRecord>> {
+        self.inner
+            .replay_matching_for_consumer(tenant, namespace, stream, consumer, subject_filter)
     }
 
     pub fn ack(
@@ -841,6 +875,85 @@ mod tests {
     }
 
     #[test]
+    fn durable_consumer_replays_matching_subjects_after_ack() {
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let missing_consumer = ConsumerName::new("missing-materializer").unwrap();
+        let mut log = InMemoryStreamLog::default();
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        log.create_consumer(&tenant, &namespace, &stream, consumer.clone())
+            .unwrap();
+
+        let first_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.started").unwrap(),
+                b"command-started".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        log.publish(
+            &tenant,
+            &namespace,
+            &stream,
+            Subject::new("noetl.execution.playbook.completed").unwrap(),
+            b"playbook-completed".to_vec(),
+            TransactionId::new("txn-0002").unwrap(),
+        )
+        .unwrap();
+        let second_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.completed").unwrap(),
+                b"command-completed".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+        log.ack(
+            &tenant,
+            &namespace,
+            &stream,
+            &consumer,
+            first_command.sequence,
+        )
+        .unwrap();
+
+        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+        let matched = log
+            .replay_matching_for_consumer(&tenant, &namespace, &stream, &consumer, &command_filter)
+            .unwrap();
+
+        assert_eq!(matched, vec![second_command.clone()]);
+        assert_eq!(
+            log.replay_for_consumer(&tenant, &namespace, &stream, &consumer)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            log.replay_matching_for_consumer(
+                &tenant,
+                &namespace,
+                &stream,
+                &missing_consumer,
+                &command_filter,
+            )
+            .unwrap_err(),
+            EhdbError::NotFound(_)
+        ));
+    }
+
+    #[test]
     fn retention_limits_records() {
         let (tenant, namespace, stream) = ids();
         let mut log = InMemoryStreamLog::default();
@@ -1035,6 +1148,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(third.sequence.value(), 3);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_replays_matching_consumer_subjects_after_reopen() {
+        let path = temp_log_path("consumer-subject-filter-replay");
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        log.create_consumer(&tenant, &namespace, &stream, consumer.clone())
+            .unwrap();
+        let first_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.started").unwrap(),
+                b"command-started".to_vec(),
+                TransactionId::new("txn-0001").unwrap(),
+            )
+            .unwrap();
+        log.publish(
+            &tenant,
+            &namespace,
+            &stream,
+            Subject::new("noetl.execution.playbook.completed").unwrap(),
+            b"playbook-completed".to_vec(),
+            TransactionId::new("txn-0002").unwrap(),
+        )
+        .unwrap();
+        let second_command = log
+            .publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.execution.command.completed").unwrap(),
+                b"command-completed".to_vec(),
+                TransactionId::new("txn-0003").unwrap(),
+            )
+            .unwrap();
+        log.ack(
+            &tenant,
+            &namespace,
+            &stream,
+            &consumer,
+            first_command.sequence,
+        )
+        .unwrap();
+        drop(log);
+
+        let reopened = LocalJsonlStreamLog::open(&path).unwrap();
+        let command_filter = Subject::new("noetl.execution.command.*").unwrap();
+
+        assert_eq!(
+            reopened
+                .replay_matching_for_consumer(
+                    &tenant,
+                    &namespace,
+                    &stream,
+                    &consumer,
+                    &command_filter,
+                )
+                .unwrap(),
+            vec![second_command]
+        );
 
         fs::remove_file(path).unwrap();
     }
