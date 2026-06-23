@@ -1033,10 +1033,12 @@ impl RetrievalContextPayloadExecution {
                 config.max_receipt_payload_bytes
             )));
         }
-        Ok(RetrievalContextPayloadExecutionArtifacts {
+        let artifacts = RetrievalContextPayloadExecutionArtifacts {
             result_payload: self.result_payload,
             receipt_payload,
-        })
+        };
+        artifacts.validate()?;
+        Ok(artifacts)
     }
 }
 
@@ -1044,6 +1046,31 @@ impl RetrievalContextPayloadExecution {
 pub struct RetrievalContextPayloadExecutionArtifacts {
     pub result_payload: Vec<u8>,
     pub receipt_payload: Vec<u8>,
+}
+
+impl RetrievalContextPayloadExecutionArtifacts {
+    pub fn receipt_summary(&self) -> Result<RetrievalContextPayloadExecutionSummary> {
+        Ok(RetrievalContextPayloadExecutionReceiptPayload::decode(&self.receipt_payload)?.summary)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_payload_limit(
+            "retrieval context artifact result payload bytes",
+            self.result_payload.len(),
+        )?;
+        validate_payload_limit(
+            "retrieval context artifact receipt payload bytes",
+            self.receipt_payload.len(),
+        )?;
+        let summary = self.receipt_summary()?;
+        if summary.result_payload_bytes != self.result_payload.len() {
+            return Err(EhdbError::InvalidState(
+                "retrieval context artifact result payload bytes do not match receipt summary"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3280,6 +3307,8 @@ mod tests {
             artifacts.result_payload.len()
         );
         assert_eq!(receipt.summary.context_block_count, context.blocks.len());
+        assert_eq!(artifacts.receipt_summary().unwrap(), receipt.summary);
+        artifacts.validate().unwrap();
 
         fs::remove_file(log_path).unwrap();
     }
@@ -3361,6 +3390,67 @@ mod tests {
         ));
 
         fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_artifacts_reject_empty_payloads() {
+        for artifacts in [
+            RetrievalContextPayloadExecutionArtifacts {
+                result_payload: Vec::new(),
+                receipt_payload: b"not-json".to_vec(),
+            },
+            RetrievalContextPayloadExecutionArtifacts {
+                result_payload: b"result".to_vec(),
+                receipt_payload: Vec::new(),
+            },
+        ] {
+            assert!(matches!(
+                artifacts.validate().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn retrieval_context_payload_artifacts_reject_malformed_receipts() {
+        let artifacts = RetrievalContextPayloadExecutionArtifacts {
+            result_payload: b"result".to_vec(),
+            receipt_payload: b"not-json".to_vec(),
+        };
+
+        assert!(matches!(
+            artifacts.receipt_summary().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            artifacts.validate().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn retrieval_context_payload_artifacts_reject_result_length_mismatch() {
+        let receipt_payload = RetrievalContextPayloadExecutionReceiptPayload::new(
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 256,
+                context_block_count: 1,
+                total_text_chars: 32,
+                truncated: false,
+                scope_required: false,
+            },
+        )
+        .encode()
+        .unwrap();
+        let artifacts = RetrievalContextPayloadExecutionArtifacts {
+            result_payload: b"short".to_vec(),
+            receipt_payload,
+        };
+
+        assert!(matches!(
+            artifacts.validate().unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
     }
 
     #[test]
