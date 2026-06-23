@@ -949,6 +949,28 @@ impl RetrievalContextPayloadExecutorConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalContextPayloadScope {
+    pub tenant: TenantId,
+    pub namespace: NamespaceName,
+}
+
+impl RetrievalContextPayloadScope {
+    pub fn validate_request(&self, request: &AssembleRetrievalContextRequest) -> Result<()> {
+        if request.tenant != self.tenant {
+            return Err(EhdbError::InvalidState(
+                "retrieval context request tenant does not match execution scope".to_string(),
+            ));
+        }
+        if request.namespace != self.namespace {
+            return Err(EhdbError::InvalidState(
+                "retrieval context request namespace does not match execution scope".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LocalRetrievalSearchService;
 
@@ -1108,6 +1130,34 @@ impl LocalRetrievalSearchService {
             )));
         }
         let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
+        self.execute_context_request_with_config(runtime, request, config)
+    }
+
+    pub fn execute_context_payload_with_scope(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request_payload: &[u8],
+        config: RetrievalContextPayloadExecutorConfig,
+        scope: &RetrievalContextPayloadScope,
+    ) -> Result<Vec<u8>> {
+        config.validate()?;
+        if request_payload.len() > config.max_request_payload_bytes {
+            return Err(EhdbError::InvalidState(format!(
+                "retrieval context request payload exceeds {} bytes",
+                config.max_request_payload_bytes
+            )));
+        }
+        let request = RetrievalContextRequestPayload::decode(request_payload)?.into_request();
+        scope.validate_request(&request)?;
+        self.execute_context_request_with_config(runtime, request, config)
+    }
+
+    fn execute_context_request_with_config(
+        &self,
+        runtime: &LocalReferenceRuntime,
+        request: AssembleRetrievalContextRequest,
+        config: RetrievalContextPayloadExecutorConfig,
+    ) -> Result<Vec<u8>> {
         let context = self.assemble_context(runtime, request)?;
         let result = RetrievalContextResultPayload::new(context).encode()?;
         if result.len() > config.max_result_payload_bytes {
@@ -2653,6 +2703,147 @@ mod tests {
         assert_eq!(context.blocks.len(), 2);
 
         fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_scope_accepts_matching_request() {
+        let log_path = temp_log_path("retrieval-context-payload-scope");
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        seed_retrieval_vectors(&mut runtime).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let scope = RetrievalContextPayloadScope {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+        };
+
+        let result_payload = LocalRetrievalSearchService
+            .execute_context_payload_with_scope(
+                &runtime,
+                &request_payload,
+                RetrievalContextPayloadExecutorConfig::default(),
+                &scope,
+            )
+            .unwrap();
+        let context = RetrievalContextResultPayload::decode(&result_payload)
+            .unwrap()
+            .into_context();
+        assert_eq!(context.blocks.len(), 2);
+
+        fs::remove_file(log_path).unwrap();
+    }
+
+    #[test]
+    fn retrieval_context_payload_scope_rejects_tenant_and_namespace_mismatches() {
+        let log_path = temp_log_path("retrieval-context-payload-scope-mismatch");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+
+        for scope in [
+            RetrievalContextPayloadScope {
+                tenant: TenantId::new("tenant-b").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+            },
+            RetrievalContextPayloadScope {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("other").unwrap(),
+            },
+        ] {
+            assert!(matches!(
+                LocalRetrievalSearchService
+                    .execute_context_payload_with_scope(
+                        &runtime,
+                        &request_payload,
+                        RetrievalContextPayloadExecutorConfig::default(),
+                        &scope,
+                    )
+                    .unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+
+        if log_path.exists() {
+            fs::remove_file(log_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn retrieval_context_payload_scope_propagates_payload_errors() {
+        let log_path = temp_log_path("retrieval-context-payload-scope-errors");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let scope = RetrievalContextPayloadScope {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+        };
+
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_scope(
+                    &runtime,
+                    b"not-json",
+                    RetrievalContextPayloadExecutorConfig::default(),
+                    &scope,
+                )
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let request_payload =
+            RetrievalContextRequestPayload::new(AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .encode()
+            .unwrap();
+        let config = RetrievalContextPayloadExecutorConfig {
+            max_request_payload_bytes: request_payload.len() - 1,
+            max_result_payload_bytes: DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES,
+        };
+        assert!(matches!(
+            LocalRetrievalSearchService
+                .execute_context_payload_with_scope(&runtime, &request_payload, config, &scope)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        if log_path.exists() {
+            fs::remove_file(log_path).unwrap();
+        }
     }
 
     #[test]
