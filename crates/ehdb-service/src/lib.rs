@@ -761,7 +761,23 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
             info.endpoint.len()
         )));
     }
-    let ticket = info.endpoint[0].ticket.as_ref().ok_or_else(|| {
+    let endpoint = &info.endpoint[0];
+    if !endpoint.location.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo endpoint locations are not supported locally".to_string(),
+        ));
+    }
+    if endpoint.expiration_time.is_some() {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo endpoint expiration is not supported locally".to_string(),
+        ));
+    }
+    if !endpoint.app_metadata.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo endpoint metadata is not supported locally".to_string(),
+        ));
+    }
+    let ticket = endpoint.ticket.as_ref().ok_or_else(|| {
         EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
     })?;
     let endpoint_ticket = ScanFlightTicket::from_arrow_ticket(ticket)?;
@@ -5809,6 +5825,52 @@ mod tests {
 
         assert!(matches!(
             ArrowScanResult::validate_flight_info(&info).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_endpoint_envelope_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-endpoint-envelope");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let info = result.to_flight_info(&ticket).unwrap();
+
+        let mut with_location = info.clone();
+        with_location.endpoint[0]
+            .location
+            .push(arrow_flight::Location {
+                uri: "grpc://127.0.0.1:50051".to_string(),
+            });
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&with_location).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut with_expiration = info.clone();
+        with_expiration.endpoint[0].expiration_time = Some(Default::default());
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&with_expiration).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut with_metadata = info;
+        with_metadata.endpoint[0].app_metadata = b"endpoint".to_vec().into();
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&with_metadata).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 
