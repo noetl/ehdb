@@ -613,6 +613,14 @@ impl ScanFlightTicket {
         validate_scan_flight_info_for_ticket(info, self)
     }
 
+    pub fn validate_flight_info_schema(
+        &self,
+        info: &FlightInfo,
+        expected_schema: &Schema,
+    ) -> Result<()> {
+        validate_scan_flight_info_for_schema(info, self, expected_schema)
+    }
+
     pub fn into_request(self) -> ScanLatestTableRequest {
         self.request
     }
@@ -867,6 +875,21 @@ fn validate_scan_flight_info_for_ticket(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_scan_flight_info_for_schema(
+    info: &FlightInfo,
+    expected_ticket: &ScanFlightTicket,
+    expected_schema: &Schema,
+) -> Result<()> {
+    validate_scan_flight_info_for_ticket(info, expected_ticket)?;
+    let schema = decode_scan_flight_info_schema(info)?;
+    if &schema != expected_schema {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo schema does not match expected schema".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -5856,6 +5879,46 @@ mod tests {
     }
 
     #[test]
+    fn scan_flight_ticket_rejects_unexpected_flight_info_schema() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-expected-schema");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let mut info = result.to_flight_info(&ticket).unwrap();
+
+        ticket
+            .validate_flight_info_schema(&info, result.schema.as_ref())
+            .unwrap();
+
+        info.schema = schema_ipc_bytes(&Schema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            true,
+        )]))
+        .unwrap()
+        .into();
+        ticket.validate_flight_info(&info).unwrap();
+        assert!(matches!(
+            ticket
+                .validate_flight_info_schema(&info, result.schema.as_ref())
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
     fn scan_result_flight_info_rejects_result_mismatches() {
         let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
             seeded_table("service-flight-info-result-consistency");
@@ -6812,7 +6875,7 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
-        ticket.validate_flight_info(&info).unwrap();
+        ticket.validate_flight_info_schema(&info, &schema).unwrap();
         let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
         let batches = client
             .do_get(endpoint_ticket)
