@@ -725,6 +725,11 @@ impl ArrowScanResult {
 }
 
 fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
+    if info.schema.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo requires schema IPC bytes".to_string(),
+        ));
+    }
     if info.app_metadata.as_ref() != SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
         return Err(EhdbError::InvalidState(
             "unsupported scan FlightInfo metadata version".to_string(),
@@ -5791,6 +5796,33 @@ mod tests {
         multiple_endpoints.endpoint.push(info.endpoint[0].clone());
         assert!(matches!(
             ArrowScanResult::validate_flight_info(&multiple_endpoints).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_empty_schema_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-schema-validation");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let mut info = result.to_flight_info(&ticket).unwrap();
+
+        info.schema = Vec::new().into();
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&info).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 
