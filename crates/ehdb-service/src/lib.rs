@@ -715,12 +715,28 @@ impl ArrowScanResult {
             ordered: true,
             app_metadata: SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes().to_vec().into(),
         };
-        Self::validate_flight_info(&info)?;
+        self.validate_flight_info_for_result(&info, ticket)?;
         Ok(info)
     }
 
     pub fn validate_flight_info(info: &FlightInfo) -> Result<()> {
         validate_scan_flight_info(info)
+    }
+
+    pub fn validate_flight_info_for_result(
+        &self,
+        info: &FlightInfo,
+        ticket: &ScanFlightTicket,
+    ) -> Result<()> {
+        let stream = self.to_flight_data()?;
+        let total_bytes = total_flight_data_bytes(&stream)?;
+        validate_scan_flight_info_for_result(
+            info,
+            ticket,
+            self.schema.as_ref(),
+            self.row_count,
+            total_bytes,
+        )
     }
 }
 
@@ -730,9 +746,7 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
             "scan FlightInfo requires schema IPC bytes".to_string(),
         ));
     }
-    let _: Schema = IpcMessage(info.schema.clone()).try_into().map_err(|err| {
-        EhdbError::InvalidState(format!("decode scan FlightInfo schema IPC bytes: {err}"))
-    })?;
+    let _ = decode_scan_flight_info_schema(info)?;
     if info.app_metadata.as_ref() != SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
         return Err(EhdbError::InvalidState(
             "unsupported scan FlightInfo metadata version".to_string(),
@@ -795,6 +809,56 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_scan_flight_info_for_result(
+    info: &FlightInfo,
+    expected_ticket: &ScanFlightTicket,
+    expected_schema: &Schema,
+    expected_row_count: usize,
+    expected_total_bytes: i64,
+) -> Result<()> {
+    validate_scan_flight_info(info)?;
+
+    let schema = decode_scan_flight_info_schema(info)?;
+    if &schema != expected_schema {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo schema does not match result schema".to_string(),
+        ));
+    }
+
+    let expected_records = i64::try_from(expected_row_count).map_err(|_| {
+        EhdbError::InvalidState(format!("scan row count too large: {expected_row_count}"))
+    })?;
+    if info.total_records != expected_records {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo total_records does not match result row count".to_string(),
+        ));
+    }
+
+    if info.total_bytes != expected_total_bytes {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo total_bytes does not match encoded result bytes".to_string(),
+        ));
+    }
+
+    let descriptor = info.flight_descriptor.as_ref().ok_or_else(|| {
+        EhdbError::InvalidState("scan FlightInfo requires a command descriptor".to_string())
+    })?;
+    let descriptor_ticket = ScanFlightTicket::decode(descriptor.cmd.as_ref())?;
+    if descriptor_ticket.request != expected_ticket.request {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo descriptor does not match expected ticket".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn decode_scan_flight_info_schema(info: &FlightInfo) -> Result<Schema> {
+    IpcMessage(info.schema.clone()).try_into().map_err(|err| {
+        EhdbError::InvalidState(format!("decode scan FlightInfo schema IPC bytes: {err}"))
+    })
 }
 
 fn validate_scan_result_stream_metadata(flight_data: &[FlightData]) -> Result<()> {
@@ -5740,6 +5804,77 @@ mod tests {
                 .request,
             ticket.request
         );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_result_mismatches() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-result-consistency");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let info = result.to_flight_info(&ticket).unwrap();
+
+        let mut wrong_schema = info.clone();
+        wrong_schema.schema = schema_ipc_bytes(&Schema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            true,
+        )]))
+        .unwrap()
+        .into();
+        assert!(matches!(
+            result
+                .validate_flight_info_for_result(&wrong_schema, &ticket)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut wrong_records = info.clone();
+        wrong_records.total_records += 1;
+        assert!(matches!(
+            result
+                .validate_flight_info_for_result(&wrong_records, &ticket)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut wrong_bytes = info.clone();
+        wrong_bytes.total_bytes += 1;
+        assert!(matches!(
+            result
+                .validate_flight_info_for_result(&wrong_bytes, &ticket)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut other_request = ticket.request.clone();
+        other_request.table_name = TableName::new("other_executions").unwrap();
+        let other_ticket = ScanFlightTicket::new(other_request);
+        let mut wrong_ticket = info;
+        wrong_ticket.flight_descriptor = Some(other_ticket.command_descriptor().unwrap());
+        wrong_ticket.endpoint[0].ticket = Some(other_ticket.to_arrow_ticket().unwrap());
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&wrong_ticket),
+            Ok(())
+        ));
+        assert!(matches!(
+            result
+                .validate_flight_info_for_result(&wrong_ticket, &ticket)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
