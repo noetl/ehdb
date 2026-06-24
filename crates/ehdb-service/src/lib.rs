@@ -753,7 +753,7 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
             "scan FlightInfo requires an EHDB command descriptor".to_string(),
         ));
     }
-    ScanFlightTicket::decode(descriptor.cmd.as_ref())?;
+    let descriptor_ticket = ScanFlightTicket::decode(descriptor.cmd.as_ref())?;
 
     if info.endpoint.len() != 1 {
         return Err(EhdbError::InvalidState(format!(
@@ -764,7 +764,12 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
     let ticket = info.endpoint[0].ticket.as_ref().ok_or_else(|| {
         EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
     })?;
-    ScanFlightTicket::from_arrow_ticket(ticket)?;
+    let endpoint_ticket = ScanFlightTicket::from_arrow_ticket(ticket)?;
+    if endpoint_ticket.request != descriptor_ticket.request {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo descriptor and endpoint ticket mismatch".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -5770,6 +5775,40 @@ mod tests {
         multiple_endpoints.endpoint.push(info.endpoint[0].clone());
         assert!(matches!(
             ArrowScanResult::validate_flight_info(&multiple_endpoints).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_descriptor_ticket_mismatches() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-ticket-mismatch");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let mut info = result.to_flight_info(&ticket).unwrap();
+
+        let mut other_request = filtered_request();
+        other_request.table_name = TableName::new("other_executions").unwrap();
+        info.endpoint[0].ticket = Some(
+            ScanFlightTicket::new(other_request)
+                .to_arrow_ticket()
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&info).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 

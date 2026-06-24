@@ -189,8 +189,9 @@ value from a `ScanFlightTicket`. The fixture includes schema IPC bytes,
 a command descriptor, one endpoint ticket, ordered result metadata, row
 count, and encoded byte count. A local validator rejects unsupported
 fixture metadata, unordered results, negative counts, missing endpoint
-tickets, and multiple endpoints. It is metadata only; no Flight server
-or gateway data-touch path is introduced.
+tickets, multiple endpoints, and descriptor/ticket request mismatches.
+It is metadata only; no Flight server or gateway data-touch path is
+introduced.
 
 `LocalArrowFlightService` ties those fixtures together in process. It
 can build `FlightInfo`, return `SchemaResult`, and execute `do_get` for
