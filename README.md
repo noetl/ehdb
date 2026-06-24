@@ -177,8 +177,11 @@ or gateway direct read path yet.
 
 `ArrowScanResult` can now encode its batches into Arrow Flight
 `FlightData` messages and decode those messages back into a validated
-result. This proves the local result-stream contract for the future
-`do_get` path while remaining pre-network and pre-distributed.
+result. Produced result streams carry an EHDB scan-result stream version
+marker, and decode rejects missing or unsupported markers before
+accepting Arrow batches. This proves the local result-stream contract
+for the future `do_get` path while remaining pre-network and
+pre-distributed.
 
 `ArrowScanResult` can also build a pre-network Arrow Flight `FlightInfo`
 value from a `ScanFlightTicket`. The fixture includes schema IPC bytes,
