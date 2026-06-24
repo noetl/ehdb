@@ -701,7 +701,7 @@ impl ArrowScanResult {
         })?;
         let total_bytes = total_flight_data_bytes(&stream)?;
 
-        Ok(FlightInfo {
+        let info = FlightInfo {
             schema,
             flight_descriptor: Some(ticket.command_descriptor()?),
             endpoint: vec![FlightEndpoint {
@@ -714,8 +714,58 @@ impl ArrowScanResult {
             total_bytes,
             ordered: true,
             app_metadata: SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes().to_vec().into(),
-        })
+        };
+        Self::validate_flight_info(&info)?;
+        Ok(info)
     }
+
+    pub fn validate_flight_info(info: &FlightInfo) -> Result<()> {
+        validate_scan_flight_info(info)
+    }
+}
+
+fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
+    if info.app_metadata.as_ref() != SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
+        return Err(EhdbError::InvalidState(
+            "unsupported scan FlightInfo metadata version".to_string(),
+        ));
+    }
+    if !info.ordered {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo must describe an ordered result".to_string(),
+        ));
+    }
+    if info.total_records < 0 {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo total_records cannot be negative".to_string(),
+        ));
+    }
+    if info.total_bytes < 0 {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo total_bytes cannot be negative".to_string(),
+        ));
+    }
+    let descriptor = info.flight_descriptor.as_ref().ok_or_else(|| {
+        EhdbError::InvalidState("scan FlightInfo requires a command descriptor".to_string())
+    })?;
+    if descriptor.r#type != DescriptorType::Cmd as i32 || !descriptor.path.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "scan FlightInfo requires an EHDB command descriptor".to_string(),
+        ));
+    }
+    ScanFlightTicket::decode(descriptor.cmd.as_ref())?;
+
+    if info.endpoint.len() != 1 {
+        return Err(EhdbError::InvalidState(format!(
+            "scan FlightInfo requires exactly one endpoint, got {}",
+            info.endpoint.len()
+        )));
+    }
+    let ticket = info.endpoint[0].ticket.as_ref().ok_or_else(|| {
+        EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
+    })?;
+    ScanFlightTicket::from_arrow_ticket(ticket)?;
+    Ok(())
 }
 
 fn validate_scan_result_stream_metadata(flight_data: &[FlightData]) -> Result<()> {
@@ -5638,6 +5688,7 @@ mod tests {
 
         let info = result.to_flight_info(&ticket).unwrap();
 
+        ArrowScanResult::validate_flight_info(&info).unwrap();
         assert!(!info.schema.is_empty());
         assert_eq!(info.total_records, 3);
         assert!(info.total_bytes > 0);
@@ -5658,6 +5709,69 @@ mod tests {
                 .request,
             ticket.request
         );
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_invalid_fixture_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-validation");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let info = result.to_flight_info(&ticket).unwrap();
+
+        let mut wrong_metadata = info.clone();
+        wrong_metadata.app_metadata = b"ehdb.arrow.scan.result.v0".to_vec().into();
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&wrong_metadata).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut unordered = info.clone();
+        unordered.ordered = false;
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&unordered).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut negative_records = info.clone();
+        negative_records.total_records = -1;
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&negative_records).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut negative_bytes = info.clone();
+        negative_bytes.total_bytes = -1;
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&negative_bytes).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut missing_ticket = info.clone();
+        missing_ticket.endpoint[0].ticket = None;
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&missing_ticket).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut multiple_endpoints = info.clone();
+        multiple_endpoints.endpoint.push(info.endpoint[0].clone());
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&multiple_endpoints).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
