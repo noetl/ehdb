@@ -191,9 +191,11 @@ count, and encoded byte count. A local validator rejects unsupported
 fixture metadata, missing or malformed schema IPC bytes, unordered
 results, negative record counts, non-positive byte counts, missing
 endpoint tickets, multiple endpoints, and descriptor/ticket request
-mismatches. The single endpoint must remain pre-network: no locations,
-expiration, or endpoint app metadata. It is metadata only; no Flight
-server or gateway data-touch path is introduced.
+mismatches. Produced fixtures are also checked against the result schema,
+row count, encoded byte count, and expected scan ticket. The single
+endpoint must remain pre-network: no locations, expiration, or endpoint
+app metadata. It is metadata only; no Flight server or gateway
+data-touch path is introduced.
 
 `LocalArrowFlightService` ties those fixtures together in process. It
 can build `FlightInfo`, return `SchemaResult`, and execute `do_get` for
