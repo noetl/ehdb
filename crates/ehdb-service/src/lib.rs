@@ -686,7 +686,7 @@ impl ArrowScanResult {
     }
 
     pub fn from_flight_data(flight_data: &[FlightData]) -> Result<Self> {
-        validate_scan_result_stream_version(flight_data)?;
+        validate_scan_result_stream_metadata(flight_data)?;
         let batches = flight_data_to_batches(flight_data).map_err(|err| {
             EhdbError::InvalidState(format!("decode scan result flight data: {err}"))
         })?;
@@ -718,17 +718,25 @@ impl ArrowScanResult {
     }
 }
 
-fn validate_scan_result_stream_version(flight_data: &[FlightData]) -> Result<()> {
+fn validate_scan_result_stream_metadata(flight_data: &[FlightData]) -> Result<()> {
     let first = flight_data.first().ok_or_else(|| {
         EhdbError::InvalidState("scan result flight data stream is empty".to_string())
     })?;
-    if first.app_metadata.as_ref() == SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
-        Ok(())
-    } else {
-        Err(EhdbError::InvalidState(
+    if first.app_metadata.as_ref() != SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
+        return Err(EhdbError::InvalidState(
             "unsupported scan result flight data stream version".to_string(),
-        ))
+        ));
     }
+    if flight_data
+        .iter()
+        .skip(1)
+        .any(|message| !message.app_metadata.is_empty())
+    {
+        return Err(EhdbError::InvalidState(
+            "unexpected scan result flight data message metadata".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn schema_ipc_bytes(schema: &Schema) -> Result<Vec<u8>> {
@@ -5479,6 +5487,10 @@ mod tests {
             flight_data[0].app_metadata.as_ref(),
             SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes()
         );
+        assert!(flight_data
+            .iter()
+            .skip(1)
+            .all(|message| message.app_metadata.is_empty()));
         assert_eq!(decoded.row_count, result.row_count);
         assert_eq!(decoded.schema.as_ref(), result.schema.as_ref());
         let execution_ids = decoded.batches[0]
@@ -5570,6 +5582,37 @@ mod tests {
         unsupported[0].app_metadata = b"ehdb.arrow.scan.result.v0".to_vec().into();
         assert!(matches!(
             ArrowScanResult::from_flight_data(&unsupported).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_data_rejects_extra_message_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-data-extra-metadata");
+        let result = LocalArrowScanService::default()
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanLatestTableRequest {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: None,
+                },
+            )
+            .unwrap();
+
+        let mut flight_data = result.to_flight_data().unwrap();
+        assert!(flight_data.len() > 1);
+        flight_data[1].app_metadata = b"unexpected".to_vec().into();
+
+        assert!(matches!(
+            ArrowScanResult::from_flight_data(&flight_data).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 
