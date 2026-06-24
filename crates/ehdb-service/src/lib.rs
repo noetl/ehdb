@@ -33,6 +33,7 @@ use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
 
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
+pub const SCAN_FLIGHT_RESULT_STREAM_VERSION: &str = "ehdb.arrow.scan.result.v1";
 pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FLIGHT_MAX_CONCURRENT_REQUESTS: usize = 64;
 pub const DEFAULT_FLIGHT_TENANT_SCOPE_HEADER: &str = "x-ehdb-tenant";
@@ -673,12 +674,19 @@ impl ArrowScanResult {
     }
 
     pub fn to_flight_data(&self) -> Result<Vec<FlightData>> {
-        batches_to_flight_data(self.schema.as_ref(), self.batches.clone()).map_err(|err| {
-            EhdbError::InvalidState(format!("encode scan result flight data: {err}"))
-        })
+        let mut stream = batches_to_flight_data(self.schema.as_ref(), self.batches.clone())
+            .map_err(|err| {
+                EhdbError::InvalidState(format!("encode scan result flight data: {err}"))
+            })?;
+        let first = stream.first_mut().ok_or_else(|| {
+            EhdbError::InvalidState("encoded scan result produced no flight data".to_string())
+        })?;
+        first.app_metadata = SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes().to_vec().into();
+        Ok(stream)
     }
 
     pub fn from_flight_data(flight_data: &[FlightData]) -> Result<Self> {
+        validate_scan_result_stream_version(flight_data)?;
         let batches = flight_data_to_batches(flight_data).map_err(|err| {
             EhdbError::InvalidState(format!("decode scan result flight data: {err}"))
         })?;
@@ -705,8 +713,21 @@ impl ArrowScanResult {
             total_records,
             total_bytes,
             ordered: true,
-            app_metadata: SCAN_FLIGHT_TICKET_VERSION.as_bytes().to_vec().into(),
+            app_metadata: SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes().to_vec().into(),
         })
+    }
+}
+
+fn validate_scan_result_stream_version(flight_data: &[FlightData]) -> Result<()> {
+    let first = flight_data.first().ok_or_else(|| {
+        EhdbError::InvalidState("scan result flight data stream is empty".to_string())
+    })?;
+    if first.app_metadata.as_ref() == SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes() {
+        Ok(())
+    } else {
+        Err(EhdbError::InvalidState(
+            "unsupported scan result flight data stream version".to_string(),
+        ))
     }
 }
 
@@ -5454,6 +5475,10 @@ mod tests {
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
         assert_eq!(flight_data.len(), 2);
+        assert_eq!(
+            flight_data[0].app_metadata.as_ref(),
+            SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes()
+        );
         assert_eq!(decoded.row_count, result.row_count);
         assert_eq!(decoded.schema.as_ref(), result.schema.as_ref());
         let execution_ids = decoded.batches[0]
@@ -5517,6 +5542,42 @@ mod tests {
     }
 
     #[test]
+    fn scan_result_flight_data_rejects_missing_or_unsupported_stream_metadata() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-data-metadata");
+        let result = LocalArrowScanService::default()
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanLatestTableRequest {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: None,
+                },
+            )
+            .unwrap();
+
+        let mut missing = result.to_flight_data().unwrap();
+        missing[0].app_metadata = Vec::new().into();
+        assert!(matches!(
+            ArrowScanResult::from_flight_data(&missing).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut unsupported = result.to_flight_data().unwrap();
+        unsupported[0].app_metadata = b"ehdb.arrow.scan.result.v0".to_vec().into();
+        assert!(matches!(
+            ArrowScanResult::from_flight_data(&unsupported).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
     fn scan_result_builds_flight_info() {
         let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
             seeded_table("service-flight-info");
@@ -5538,6 +5599,10 @@ mod tests {
         assert_eq!(info.total_records, 3);
         assert!(info.total_bytes > 0);
         assert!(info.ordered);
+        assert_eq!(
+            info.app_metadata.as_ref(),
+            SCAN_FLIGHT_RESULT_STREAM_VERSION.as_bytes()
+        );
         assert_eq!(info.endpoint.len(), 1);
         assert_eq!(
             info.flight_descriptor.unwrap().r#type,
