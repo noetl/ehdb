@@ -12,8 +12,8 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::Schema;
 use ehdb_core::{
-    ChunkId, ConsumerName, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, PrincipalId,
-    Result, StreamName, TableName, TenantId, TransactionId,
+    ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EhdbError, EmbeddingModelId,
+    NamespaceName, PrincipalId, Result, StreamName, TableName, TenantId, TransactionId,
 };
 use ehdb_reference::{
     ArrowEqualityPredicate, LocalArrowSnapshotScanner, LocalReferenceRuntime, ScanArrowSnapshot,
@@ -627,7 +627,20 @@ impl ScanFlightTicket {
 fn validate_scan_latest_table_request(request: &ScanLatestTableRequest) -> Result<()> {
     TenantId::new(request.tenant.as_str()).map(|_| ())?;
     NamespaceName::new(request.namespace.as_str()).map(|_| ())?;
-    TableName::new(request.table_name.as_str()).map(|_| ())
+    TableName::new(request.table_name.as_str()).map(|_| ())?;
+    if let Some(projection) = &request.projection {
+        for column in projection {
+            validate_scan_selector(column)?;
+        }
+    }
+    if let Some(predicate) = &request.predicate {
+        validate_scan_selector(&predicate.column)?;
+    }
+    Ok(())
+}
+
+fn validate_scan_selector(column: &str) -> Result<()> {
+    ColumnSchema::new(column, DataType::Utf8, true).map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5340,6 +5353,43 @@ mod tests {
                 EhdbError::InvalidIdentifier(_)
             ));
         }
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_invalid_selector_identifiers() {
+        for (pointer, value) in [
+            ("/request/projection/0", serde_json::json!("bad projection")),
+            (
+                "/request/predicate/column",
+                serde_json::json!("bad predicate"),
+            ),
+        ] {
+            let mut ticket =
+                serde_json::to_value(ScanFlightTicket::new(filtered_request())).unwrap();
+            *ticket.pointer_mut(pointer).unwrap() = value;
+            let encoded = serde_json::to_vec(&ticket).unwrap();
+
+            assert!(matches!(
+                ScanFlightTicket::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidIdentifier(_)
+            ));
+        }
+
+        let mut request = filtered_request();
+        request.projection = Some(vec!["execution id".to_string()]);
+        let ticket = ScanFlightTicket::new(request);
+        assert!(matches!(
+            ticket.encode().unwrap_err(),
+            EhdbError::InvalidIdentifier(_)
+        ));
+        assert!(matches!(
+            ticket.to_arrow_ticket().unwrap_err(),
+            EhdbError::InvalidIdentifier(_)
+        ));
+        assert!(matches!(
+            ticket.command_descriptor().unwrap_err(),
+            EhdbError::InvalidIdentifier(_)
+        ));
     }
 
     #[test]
