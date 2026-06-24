@@ -748,9 +748,9 @@ fn validate_scan_flight_info(info: &FlightInfo) -> Result<()> {
             "scan FlightInfo total_records cannot be negative".to_string(),
         ));
     }
-    if info.total_bytes < 0 {
+    if info.total_bytes <= 0 {
         return Err(EhdbError::InvalidState(
-            "scan FlightInfo total_bytes cannot be negative".to_string(),
+            "scan FlightInfo total_bytes must be positive".to_string(),
         ));
     }
     let descriptor = info.flight_descriptor.as_ref().ok_or_else(|| {
@@ -5801,6 +5801,33 @@ mod tests {
         multiple_endpoints.endpoint.push(info.endpoint[0].clone());
         assert!(matches!(
             ArrowScanResult::validate_flight_info(&multiple_endpoints).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_flight_info_rejects_zero_byte_count() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-info-zero-byte-count-validation");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let mut info = result.to_flight_info(&ticket).unwrap();
+
+        info.total_bytes = 0;
+        assert!(matches!(
+            ArrowScanResult::validate_flight_info(&info).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 
