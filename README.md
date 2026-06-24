@@ -266,7 +266,8 @@ scope.
 
 The loopback client smoke path starts that listener and connects with
 the Arrow Flight client over tonic/gRPC transport. It calls
-`get_flight_info`, follows the returned endpoint ticket with `do_get`,
+`get_flight_info`, validates the returned `FlightInfo` against the
+expected scan ticket, follows the returned endpoint ticket with `do_get`,
 and decodes the returned Arrow batches. A second smoke path proves the
 same flow with the header-token auth policy enabled, and a third proves
 tenant/namespace scope metadata over real tonic/gRPC transport. A fourth
