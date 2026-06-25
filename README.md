@@ -270,10 +270,11 @@ the Arrow Flight client over tonic/gRPC transport. It calls
 expected scan ticket plus the schema returned by `get_schema`, extracts a
 schema-aware validated endpoint ticket for `do_get`, and decodes the
 returned Arrow batches through a receiver helper that validates the
-decoded result against the expected ticket plus returned `FlightInfo`
-row count, schema, and encoded byte count. Local service and server
-tests perform the same pairing from raw `SchemaResult` values and return
-the endpoint ticket only from that validated pair. A second smoke path
+decoded result against the schema returned by `get_schema`, the expected
+ticket, and returned `FlightInfo` row count, schema, and encoded byte
+count. Local service and server tests perform the same pairing from raw
+`SchemaResult` values and return the endpoint ticket only from that
+validated pair. A second smoke path
 proves the same flow with the header-token auth policy enabled, and a
 third proves tenant/namespace scope metadata over real tonic/gRPC
 transport. A fourth proves catalog-backed scan grant enforcement with
