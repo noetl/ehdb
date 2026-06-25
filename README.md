@@ -351,8 +351,9 @@ boundaries, rejecting malformed payloads, unsupported versions, and
 invalid decoded identifiers before execution or handoff. Unknown object
 fields in the request envelope, assembly request, result envelope,
 context object, or context blocks are rejected on the same boundary.
-They are not an RPC protocol, Arrow Flight endpoint, gateway route,
-prompt engine, or production retrieval API.
+Decoded bytes must match the canonical EHDB encoding produced by each
+payload's `encode` method. They are not an RPC protocol, Arrow Flight
+endpoint, gateway route, prompt engine, or production retrieval API.
 `LocalRetrievalSearchService::execute_context_payload` completes the
 local handoff loop by decoding a request payload, assembling context
 from replayed state, and returning an encoded result payload. This is an
