@@ -1900,6 +1900,7 @@ impl RetrievalContextReceiptEventStreamRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextPayloadExecutionReceiptEventPayload {
     pub version: String,
     pub receipt_payload: Vec<u8>,
@@ -4731,6 +4732,35 @@ mod tests {
         assert!(matches!(
             RetrievalContextPayloadExecutionReceiptEventPayload::decode(&unsupported_event)
                 .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn retrieval_context_receipt_event_payload_rejects_unknown_fields() {
+        let receipt_payload = RetrievalContextPayloadExecutionReceiptPayload::new(
+            RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 256,
+                context_block_count: 1,
+                total_text_chars: 32,
+                truncated: false,
+                scope_required: false,
+            },
+        )
+        .encode()
+        .unwrap();
+        let event =
+            RetrievalContextPayloadExecutionReceiptEventPayload::new(receipt_payload).unwrap();
+        let mut payload = serde_json::to_value(event).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        let encoded = serde_json::to_vec(&payload).unwrap();
+
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptEventPayload::decode(&encoded).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
     }
