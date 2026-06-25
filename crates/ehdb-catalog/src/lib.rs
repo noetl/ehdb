@@ -5,6 +5,7 @@ use ehdb_core::{
     TenantId, TransactionId,
 };
 use ehdb_storage::ObjectRef;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TableKey {
@@ -32,7 +33,8 @@ struct ScanGrantKey {
     principal: PrincipalId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogTable {
     pub id: TableId,
     pub tenant: TenantId,
@@ -42,7 +44,8 @@ pub struct CatalogTable {
     pub created_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogSnapshot {
     pub id: SnapshotId,
     pub tenant: TenantId,
@@ -53,7 +56,8 @@ pub struct CatalogSnapshot {
     pub committed_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogScanGrant {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -62,7 +66,8 @@ pub struct CatalogScanGrant {
     pub granted_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTable {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -71,7 +76,8 @@ pub struct CreateTable {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitSnapshot {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -82,7 +88,8 @@ pub struct CommitSnapshot {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantScan {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -366,6 +373,27 @@ mod tests {
         }
     }
 
+    fn add_unknown(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        let target = if pointer.is_empty() {
+            &mut value
+        } else {
+            value.pointer_mut(pointer).unwrap()
+        };
+        target
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        value
+    }
+
+    fn assert_unknown_rejected<T>(value: serde_json::Value, pointer: &str)
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let value = add_unknown(value, pointer);
+        assert!(serde_json::from_value::<T>(value).is_err());
+    }
+
     #[test]
     fn creates_and_reads_table() {
         let mut catalog = InMemoryCatalog::default();
@@ -377,6 +405,42 @@ mod tests {
 
         assert_eq!(found.id, table.id);
         assert_eq!(catalog.table_count(), 1);
+    }
+
+    #[test]
+    fn catalog_metadata_json_rejects_unknown_fields() {
+        let mut catalog = InMemoryCatalog::default();
+        let table = catalog.create_table(create_table_request()).unwrap();
+        let snapshot = catalog
+            .commit_snapshot(commit_snapshot_request(table.id.clone(), "snapshot-0001"))
+            .unwrap();
+        let grant = catalog
+            .grant_scan(grant_scan_request(table.id.clone(), "worker-system"))
+            .unwrap();
+        let create = create_table_request();
+        let commit = commit_snapshot_request(table.id.clone(), "snapshot-0002");
+        let grant_request = grant_scan_request(table.id.clone(), "worker-other");
+
+        assert_unknown_rejected::<CatalogTable>(serde_json::to_value(&table).unwrap(), "");
+        assert_unknown_rejected::<CatalogTable>(serde_json::to_value(&table).unwrap(), "/schema");
+        assert_unknown_rejected::<CatalogTable>(
+            serde_json::to_value(&table).unwrap(),
+            "/schema/columns/0",
+        );
+        assert_unknown_rejected::<CatalogSnapshot>(serde_json::to_value(&snapshot).unwrap(), "");
+        assert_unknown_rejected::<CatalogSnapshot>(
+            serde_json::to_value(&snapshot).unwrap(),
+            "/files/0",
+        );
+        assert_unknown_rejected::<CatalogScanGrant>(serde_json::to_value(&grant).unwrap(), "");
+        assert_unknown_rejected::<CreateTable>(serde_json::to_value(&create).unwrap(), "");
+        assert_unknown_rejected::<CreateTable>(serde_json::to_value(&create).unwrap(), "/schema");
+        assert_unknown_rejected::<CommitSnapshot>(serde_json::to_value(&commit).unwrap(), "");
+        assert_unknown_rejected::<CommitSnapshot>(
+            serde_json::to_value(&commit).unwrap(),
+            "/files/0/placement",
+        );
+        assert_unknown_rejected::<GrantScan>(serde_json::to_value(&grant_request).unwrap(), "");
     }
 
     #[test]

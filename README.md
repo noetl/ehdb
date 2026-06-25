@@ -323,6 +323,11 @@ that replayed metadata through `FlightScanGrantPolicy` for local Arrow
 Flight scan authorization. Production IAM, policy evaluation,
 revocation, and non-loopback service exposure remain future surfaces.
 
+Catalog metadata JSON decoding rejects unknown fields on tables,
+snapshots, scan grants, create-table requests, snapshot commits, scan
+grant requests, table schemas, and column schemas before persisted
+metadata is accepted for replay or catalog operations.
+
 `ehdb-retrieval` now includes a local exact cosine-similarity fixture
 over registered chunk embeddings. `VectorSearch` scopes candidates by
 tenant, namespace, and embedding model, validates finite non-zero query

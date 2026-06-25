@@ -67,6 +67,7 @@ identifier_type!(ChunkId);
 identifier_type!(EmbeddingModelId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
@@ -86,6 +87,7 @@ impl ColumnSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableSchema {
     columns: Vec<ColumnSchema>,
 }
