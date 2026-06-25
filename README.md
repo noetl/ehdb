@@ -171,10 +171,11 @@ versioned payload, round-trips through Arrow Flight `Ticket`, and builds
 command `FlightDescriptor` values for the future Flight read API. The
 codec revalidates tenant, namespace, table, projection-column, and
 predicate-column identifiers before producing ticket bytes and after
-decoding them; empty projection lists and duplicate projection columns
-are rejected before scan execution. This is still a contract fixture:
-there is no Flight server, client, SQL planner, predicate pushdown,
-distributed executor, or gateway direct read path yet.
+decoding them; unknown ticket, request, or predicate object fields,
+empty projection lists, and duplicate projection columns are rejected
+before scan execution. This is still a contract fixture: there is no
+Flight server, client, SQL planner, predicate pushdown, distributed
+executor, or gateway direct read path yet.
 
 `ArrowScanResult` can now encode its batches into Arrow Flight
 `FlightData` messages and decode those messages back into a validated

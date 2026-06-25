@@ -554,6 +554,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanLatestTableRequest {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -563,6 +564,7 @@ pub struct ScanLatestTableRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanFlightTicket {
     pub version: String,
     pub request: ScanLatestTableRequest,
@@ -5763,6 +5765,29 @@ mod tests {
     fn flight_scan_ticket_rejects_malformed_payloads() {
         let error = ScanFlightTicket::decode(b"not-json").unwrap_err();
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_unknown_payload_fields() {
+        for pointer in ["", "/request", "/request/predicate"] {
+            let mut ticket =
+                serde_json::to_value(ScanFlightTicket::new(filtered_request())).unwrap();
+            let target = if pointer.is_empty() {
+                &mut ticket
+            } else {
+                ticket.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+            let encoded = serde_json::to_vec(&ticket).unwrap();
+
+            assert!(matches!(
+                ScanFlightTicket::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]

@@ -256,6 +256,7 @@ pub struct ScanArrowSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArrowEqualityPredicate {
     pub column: String,
     pub value: ArrowScalarValue,
