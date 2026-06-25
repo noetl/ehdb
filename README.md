@@ -267,16 +267,17 @@ scope.
 The loopback client smoke path starts that listener and connects with
 the Arrow Flight client over tonic/gRPC transport. It calls
 `get_flight_info`, validates the returned `FlightInfo` against the
-expected scan ticket and the schema returned by `get_schema`, extracts a
+expected scan ticket plus the schema returned by `get_schema`, extracts a
 schema-aware validated endpoint ticket for `do_get`, and decodes the
 returned Arrow batches through a receiver helper that validates the
 decoded result against the expected ticket plus returned `FlightInfo`
-row count, schema, and encoded byte count. A second smoke path proves
-the same flow with the header-token auth policy enabled, and a third
-proves tenant/namespace scope metadata over real tonic/gRPC transport.
-A fourth proves catalog-backed scan grant enforcement with principal
-metadata over the same loopback path. This remains a local-reference
-test path, not a gateway integration.
+row count, schema, and encoded byte count. Local service and server
+tests perform the same pairing from raw `SchemaResult` values. A second
+smoke path proves the same flow with the header-token auth policy
+enabled, and a third proves tenant/namespace scope metadata over real
+tonic/gRPC transport. A fourth proves catalog-backed scan grant
+enforcement with principal metadata over the same loopback path. This
+remains a local-reference test path, not a gateway integration.
 
 ## Catalog Snapshots And Scan Grants
 

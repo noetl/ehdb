@@ -621,6 +621,18 @@ impl ScanFlightTicket {
         validate_scan_flight_info_for_schema(info, self, expected_schema)
     }
 
+    pub fn schema_from_schema_result_for_flight_info(
+        &self,
+        schema_result: SchemaResult,
+        info: &FlightInfo,
+    ) -> Result<Schema> {
+        let schema = schema_result.try_into().map_err(|err| {
+            EhdbError::InvalidState(format!("decode scan SchemaResult IPC bytes: {err}"))
+        })?;
+        validate_scan_flight_info_for_schema(info, self, &schema)?;
+        Ok(schema)
+    }
+
     pub fn endpoint_ticket_from_flight_info(&self, info: &FlightInfo) -> Result<Ticket> {
         validate_scan_flight_info_for_ticket(info, self)?;
         endpoint_ticket_from_validated_scan_flight_info(info)
@@ -5995,6 +6007,13 @@ mod tests {
         ticket
             .validate_flight_info_schema(&info, result.schema.as_ref())
             .unwrap();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(
+                schema_result_from_schema(result.schema.as_ref()).unwrap(),
+                &info,
+            )
+            .unwrap();
+        assert_eq!(&schema, result.schema.as_ref());
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
             .unwrap();
@@ -6022,6 +6041,15 @@ mod tests {
         assert!(matches!(
             ticket
                 .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            ticket
+                .schema_from_schema_result_for_flight_info(
+                    schema_result_from_schema(result.schema.as_ref()).unwrap(),
+                    &info,
+                )
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
@@ -6443,9 +6471,11 @@ mod tests {
         let schema_result = service
             .get_schema(&runtime, &store, request.clone())
             .unwrap();
-        let schema: Schema = schema_result.try_into().unwrap();
         let info = service
             .get_flight_info(&runtime, &store, request.clone())
+            .unwrap();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(schema_result, &info)
             .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
@@ -6539,12 +6569,14 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let schema: Schema = schema_result.try_into().unwrap();
         let info = server
             .get_flight_info(Request::new(ticket.command_descriptor().unwrap()))
             .await
             .unwrap()
             .into_inner();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(schema_result, &info)
+            .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -6672,13 +6704,11 @@ mod tests {
         schema_request
             .metadata_mut()
             .insert("x-ehdb-auth", "local-secret".parse().unwrap());
-        let schema: Schema = server
+        let schema_result = server
             .get_schema(schema_request)
             .await
             .unwrap()
-            .into_inner()
-            .try_into()
-            .unwrap();
+            .into_inner();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request
             .metadata_mut()
@@ -6688,6 +6718,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(schema_result, &info)
+            .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -6775,13 +6808,11 @@ mod tests {
             DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER,
             "system".parse().unwrap(),
         );
-        let schema: Schema = server
+        let schema_result = server
             .get_schema(schema_request)
             .await
             .unwrap()
-            .into_inner()
-            .try_into()
-            .unwrap();
+            .into_inner();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request.metadata_mut().insert(
             DEFAULT_FLIGHT_TENANT_SCOPE_HEADER,
@@ -6796,6 +6827,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(schema_result, &info)
+            .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -6882,13 +6916,11 @@ mod tests {
             DEFAULT_FLIGHT_PRINCIPAL_HEADER,
             "worker-system".parse().unwrap(),
         );
-        let schema: Schema = server
+        let schema_result = server
             .get_schema(schema_request)
             .await
             .unwrap()
-            .into_inner()
-            .try_into()
-            .unwrap();
+            .into_inner();
         let mut info_request = Request::new(ticket.command_descriptor().unwrap());
         info_request.metadata_mut().insert(
             DEFAULT_FLIGHT_PRINCIPAL_HEADER,
@@ -6899,6 +6931,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
+        let schema = ticket
+            .schema_from_schema_result_for_flight_info(schema_result, &info)
+            .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -7075,6 +7110,7 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
+        ticket.validate_flight_info_schema(&info, &schema).unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -7173,6 +7209,7 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
+        ticket.validate_flight_info_schema(&info, &schema).unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -7282,6 +7319,7 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
+        ticket.validate_flight_info_schema(&info, &schema).unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
@@ -7386,6 +7424,7 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
+        ticket.validate_flight_info_schema(&info, &schema).unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
