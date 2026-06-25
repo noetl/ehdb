@@ -272,9 +272,10 @@ schema-aware validated endpoint ticket for `do_get`, and decodes the
 returned Arrow batches through a receiver helper that validates the
 decoded result against the schema returned by `get_schema`, the expected
 ticket, and returned `FlightInfo` row count, schema, and encoded byte
-count. Local service and server tests perform the same pairing from raw
-`SchemaResult` and raw `FlightData` values so stream decoding is also
-bound to the decoded schema, returned `FlightInfo`, and expected ticket.
+count. Local service and server tests perform the same pairing through a
+single response-envelope helper for raw `SchemaResult`, returned
+`FlightInfo`, raw `FlightData`, and expected ticket, so stream decoding
+is bound to the decoded schema before rows are accepted.
 A second smoke path
 proves the same flow with the header-token auth policy enabled, and a
 third proves tenant/namespace scope metadata over real tonic/gRPC
