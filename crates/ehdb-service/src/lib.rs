@@ -1305,6 +1305,12 @@ impl RetrievalContextRequestPayload {
         })?;
         payload.validate_version()?;
         validate_retrieval_context_request(&payload.request)?;
+        let canonical = payload.encode()?;
+        if canonical.as_slice() != bytes {
+            return Err(EhdbError::InvalidState(
+                "retrieval context request payload must use canonical EHDB encoding".to_string(),
+            ));
+        }
         Ok(payload)
     }
 
@@ -1353,6 +1359,12 @@ impl RetrievalContextResultPayload {
         })?;
         payload.validate_version()?;
         validate_retrieval_context(&payload.context)?;
+        let canonical = payload.encode()?;
+        if canonical.as_slice() != bytes {
+            return Err(EhdbError::InvalidState(
+                "retrieval context result payload must use canonical EHDB encoding".to_string(),
+            ));
+        }
         Ok(payload)
     }
 
@@ -3547,6 +3559,64 @@ mod tests {
         ] {
             assert!(matches!(error, EhdbError::InvalidState(_)));
         }
+    }
+
+    #[test]
+    fn retrieval_context_payloads_reject_noncanonical_json() {
+        let request = AssembleRetrievalContextRequest {
+            tenant: TenantId::new("tenant-a").unwrap(),
+            namespace: NamespaceName::new("knowledge").unwrap(),
+            model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+            query: vec![1.0, 0.0],
+            text_query: "local".to_string(),
+            hit_limit: 10,
+            max_block_chars: 64,
+            max_total_chars: 128,
+            vector_weight: 1.0,
+            text_weight: 1.0,
+        };
+        let request_payload = RetrievalContextRequestPayload::new(request);
+        let pretty_request = serde_json::to_vec_pretty(&request_payload).unwrap();
+
+        assert_ne!(pretty_request, request_payload.encode().unwrap());
+        assert!(matches!(
+            RetrievalContextRequestPayload::decode(&pretty_request).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert_eq!(
+            RetrievalContextRequestPayload::decode(&request_payload.encode().unwrap()).unwrap(),
+            request_payload
+        );
+
+        let result_payload = RetrievalContextResultPayload::new(RetrievalContext {
+            blocks: vec![RetrievalContextBlock {
+                chunk_id: ChunkId::new("chunk-0001").unwrap(),
+                document_id: DocumentId::new("doc-0001").unwrap(),
+                ordinal: 0,
+                checksum: "sha256:test".to_string(),
+                text: "NoETL retrieval context".to_string(),
+                original_text_chars: 23,
+                clipped: false,
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                dimensions: 2,
+                vector_score: 1.0,
+                text_match_count: 1,
+                combined_score: 2.0,
+            }],
+            total_text_chars: 23,
+            truncated: false,
+        });
+        let pretty_result = serde_json::to_vec_pretty(&result_payload).unwrap();
+
+        assert_ne!(pretty_result, result_payload.encode().unwrap());
+        assert!(matches!(
+            RetrievalContextResultPayload::decode(&pretty_result).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert_eq!(
+            RetrievalContextResultPayload::decode(&result_payload.encode().unwrap()).unwrap(),
+            result_payload
+        );
     }
 
     #[test]
