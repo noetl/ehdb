@@ -1237,6 +1237,7 @@ pub struct SearchHybridChunksHit {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssembleRetrievalContextRequest {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -1251,6 +1252,7 @@ pub struct AssembleRetrievalContextRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextBlock {
     pub chunk_id: ChunkId,
     pub document_id: DocumentId,
@@ -1267,6 +1269,7 @@ pub struct RetrievalContextBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContext {
     pub blocks: Vec<RetrievalContextBlock>,
     pub total_text_chars: usize,
@@ -1274,6 +1277,7 @@ pub struct RetrievalContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextRequestPayload {
     pub version: String,
     pub request: AssembleRetrievalContextRequest,
@@ -1321,6 +1325,7 @@ impl RetrievalContextRequestPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextResultPayload {
     pub version: String,
     pub context: RetrievalContext,
@@ -3586,6 +3591,82 @@ mod tests {
             RetrievalContextResultPayload::decode(&unsupported_result).unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_request_payload_rejects_unknown_fields() {
+        for pointer in ["", "/request"] {
+            let request = AssembleRetrievalContextRequest {
+                tenant: TenantId::new("tenant-a").unwrap(),
+                namespace: NamespaceName::new("knowledge").unwrap(),
+                model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                query: vec![1.0, 0.0],
+                text_query: "local".to_string(),
+                hit_limit: 10,
+                max_block_chars: 64,
+                max_total_chars: 128,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            };
+            let mut payload =
+                serde_json::to_value(RetrievalContextRequestPayload::new(request)).unwrap();
+            let target = if pointer.is_empty() {
+                &mut payload
+            } else {
+                payload.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+            let encoded = serde_json::to_vec(&payload).unwrap();
+
+            assert!(matches!(
+                RetrievalContextRequestPayload::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn retrieval_context_result_payload_rejects_unknown_fields() {
+        for pointer in ["", "/context", "/context/blocks/0"] {
+            let context = RetrievalContext {
+                blocks: vec![RetrievalContextBlock {
+                    chunk_id: ChunkId::new("chunk-0001").unwrap(),
+                    document_id: DocumentId::new("doc-0001").unwrap(),
+                    ordinal: 0,
+                    checksum: "sha256:test".to_string(),
+                    text: "NoETL retrieval context".to_string(),
+                    original_text_chars: 23,
+                    clipped: false,
+                    model_id: EmbeddingModelId::new("text-embedding-local").unwrap(),
+                    dimensions: 2,
+                    vector_score: 1.0,
+                    text_match_count: 1,
+                    combined_score: 2.0,
+                }],
+                total_text_chars: 23,
+                truncated: false,
+            };
+            let mut payload =
+                serde_json::to_value(RetrievalContextResultPayload::new(context)).unwrap();
+            let target = if pointer.is_empty() {
+                &mut payload
+            } else {
+                payload.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+            let encoded = serde_json::to_vec(&payload).unwrap();
+
+            assert!(matches!(
+                RetrievalContextResultPayload::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]
