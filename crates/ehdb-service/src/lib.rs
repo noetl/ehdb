@@ -1456,6 +1456,7 @@ impl RetrievalContextPayloadScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextPayloadExecutionSummary {
     pub request_payload_bytes: usize,
     pub result_payload_bytes: usize,
@@ -1973,6 +1974,7 @@ impl RetrievalContextPayloadExecutionReceiptEventPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetrievalContextPayloadExecutionReceiptPayload {
     pub version: String,
     pub summary: RetrievalContextPayloadExecutionSummary,
@@ -4228,6 +4230,38 @@ mod tests {
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payloads_reject_unknown_fields() {
+        for pointer in ["", "/summary"] {
+            let summary = RetrievalContextPayloadExecutionSummary {
+                request_payload_bytes: 128,
+                result_payload_bytes: 512,
+                context_block_count: 3,
+                total_text_chars: 256,
+                truncated: true,
+                scope_required: false,
+            };
+            let mut payload =
+                serde_json::to_value(RetrievalContextPayloadExecutionReceiptPayload::new(summary))
+                    .unwrap();
+            let target = if pointer.is_empty() {
+                &mut payload
+            } else {
+                payload.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+            let encoded = serde_json::to_vec(&payload).unwrap();
+
+            assert!(matches!(
+                RetrievalContextPayloadExecutionReceiptPayload::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]
