@@ -623,12 +623,16 @@ impl ScanFlightTicket {
 
     pub fn endpoint_ticket_from_flight_info(&self, info: &FlightInfo) -> Result<Ticket> {
         validate_scan_flight_info_for_ticket(info, self)?;
-        info.endpoint
-            .first()
-            .and_then(|endpoint| endpoint.ticket.clone())
-            .ok_or_else(|| {
-                EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
-            })
+        endpoint_ticket_from_validated_scan_flight_info(info)
+    }
+
+    pub fn endpoint_ticket_from_flight_info_for_schema(
+        &self,
+        info: &FlightInfo,
+        expected_schema: &Schema,
+    ) -> Result<Ticket> {
+        validate_scan_flight_info_for_schema(info, self, expected_schema)?;
+        endpoint_ticket_from_validated_scan_flight_info(info)
     }
 
     pub fn into_request(self) -> ScanLatestTableRequest {
@@ -645,6 +649,15 @@ impl ScanFlightTicket {
             )))
         }
     }
+}
+
+fn endpoint_ticket_from_validated_scan_flight_info(info: &FlightInfo) -> Result<Ticket> {
+    info.endpoint
+        .first()
+        .and_then(|endpoint| endpoint.ticket.clone())
+        .ok_or_else(|| {
+            EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
+        })
 }
 
 fn validate_scan_latest_table_request(request: &ScanLatestTableRequest) -> Result<()> {
@@ -5960,6 +5973,15 @@ mod tests {
         ticket
             .validate_flight_info_schema(&info, result.schema.as_ref())
             .unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
+            .unwrap();
+        assert_eq!(
+            ScanFlightTicket::from_arrow_ticket(&endpoint_ticket)
+                .unwrap()
+                .request,
+            ticket.request
+        );
 
         info.schema = schema_ipc_bytes(&Schema::new(vec![Field::new(
             "other",
@@ -5972,6 +5994,12 @@ mod tests {
         assert!(matches!(
             ticket
                 .validate_flight_info_schema(&info, result.schema.as_ref())
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            ticket
+                .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
@@ -6373,6 +6401,7 @@ mod tests {
             }),
         };
         let service = LocalArrowFlightService::default();
+        let ticket = ScanFlightTicket::new(request.clone());
 
         let schema_result = service
             .get_schema(&runtime, &store, request.clone())
@@ -6381,8 +6410,10 @@ mod tests {
         let info = service
             .get_flight_info(&runtime, &store, request.clone())
             .unwrap();
-        let endpoint_ticket = info.endpoint[0].ticket.as_ref().unwrap();
-        let flight_data = service.do_get(&runtime, &store, endpoint_ticket).unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
+        let flight_data = service.do_get(&runtime, &store, &endpoint_ticket).unwrap();
         let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
 
         assert_eq!(schema.fields().len(), 1);
@@ -6475,7 +6506,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
         let flight_data = server
             .do_get(Request::new(endpoint_ticket))
             .await
@@ -6614,7 +6647,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
             Ok(_) => panic!("missing Flight auth token must fail"),
@@ -6718,7 +6753,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
             Ok(_) => panic!("missing Flight scan scope metadata must fail"),
@@ -6817,7 +6854,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
             Ok(_) => panic!("missing Flight principal metadata must fail"),
@@ -6989,8 +7028,9 @@ mod tests {
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
-        ticket.validate_flight_info_schema(&info, &schema).unwrap();
-        let endpoint_ticket = ticket.endpoint_ticket_from_flight_info(&info).unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
@@ -7079,11 +7119,17 @@ mod tests {
 
         let mut client = FlightClient::new(channel);
         client.add_header("x-ehdb-auth", "local-secret").unwrap();
+        let schema = client
+            .get_schema(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
         let info = client
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
@@ -7178,11 +7224,17 @@ mod tests {
         client
             .add_header(DEFAULT_FLIGHT_NAMESPACE_SCOPE_HEADER, "system")
             .unwrap();
+        let schema = client
+            .get_schema(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
         let info = client
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
@@ -7272,11 +7324,17 @@ mod tests {
         client
             .add_header(DEFAULT_FLIGHT_PRINCIPAL_HEADER, "worker-system")
             .unwrap();
+        let schema = client
+            .get_schema(ticket.command_descriptor().unwrap())
+            .await
+            .unwrap();
         let info = client
             .get_flight_info(ticket.command_descriptor().unwrap())
             .await
             .unwrap();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket
+            .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
