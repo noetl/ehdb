@@ -58,7 +58,8 @@ line, calls `sync_data` after each append, and rebuilds replay state on
 open using the same duplicate transaction ID and sequence checks as the
 in-memory log. Replay also revalidates the transaction envelope and
 mutation identifiers before accepting persisted records back into
-ordered state.
+ordered state. Unknown transaction record and mutation fields are
+rejected during replay instead of being silently ignored.
 
 `ehdb-stream` includes `LocalJsonlStreamLog`, a reference append-only
 stream journal for the local developer loop and restart tests. It

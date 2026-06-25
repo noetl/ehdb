@@ -37,6 +37,7 @@ impl TransactionSequence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Mutation {
     Catalog(CatalogMutation),
     Stream(StreamMutation),
@@ -46,6 +47,7 @@ pub enum Mutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CatalogMutation {
     CreateTable {
         table_id: TableId,
@@ -65,6 +67,7 @@ pub enum CatalogMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum StreamMutation {
     CreateStream {
         stream: StreamName,
@@ -88,6 +91,7 @@ pub enum StreamMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RetrievalMutation {
     RegisterDocument {
         document_id: DocumentId,
@@ -110,6 +114,7 @@ pub enum RetrievalMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SystemMutation {
     PublishLibrary {
         path: SystemLibraryPath,
@@ -131,11 +136,13 @@ pub enum SystemMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum StorageMutation {
     RegisterReplica { replica: ObjectReplica },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionRecord {
     pub sequence: TransactionSequence,
     pub transaction_id: TransactionId,
@@ -145,6 +152,7 @@ pub struct TransactionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitTransaction {
     pub transaction_id: TransactionId,
     pub tenant: TenantId,
@@ -945,6 +953,57 @@ mod tests {
         assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_unknown_transaction_fields_on_open() {
+        for (case, mut record, pointer) in [
+            ("record", stream_record_json(), ""),
+            (
+                "catalog",
+                catalog_record_json(),
+                "/mutations/0/Catalog/CreateTable",
+            ),
+            (
+                "stream",
+                stream_record_json(),
+                "/mutations/0/Stream/Publish",
+            ),
+            (
+                "retrieval",
+                retrieval_record_json(),
+                "/mutations/0/Retrieval/RegisterChunk",
+            ),
+            (
+                "system",
+                system_record_json(),
+                "/mutations/0/System/PublishLibrary",
+            ),
+            (
+                "storage",
+                storage_record_json(),
+                "/mutations/0/Storage/RegisterReplica",
+            ),
+        ] {
+            let path = temp_log_path(&format!("unknown-transaction-field-{case}"));
+            let target = if pointer.is_empty() {
+                &mut record
+            } else {
+                record.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+            write_raw_records(&path, &[record]);
+
+            assert!(matches!(
+                LocalJsonlTransactionLog::open(&path).unwrap_err(),
+                EhdbError::Storage(_)
+            ));
+
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
