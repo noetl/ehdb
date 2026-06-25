@@ -397,7 +397,8 @@ validated receipt bytes in a versioned JSON event envelope with the
 stable subject `ehdb.retrieval.context.execution.receipt`. This is a
 local stream-ready payload shape for future EHDB audit/event plumbing;
 it does not publish to a stream, log, expose a service, or carry result
-payload/context bytes.
+payload/context bytes. Event payload decoding rejects unknown envelope
+fields before replay decode, publisher helper use, or consumer handoff.
 `RetrievalContextReceiptEventStreamTarget` can build and explicitly
 create the receipt event stream with caller-selected retention before
 publication. Stream setup is caller-driven; publish helpers do not
