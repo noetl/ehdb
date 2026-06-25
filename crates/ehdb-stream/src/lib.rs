@@ -144,6 +144,7 @@ pub enum RetentionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamConfig {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -152,6 +153,7 @@ pub struct StreamConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamRecord {
     pub sequence: StreamSequence,
     pub subject: Subject,
@@ -160,6 +162,7 @@ pub struct StreamRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableConsumer {
     pub name: ConsumerName,
     pub acked_sequence: Option<StreamSequence>,
@@ -514,6 +517,7 @@ impl InMemoryStreamLog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum StreamJournalEntry {
     CreateStream {
         config: StreamConfig,
@@ -1460,6 +1464,94 @@ mod tests {
         assert!(matches!(error, EhdbError::Storage(_)));
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_unknown_journal_fields_on_replay() {
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+
+        let mut create_stream =
+            create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str());
+        create_stream["CreateStream"]["unexpected"] = serde_json::json!("field");
+
+        let mut create_stream_config =
+            create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str());
+        create_stream_config["CreateStream"]["config"]["unexpected"] = serde_json::json!("field");
+
+        let mut create_consumer = create_consumer_json(
+            tenant.as_str(),
+            namespace.as_str(),
+            stream.as_str(),
+            consumer.as_str(),
+        );
+        create_consumer["CreateConsumer"]["unexpected"] = serde_json::json!("field");
+
+        let mut publish = publish_json(
+            tenant.as_str(),
+            namespace.as_str(),
+            stream.as_str(),
+            "noetl.event",
+            "txn-0001",
+        );
+        publish["Publish"]["record"]["unexpected"] = serde_json::json!("field");
+
+        let mut ack = ack_json(
+            tenant.as_str(),
+            namespace.as_str(),
+            stream.as_str(),
+            consumer.as_str(),
+            1,
+        );
+        ack["Ack"]["unexpected"] = serde_json::json!("field");
+
+        for (case, entries) in [
+            ("create-stream", vec![create_stream]),
+            ("create-stream-config", vec![create_stream_config]),
+            (
+                "create-consumer",
+                vec![
+                    create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                    create_consumer,
+                ],
+            ),
+            (
+                "publish-record",
+                vec![
+                    create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                    publish,
+                ],
+            ),
+            (
+                "ack",
+                vec![
+                    create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                    create_consumer_json(
+                        tenant.as_str(),
+                        namespace.as_str(),
+                        stream.as_str(),
+                        consumer.as_str(),
+                    ),
+                    publish_json(
+                        tenant.as_str(),
+                        namespace.as_str(),
+                        stream.as_str(),
+                        "noetl.event",
+                        "txn-0001",
+                    ),
+                    ack,
+                ],
+            ),
+        ] {
+            let path = temp_log_path(&format!("unknown-journal-field-{case}"));
+            write_raw_journal(&path, &entries);
+
+            assert!(matches!(
+                LocalJsonlStreamLog::open(&path).unwrap_err(),
+                EhdbError::Storage(_)
+            ));
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
