@@ -657,6 +657,25 @@ impl ScanFlightTicket {
         endpoint_ticket_from_validated_scan_flight_info(info)
     }
 
+    pub fn validate_endpoint_ticket_for_flight_info(
+        &self,
+        endpoint_ticket: &Ticket,
+        info: &FlightInfo,
+    ) -> Result<()> {
+        validate_scan_flight_info_for_ticket(info, self)?;
+        validate_endpoint_ticket_for_validated_scan_flight_info(endpoint_ticket, info, self)
+    }
+
+    pub fn validate_endpoint_ticket_for_flight_info_for_schema(
+        &self,
+        endpoint_ticket: &Ticket,
+        info: &FlightInfo,
+        expected_schema: &Schema,
+    ) -> Result<()> {
+        validate_scan_flight_info_for_schema(info, self, expected_schema)?;
+        validate_endpoint_ticket_for_validated_scan_flight_info(endpoint_ticket, info, self)
+    }
+
     pub fn into_request(self) -> ScanLatestTableRequest {
         self.request
     }
@@ -680,6 +699,28 @@ fn endpoint_ticket_from_validated_scan_flight_info(info: &FlightInfo) -> Result<
         .ok_or_else(|| {
             EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
         })
+}
+
+fn validate_endpoint_ticket_for_validated_scan_flight_info(
+    endpoint_ticket: &Ticket,
+    info: &FlightInfo,
+    expected_ticket: &ScanFlightTicket,
+) -> Result<()> {
+    let decoded_endpoint_ticket = ScanFlightTicket::from_arrow_ticket(endpoint_ticket)?;
+    if decoded_endpoint_ticket.request != expected_ticket.request {
+        return Err(EhdbError::InvalidState(
+            "scan endpoint ticket does not match expected ticket".to_string(),
+        ));
+    }
+
+    let returned_endpoint_ticket = endpoint_ticket_from_validated_scan_flight_info(info)?;
+    if endpoint_ticket.ticket != returned_endpoint_ticket.ticket {
+        return Err(EhdbError::InvalidState(
+            "scan endpoint ticket does not match FlightInfo endpoint ticket".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_scan_latest_table_request(request: &ScanLatestTableRequest) -> Result<()> {
@@ -6004,6 +6045,9 @@ mod tests {
 
         ticket.validate_flight_info(&info).unwrap();
         let endpoint_ticket = ticket.endpoint_ticket_from_flight_info(&info).unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info(&endpoint_ticket, &info)
+            .unwrap();
         assert_eq!(
             ScanFlightTicket::from_arrow_ticket(&endpoint_ticket)
                 .unwrap()
@@ -6021,6 +6065,15 @@ mod tests {
         assert!(matches!(
             other_ticket
                 .endpoint_ticket_from_flight_info(&info)
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            ticket
+                .validate_endpoint_ticket_for_flight_info(
+                    &other_ticket.to_arrow_ticket().unwrap(),
+                    &info,
+                )
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
@@ -6059,6 +6112,13 @@ mod tests {
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(
+                &endpoint_ticket,
+                &info,
+                result.schema.as_ref(),
+            )
+            .unwrap();
         assert_eq!(
             ScanFlightTicket::from_arrow_ticket(&endpoint_ticket)
                 .unwrap()
@@ -6096,6 +6156,16 @@ mod tests {
         assert!(matches!(
             ticket
                 .endpoint_ticket_from_flight_info_for_schema(&info, result.schema.as_ref())
+                .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            ticket
+                .validate_endpoint_ticket_for_flight_info_for_schema(
+                    &endpoint_ticket,
+                    &info,
+                    result.schema.as_ref(),
+                )
                 .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
@@ -6605,6 +6675,9 @@ mod tests {
                 &info,
             )
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
+            .unwrap();
         let flight_data = service.do_get(&runtime, &store, &endpoint_ticket).unwrap();
         let (response_schema, decoded) =
             ArrowScanResult::from_flight_data_for_schema_result_info_and_ticket(
@@ -6710,6 +6783,9 @@ mod tests {
                 schema_result.clone(),
                 &info,
             )
+            .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
             .unwrap();
         let flight_data = server
             .do_get(Request::new(endpoint_ticket))
@@ -6861,6 +6937,9 @@ mod tests {
                 &info,
             )
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
+            .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
             Ok(_) => panic!("missing Flight auth token must fail"),
@@ -6976,6 +7055,9 @@ mod tests {
                 &info,
             )
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
+            .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
             Ok(_) => panic!("missing Flight scan scope metadata must fail"),
@@ -7085,6 +7167,9 @@ mod tests {
                 schema_result.clone(),
                 &info,
             )
+            .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
             .unwrap();
 
         match server.do_get(Request::new(endpoint_ticket.clone())).await {
@@ -7268,6 +7353,9 @@ mod tests {
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
@@ -7369,6 +7457,9 @@ mod tests {
             .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
             .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
@@ -7483,6 +7574,9 @@ mod tests {
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
+            .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
@@ -7590,6 +7684,9 @@ mod tests {
             .unwrap();
         let endpoint_ticket = ticket
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
+            .unwrap();
+        ticket
+            .validate_endpoint_ticket_for_flight_info_for_schema(&endpoint_ticket, &info, &schema)
             .unwrap();
         let batches = client
             .do_get(endpoint_ticket)
