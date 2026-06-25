@@ -381,8 +381,8 @@ fields and does not publish events, emit logs, expose a network API, or
 carry retrieval-sensitive content. Receipt encode/decode validates
 positive request/result byte counts and rejects text chars without a
 context block, while rejecting unknown receipt envelope and summary
-fields before artifact validation, receipt decode, or stream-event
-wrapping.
+fields and non-canonical JSON bytes before artifact validation,
+receipt decode, or stream-event wrapping.
 `RetrievalContextPayloadExecution::encode_receipt_payload` gives local
 worker/playbook tests a direct way to produce those receipt bytes from
 an execution result without reassembling the codec wrapper.

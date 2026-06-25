@@ -2002,6 +2002,13 @@ impl RetrievalContextPayloadExecutionReceiptPayload {
         })?;
         payload.validate_version()?;
         payload.summary.validate()?;
+        let canonical = payload.encode()?;
+        if canonical.as_slice() != bytes {
+            return Err(EhdbError::InvalidState(
+                "retrieval context execution receipt payload must use canonical EHDB encoding"
+                    .to_string(),
+            ));
+        }
         Ok(payload)
     }
 
@@ -4262,6 +4269,31 @@ mod tests {
                 EhdbError::InvalidState(_)
             ));
         }
+    }
+
+    #[test]
+    fn retrieval_context_execution_receipt_payloads_reject_noncanonical_json() {
+        let summary = RetrievalContextPayloadExecutionSummary {
+            request_payload_bytes: 128,
+            result_payload_bytes: 512,
+            context_block_count: 3,
+            total_text_chars: 256,
+            truncated: true,
+            scope_required: false,
+        };
+        let payload = RetrievalContextPayloadExecutionReceiptPayload::new(summary);
+        let pretty_payload = serde_json::to_vec_pretty(&payload).unwrap();
+
+        assert_ne!(pretty_payload, payload.encode().unwrap());
+        assert!(matches!(
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&pretty_payload).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert_eq!(
+            RetrievalContextPayloadExecutionReceiptPayload::decode(&payload.encode().unwrap())
+                .unwrap(),
+            payload
+        );
     }
 
     #[test]
