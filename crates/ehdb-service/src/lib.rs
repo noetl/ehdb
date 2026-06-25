@@ -736,6 +736,28 @@ impl ArrowScanResult {
         Self::from_flight_data(flight_data)
     }
 
+    pub fn from_flight_data_for_info_and_ticket(
+        flight_data: &[FlightData],
+        info: &FlightInfo,
+        ticket: &ScanFlightTicket,
+    ) -> Result<Self> {
+        validate_scan_flight_info_for_ticket(info, ticket)?;
+        validate_scan_flight_data_for_info(flight_data, info)?;
+        let result = Self::from_flight_data(flight_data)?;
+        result.validate_flight_info_for_result(info, ticket)?;
+        Ok(result)
+    }
+
+    pub fn from_batches_for_info_and_ticket(
+        batches: Vec<RecordBatch>,
+        info: &FlightInfo,
+        ticket: &ScanFlightTicket,
+    ) -> Result<Self> {
+        let result = Self::from_batches(batches)?;
+        result.validate_flight_info_for_result(info, ticket)?;
+        Ok(result)
+    }
+
     pub fn to_flight_info(&self, ticket: &ScanFlightTicket) -> Result<FlightInfo> {
         let stream = self.to_flight_data()?;
         let schema = schema_ipc_bytes(self.schema.as_ref())?.into();
@@ -6026,8 +6048,23 @@ mod tests {
         let flight_data = result.to_flight_data().unwrap();
         let info = result.to_flight_info(&ticket).unwrap();
 
-        let decoded = ArrowScanResult::from_flight_data_for_info(&flight_data, &info).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
         assert_eq!(decoded.row_count, result.row_count);
+
+        let mut other_request = ticket.request.clone();
+        other_request.table_name = TableName::new("other_executions").unwrap();
+        let other_ticket = ScanFlightTicket::new(other_request);
+        assert!(matches!(
+            ArrowScanResult::from_flight_data_for_info_and_ticket(
+                &flight_data,
+                &info,
+                &other_ticket
+            )
+            .unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
 
         let mut wrong_records = info.clone();
         wrong_records.total_records += 1;
@@ -6414,7 +6451,9 @@ mod tests {
             .endpoint_ticket_from_flight_info_for_schema(&info, &schema)
             .unwrap();
         let flight_data = service.do_get(&runtime, &store, &endpoint_ticket).unwrap();
-        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "execution_id");
@@ -6517,7 +6556,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "execution_id");
@@ -6668,7 +6709,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
@@ -6779,7 +6822,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
@@ -6876,7 +6921,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let decoded = ArrowScanResult::from_flight_data(&flight_data).unwrap();
+        let decoded =
+            ArrowScanResult::from_flight_data_for_info_and_ticket(&flight_data, &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.field(0).name(), "execution_id");
         assert_eq!(info.total_records, 1);
@@ -7038,10 +7085,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let decoded = ArrowScanResult::from_batches(batches.clone()).unwrap();
-        decoded
-            .validate_flight_info_for_result(&info, &ticket)
-            .unwrap();
+        let decoded =
+            ArrowScanResult::from_batches_for_info_and_ticket(batches.clone(), &info, &ticket)
+                .unwrap();
 
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "execution_id");
@@ -7137,10 +7183,14 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        let decoded =
+            ArrowScanResult::from_batches_for_info_and_ticket(batches.clone(), &info, &ticket)
+                .unwrap();
 
         assert_eq!(info.total_records, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(decoded.row_count, 1);
 
         drop(client);
         shutdown_tx.send(()).unwrap();
@@ -7242,10 +7292,14 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        let decoded =
+            ArrowScanResult::from_batches_for_info_and_ticket(batches.clone(), &info, &ticket)
+                .unwrap();
 
         assert_eq!(info.total_records, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(decoded.row_count, 1);
 
         drop(client);
         shutdown_tx.send(()).unwrap();
@@ -7342,10 +7396,14 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        let decoded =
+            ArrowScanResult::from_batches_for_info_and_ticket(batches.clone(), &info, &ticket)
+                .unwrap();
 
         assert_eq!(info.total_records, 1);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(decoded.row_count, 1);
 
         drop(client);
         shutdown_tx.send(()).unwrap();
