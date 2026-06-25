@@ -174,6 +174,7 @@ pub enum SystemCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WasmSystemLibrary {
     pub path: SystemLibraryPath,
     pub revision: SystemLibraryRevision,
@@ -198,6 +199,7 @@ impl WasmSystemLibrary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoetlWasmPluginRef {
     pub path: SystemLibraryPath,
     pub version: SystemLibraryRevision,
@@ -258,6 +260,7 @@ struct BindingKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemLibraryBinding {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -772,6 +775,40 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, EhdbError::NotFound(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_system_library_metadata_fields_on_decode() {
+        let (tenant, namespace) = tenant_namespace();
+        let mut catalog = InMemorySystemLibraryCatalog::default();
+        let library = catalog
+            .publish(publish_request("system/catalog/bootstrap", 1, '1'))
+            .unwrap();
+        let binding = catalog
+            .bind(bind_request(&library, tenant, namespace, "txn-bind-1"))
+            .unwrap();
+        let plugin_ref = library.plugin_ref();
+
+        let mut library_json = serde_json::to_value(&library).unwrap();
+        library_json
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        assert!(serde_json::from_value::<WasmSystemLibrary>(library_json).is_err());
+
+        let mut plugin_ref_json = serde_json::to_value(&plugin_ref).unwrap();
+        plugin_ref_json
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        assert!(serde_json::from_value::<NoetlWasmPluginRef>(plugin_ref_json).is_err());
+
+        let mut binding_json = serde_json::to_value(&binding).unwrap();
+        binding_json
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        assert!(serde_json::from_value::<SystemLibraryBinding>(binding_json).is_err());
     }
 
     #[test]

@@ -92,6 +92,9 @@ survives restart. Replay revalidates persisted manifest and binding
 identifiers before rebuilding system-library state. Unknown journal,
 publish, and bind fields are rejected during replay instead of being
 silently ignored.
+Decoded system-library metadata also rejects unknown manifest, plugin
+reference, and binding fields before resolved WASM handoff metadata is
+accepted.
 
 ## Immutable Objects
 
@@ -484,6 +487,9 @@ the Rust crate version or forcing every caller to chase semver bumps.
 The local JSONL journal preserves those rebinding decisions across
 restart for the developer loop, and replay rejects unknown journal,
 publish, or bind fields before rebuilding hot-replacement state.
+Resolved manifest, plugin reference, and binding JSON decoding also
+rejects unknown fields before system-library metadata is accepted for a
+NoETL WASM handoff.
 
 ## Developer Loop
 
