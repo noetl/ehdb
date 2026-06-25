@@ -705,6 +705,14 @@ impl ArrowScanResult {
         Self::from_batches(batches)
     }
 
+    pub fn from_flight_data_for_info(
+        flight_data: &[FlightData],
+        info: &FlightInfo,
+    ) -> Result<Self> {
+        validate_scan_flight_data_for_info(flight_data, info)?;
+        Self::from_flight_data(flight_data)
+    }
+
     pub fn to_flight_info(&self, ticket: &ScanFlightTicket) -> Result<FlightInfo> {
         let stream = self.to_flight_data()?;
         let schema = schema_ipc_bytes(self.schema.as_ref())?.into();
@@ -897,6 +905,36 @@ fn decode_scan_flight_info_schema(info: &FlightInfo) -> Result<Schema> {
     IpcMessage(info.schema.clone()).try_into().map_err(|err| {
         EhdbError::InvalidState(format!("decode scan FlightInfo schema IPC bytes: {err}"))
     })
+}
+
+fn validate_scan_flight_data_for_info(flight_data: &[FlightData], info: &FlightInfo) -> Result<()> {
+    validate_scan_flight_info(info)?;
+    let result = ArrowScanResult::from_flight_data(flight_data)?;
+
+    let schema = decode_scan_flight_info_schema(info)?;
+    if schema != *result.schema {
+        return Err(EhdbError::InvalidState(
+            "scan FlightData schema does not match FlightInfo schema".to_string(),
+        ));
+    }
+
+    let row_count = i64::try_from(result.row_count).map_err(|_| {
+        EhdbError::InvalidState(format!("scan row count too large: {}", result.row_count))
+    })?;
+    if info.total_records != row_count {
+        return Err(EhdbError::InvalidState(
+            "scan FlightData row count does not match FlightInfo total_records".to_string(),
+        ));
+    }
+
+    let total_bytes = total_flight_data_bytes(flight_data)?;
+    if info.total_bytes != total_bytes {
+        return Err(EhdbError::InvalidState(
+            "scan FlightData byte count does not match FlightInfo total_bytes".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_scan_result_stream_metadata(flight_data: &[FlightData]) -> Result<()> {
@@ -5919,6 +5957,58 @@ mod tests {
     }
 
     #[test]
+    fn scan_result_rejects_flight_data_info_mismatches() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-flight-data-info-consistency");
+        let request = ScanLatestTableRequest {
+            tenant,
+            namespace,
+            table_name,
+            projection: None,
+            predicate: None,
+        };
+        let ticket = ScanFlightTicket::new(request.clone());
+        let result = LocalArrowScanService::default()
+            .scan_latest(&runtime, &store, request)
+            .unwrap();
+        let flight_data = result.to_flight_data().unwrap();
+        let info = result.to_flight_info(&ticket).unwrap();
+
+        let decoded = ArrowScanResult::from_flight_data_for_info(&flight_data, &info).unwrap();
+        assert_eq!(decoded.row_count, result.row_count);
+
+        let mut wrong_records = info.clone();
+        wrong_records.total_records += 1;
+        assert!(matches!(
+            ArrowScanResult::from_flight_data_for_info(&flight_data, &wrong_records).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut wrong_bytes = info.clone();
+        wrong_bytes.total_bytes += 1;
+        assert!(matches!(
+            ArrowScanResult::from_flight_data_for_info(&flight_data, &wrong_bytes).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut wrong_schema = info;
+        wrong_schema.schema = schema_ipc_bytes(&Schema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            true,
+        )]))
+        .unwrap()
+        .into();
+        assert!(matches!(
+            ArrowScanResult::from_flight_data_for_info(&flight_data, &wrong_schema).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
     fn scan_result_flight_info_rejects_result_mismatches() {
         let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
             seeded_table("service-flight-info-result-consistency");
@@ -6884,6 +6974,10 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        let decoded = ArrowScanResult::from_batches(batches.clone()).unwrap();
+        decoded
+            .validate_flight_info_for_result(&info, &ticket)
+            .unwrap();
 
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "execution_id");
@@ -6891,6 +6985,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[0].schema().field(0).name(), "execution_id");
+        assert_eq!(decoded.row_count, 1);
         let execution_ids = batches[0]
             .column(0)
             .as_any()

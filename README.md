@@ -269,12 +269,13 @@ the Arrow Flight client over tonic/gRPC transport. It calls
 `get_flight_info`, validates the returned `FlightInfo` against the
 expected scan ticket and the schema returned by `get_schema`, follows
 the returned endpoint ticket with `do_get`, and decodes the returned
-Arrow batches. A second smoke path proves the same flow with the
-header-token auth policy enabled, and a third proves tenant/namespace
-scope metadata over real tonic/gRPC transport. A fourth proves
-catalog-backed scan grant enforcement with principal metadata over the
-same loopback path. This remains a local-reference test path, not a
-gateway integration.
+Arrow batches before validating the decoded result against the returned
+`FlightInfo` row count, schema, and encoded byte count. A second smoke
+path proves the same flow with the header-token auth policy enabled, and
+a third proves tenant/namespace scope metadata over real tonic/gRPC
+transport. A fourth proves catalog-backed scan grant enforcement with
+principal metadata over the same loopback path. This remains a
+local-reference test path, not a gateway integration.
 
 ## Catalog Snapshots And Scan Grants
 
