@@ -84,6 +84,7 @@ pub enum CloudProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeoLocation {
     pub provider: CloudProvider,
     pub region: String,
@@ -136,6 +137,7 @@ impl DataGravityShard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectPlacement {
     pub geo: GeoLocation,
     pub data_gravity_shard: DataGravityShard,
@@ -164,6 +166,7 @@ pub enum PlacementRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlacementTarget {
     pub role: PlacementRole,
     pub placement: ObjectPlacement,
@@ -186,6 +189,7 @@ impl PlacementTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlacementPolicy {
     minimum_copies: usize,
     targets: Vec<PlacementTarget>,
@@ -274,6 +278,7 @@ impl PlacementPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectRef {
     pub path: ObjectPath,
     pub len: u64,
@@ -282,6 +287,7 @@ pub struct ObjectRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectReplica {
     pub path: ObjectPath,
     pub len: u64,
@@ -301,6 +307,7 @@ impl From<ObjectRef> for ObjectReplica {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InMemoryObjectReplicaRegistry {
     replicas: BTreeMap<String, BTreeMap<String, ObjectReplica>>,
 }
@@ -362,6 +369,7 @@ impl InMemoryObjectReplicaRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReplicationAction {
     AlreadySatisfied {
         placement: ObjectPlacement,
@@ -373,6 +381,7 @@ pub enum ReplicationAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationPlan {
     pub object_path: ObjectPath,
     pub digest: ObjectDigest,
@@ -757,6 +766,27 @@ mod tests {
         }
     }
 
+    fn add_unknown(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        let target = if pointer.is_empty() {
+            &mut value
+        } else {
+            value.pointer_mut(pointer).unwrap()
+        };
+        target
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        value
+    }
+
+    fn assert_unknown_rejected<T>(value: serde_json::Value, pointer: &str)
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let value = add_unknown(value, pointer);
+        assert!(serde_json::from_value::<T>(value).is_err());
+    }
+
     #[test]
     fn validates_geo_location_and_data_gravity_shard() {
         let geo = GeoLocation::new(CloudProvider::Aws, "us-east-1", Some("use1-az1")).unwrap();
@@ -769,6 +799,82 @@ mod tests {
         assert_eq!(placement.data_gravity_shard.as_str(), "tenant-a-system");
         assert!(GeoLocation::new(CloudProvider::Gcp, "us east1", None::<String>).is_err());
         assert!(DataGravityShard::new("tenant/a").is_err());
+    }
+
+    #[test]
+    fn storage_metadata_json_rejects_unknown_fields() {
+        let shard = DataGravityShard::new("tenant-a-system").unwrap();
+        let source = placed_object(
+            "tenant-a/system/table/part-000.arrow",
+            aws_primary(shard.clone()),
+        );
+        let target = gcp_replica(shard.clone());
+        let target_ref = placed_object("tenant-a/system/table/part-000.arrow", target.clone());
+        let replica: ObjectReplica = target_ref.into();
+        let policy = PlacementPolicy::new(
+            2,
+            vec![
+                PlacementTarget::primary(source.placement.clone()),
+                PlacementTarget::replica(target.clone()),
+            ],
+        )
+        .unwrap();
+        let plan = plan_replication(&source, &[], &policy).unwrap();
+        let mut registry = InMemoryObjectReplicaRegistry::default();
+        registry.register(source.clone().into()).unwrap();
+
+        assert_unknown_rejected::<GeoLocation>(
+            serde_json::to_value(source.placement.geo.clone()).unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<ObjectPlacement>(
+            serde_json::to_value(source.placement.clone()).unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<ObjectPlacement>(
+            serde_json::to_value(source.placement.clone()).unwrap(),
+            "/geo",
+        );
+        assert_unknown_rejected::<PlacementTarget>(
+            serde_json::to_value(PlacementTarget::primary(source.placement.clone())).unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<PlacementTarget>(
+            serde_json::to_value(PlacementTarget::primary(source.placement.clone())).unwrap(),
+            "/placement",
+        );
+        assert_unknown_rejected::<PlacementPolicy>(serde_json::to_value(&policy).unwrap(), "");
+        assert_unknown_rejected::<PlacementPolicy>(
+            serde_json::to_value(&policy).unwrap(),
+            "/targets/0",
+        );
+        assert_unknown_rejected::<ObjectRef>(serde_json::to_value(&source).unwrap(), "");
+        assert_unknown_rejected::<ObjectRef>(
+            serde_json::to_value(&source).unwrap(),
+            "/placement/geo",
+        );
+        assert_unknown_rejected::<ObjectReplica>(serde_json::to_value(&replica).unwrap(), "");
+        assert_unknown_rejected::<ObjectReplica>(
+            serde_json::to_value(&replica).unwrap(),
+            "/placement",
+        );
+        assert_unknown_rejected::<InMemoryObjectReplicaRegistry>(
+            serde_json::to_value(&registry).unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<ReplicationAction>(
+            serde_json::to_value(ReplicationAction::CopyNeeded {
+                source: source.placement.clone(),
+                target,
+            })
+            .unwrap(),
+            "/CopyNeeded",
+        );
+        assert_unknown_rejected::<ReplicationPlan>(serde_json::to_value(&plan).unwrap(), "");
+        assert_unknown_rejected::<ReplicationPlan>(
+            serde_json::to_value(&plan).unwrap(),
+            "/actions/1/CopyNeeded/target",
+        );
     }
 
     #[test]

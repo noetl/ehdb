@@ -589,6 +589,7 @@ dependencies = [
  "criterion",
  "ehdb-core",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

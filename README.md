@@ -135,6 +135,11 @@ placement, and data-gravity shard together, rejects conflicting metadata
 for the same object path, and can feed `plan_replication` from registry
 state instead of caller-supplied arrays.
 
+Storage metadata JSON decoding rejects unknown fields on object refs,
+geo placements, placement policy targets, replica records, replication
+actions, and replication plans so persisted routing metadata does not
+silently ignore unexpected keys before replay or planning.
+
 `LocalReplicationExecutor` is the bounded local execution reference for
 copy-needed plans. It verifies source bytes through the immutable object
 store and records successful target replicas by appending
