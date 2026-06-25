@@ -75,7 +75,9 @@ pending after the consumer ack cursor without moving that cursor.
 JSONL replay revalidates persisted stream record subjects before
 rebuilding state. It also revalidates persisted stream coordinates,
 consumer names, stream record transaction IDs, and nonzero stream
-sequences before applying journal entries.
+sequences before applying journal entries. Unknown journal, config,
+record, and consumer fields are rejected during replay instead of being
+silently ignored.
 
 These are not the production consensus or replicated stream layers.
 Raft/Paxos and distributed stream storage belong behind these boundaries
