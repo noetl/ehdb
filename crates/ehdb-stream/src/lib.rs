@@ -8,9 +8,9 @@ use std::{
 use ehdb_core::{
     ConsumerName, EhdbError, NamespaceName, Result, StreamName, TenantId, TransactionId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct StreamSequence(u64);
 
 impl StreamSequence {
@@ -34,6 +34,16 @@ impl StreamSequence {
 
     pub fn value(self) -> u64 {
         self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StreamSequence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1289,6 +1299,15 @@ mod tests {
     }
 
     #[test]
+    fn stream_sequence_deserialization_rejects_zero_values() {
+        assert_eq!(
+            serde_json::from_str::<StreamSequence>("1").unwrap(),
+            StreamSequence::first()
+        );
+        assert!(serde_json::from_str::<StreamSequence>("0").is_err());
+    }
+
+    #[test]
     fn local_jsonl_log_replays_records_and_consumer_cursor_after_reopen() {
         let path = temp_log_path("restart");
         let (tenant, namespace, stream) = ids();
@@ -1380,6 +1399,65 @@ mod tests {
         let error = LocalJsonlStreamLog::open(&path).unwrap_err();
 
         assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_zero_stream_sequence_on_replay() {
+        let path = temp_log_path("zero-sequence");
+        let (tenant, namespace, stream) = ids();
+        let mut publish = publish_json(
+            tenant.as_str(),
+            namespace.as_str(),
+            stream.as_str(),
+            "noetl.event",
+            "txn-0001",
+        );
+        publish["Publish"]["record"]["sequence"] = serde_json::json!(0);
+        write_raw_journal(
+            &path,
+            &[
+                create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                publish,
+            ],
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_jsonl_log_rejects_zero_ack_sequence_on_replay() {
+        let path = temp_log_path("zero-ack-sequence");
+        let (tenant, namespace, stream) = ids();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        write_raw_journal(
+            &path,
+            &[
+                create_stream_json(tenant.as_str(), namespace.as_str(), stream.as_str()),
+                create_consumer_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    consumer.as_str(),
+                ),
+                ack_json(
+                    tenant.as_str(),
+                    namespace.as_str(),
+                    stream.as_str(),
+                    consumer.as_str(),
+                    0,
+                ),
+            ],
+        );
+
+        let error = LocalJsonlStreamLog::open(&path).unwrap_err();
+
+        assert!(matches!(error, EhdbError::Storage(_)));
 
         fs::remove_file(path).unwrap();
     }
