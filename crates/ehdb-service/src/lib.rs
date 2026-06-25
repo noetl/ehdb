@@ -621,6 +621,16 @@ impl ScanFlightTicket {
         validate_scan_flight_info_for_schema(info, self, expected_schema)
     }
 
+    pub fn endpoint_ticket_from_flight_info(&self, info: &FlightInfo) -> Result<Ticket> {
+        validate_scan_flight_info_for_ticket(info, self)?;
+        info.endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .ok_or_else(|| {
+                EhdbError::InvalidState("scan FlightInfo endpoint requires a ticket".to_string())
+            })
+    }
+
     pub fn into_request(self) -> ScanLatestTableRequest {
         self.request
     }
@@ -5870,14 +5880,15 @@ mod tests {
         );
         assert_eq!(info.endpoint.len(), 1);
         assert_eq!(
-            info.flight_descriptor.unwrap().r#type,
+            info.flight_descriptor.as_ref().unwrap().r#type,
             DescriptorType::Cmd as i32
         );
-        let endpoint_ticket = info.endpoint[0].ticket.as_ref().unwrap();
         assert_eq!(
-            ScanFlightTicket::from_arrow_ticket(endpoint_ticket)
-                .unwrap()
-                .request,
+            ScanFlightTicket::from_arrow_ticket(
+                &ticket.endpoint_ticket_from_flight_info(&info).unwrap()
+            )
+            .unwrap()
+            .request,
             ticket.request
         );
 
@@ -5903,12 +5914,25 @@ mod tests {
         let info = result.to_flight_info(&ticket).unwrap();
 
         ticket.validate_flight_info(&info).unwrap();
+        let endpoint_ticket = ticket.endpoint_ticket_from_flight_info(&info).unwrap();
+        assert_eq!(
+            ScanFlightTicket::from_arrow_ticket(&endpoint_ticket)
+                .unwrap()
+                .request,
+            ticket.request
+        );
 
         let mut other_request = ticket.request.clone();
         other_request.table_name = TableName::new("other_executions").unwrap();
         let other_ticket = ScanFlightTicket::new(other_request);
         assert!(matches!(
             other_ticket.validate_flight_info(&info).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(matches!(
+            other_ticket
+                .endpoint_ticket_from_flight_info(&info)
+                .unwrap_err(),
             EhdbError::InvalidState(_)
         ));
 
@@ -6966,7 +6990,7 @@ mod tests {
             .await
             .unwrap();
         ticket.validate_flight_info_schema(&info, &schema).unwrap();
-        let endpoint_ticket = info.endpoint[0].ticket.clone().unwrap();
+        let endpoint_ticket = ticket.endpoint_ticket_from_flight_info(&info).unwrap();
         let batches = client
             .do_get(endpoint_ticket)
             .await
