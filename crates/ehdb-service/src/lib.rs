@@ -1,4 +1,4 @@
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeSet, future::Future, net::SocketAddr, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
@@ -728,8 +728,19 @@ fn validate_scan_latest_table_request(request: &ScanLatestTableRequest) -> Resul
     NamespaceName::new(request.namespace.as_str()).map(|_| ())?;
     TableName::new(request.table_name.as_str()).map(|_| ())?;
     if let Some(projection) = &request.projection {
+        if projection.is_empty() {
+            return Err(EhdbError::InvalidState(
+                "scan projection must contain at least one column".to_string(),
+            ));
+        }
+        let mut columns = BTreeSet::new();
         for column in projection {
             validate_scan_selector(column)?;
+            if !columns.insert(column.as_str()) {
+                return Err(EhdbError::InvalidState(format!(
+                    "duplicate scan projection column: {column}"
+                )));
+            }
         }
     }
     if let Some(predicate) = &request.predicate {
@@ -1134,6 +1145,7 @@ impl LocalArrowScanService {
         store: &S,
         request: ScanLatestTableRequest,
     ) -> Result<ArrowScanResult> {
+        validate_scan_latest_table_request(&request)?;
         let batches = self.scanner.scan_latest(
             runtime,
             store,
@@ -2917,6 +2929,35 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(execution_ids.value(0), "exec-2");
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_scan_service_rejects_invalid_projection_shape() {
+        let (log_path, object_root, runtime, store, tenant, namespace, table_name) =
+            seeded_table("service-invalid-projection-shape");
+
+        for projection in [
+            Vec::new(),
+            vec!["execution_id".to_string(), "execution_id".to_string()],
+        ] {
+            let error = LocalArrowScanService::default()
+                .scan_latest(
+                    &runtime,
+                    &store,
+                    ScanLatestTableRequest {
+                        tenant: tenant.clone(),
+                        namespace: namespace.clone(),
+                        table_name: table_name.clone(),
+                        projection: Some(projection),
+                        predicate: None,
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, EhdbError::InvalidState(_)));
+        }
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
@@ -5778,6 +5819,36 @@ mod tests {
             ticket.command_descriptor().unwrap_err(),
             EhdbError::InvalidIdentifier(_)
         ));
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_invalid_projection_shape() {
+        for projection in [
+            Vec::new(),
+            vec!["execution_id".to_string(), "execution_id".to_string()],
+        ] {
+            let mut request = filtered_request();
+            request.projection = Some(projection);
+            let ticket = ScanFlightTicket::new(request);
+            assert!(matches!(
+                ticket.encode().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+            assert!(matches!(
+                ticket.to_arrow_ticket().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+            assert!(matches!(
+                ticket.command_descriptor().unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+
+            let encoded = serde_json::to_vec(&ticket).unwrap();
+            assert!(matches!(
+                ScanFlightTicket::decode(&encoded).unwrap_err(),
+                EhdbError::InvalidState(_)
+            ));
+        }
     }
 
     #[test]
