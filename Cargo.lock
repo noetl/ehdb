@@ -559,6 +559,8 @@ name = "ehdb-retrieval"
 version = "0.1.0"
 dependencies = [
  "ehdb-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

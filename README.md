@@ -337,6 +337,10 @@ reference RAG primitive only; ANN indexes, retrieval services,
 production IAM, Qdrant adapters, and distributed query execution remain
 future surfaces.
 
+Retrieval metadata JSON decoding rejects unknown fields on documents,
+chunks, embeddings, registration requests, search requests, and local
+search hits before persisted or handed-off RAG metadata is accepted.
+
 `ehdb-service` exposes that local vector lookup through
 `LocalRetrievalSearchService`, an in-process service-facing request and
 result boundary over replayed `LocalReferenceRuntime` retrieval state.

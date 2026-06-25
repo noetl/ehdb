@@ -4,8 +4,10 @@ use ehdb_core::{
     ChunkId, DocumentId, EhdbError, EmbeddingModelId, NamespaceName, Result, TenantId,
     TransactionId,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Document {
     pub id: DocumentId,
     pub tenant: TenantId,
@@ -15,7 +17,8 @@ pub struct Document {
     pub created_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterDocument {
     pub id: DocumentId,
     pub tenant: TenantId,
@@ -25,7 +28,8 @@ pub struct RegisterDocument {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Chunk {
     pub id: ChunkId,
     pub document_id: DocumentId,
@@ -35,7 +39,8 @@ pub struct Chunk {
     pub created_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterChunk {
     pub id: ChunkId,
     pub document_id: DocumentId,
@@ -45,7 +50,8 @@ pub struct RegisterChunk {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Embedding {
     pub chunk_id: ChunkId,
     pub model_id: EmbeddingModelId,
@@ -54,7 +60,8 @@ pub struct Embedding {
     pub created_by: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterEmbedding {
     pub chunk_id: ChunkId,
     pub model_id: EmbeddingModelId,
@@ -63,7 +70,8 @@ pub struct RegisterEmbedding {
     pub transaction_id: TransactionId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VectorSearch {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -72,14 +80,16 @@ pub struct VectorSearch {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VectorSearchHit {
     pub chunk: Chunk,
     pub embedding: Embedding,
     pub score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TextSearch {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -87,13 +97,15 @@ pub struct TextSearch {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TextSearchHit {
     pub chunk: Chunk,
     pub match_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HybridSearch {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -105,7 +117,8 @@ pub struct HybridSearch {
     pub text_weight: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HybridSearchHit {
     pub chunk: Chunk,
     pub embedding: Embedding,
@@ -587,6 +600,27 @@ mod tests {
             .unwrap()
     }
 
+    fn add_unknown(mut value: serde_json::Value, pointer: &str) -> serde_json::Value {
+        let target = if pointer.is_empty() {
+            &mut value
+        } else {
+            value.pointer_mut(pointer).unwrap()
+        };
+        target
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!("field"));
+        value
+    }
+
+    fn assert_unknown_rejected<T>(value: serde_json::Value, pointer: &str)
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let value = add_unknown(value, pointer);
+        assert!(serde_json::from_value::<T>(value).is_err());
+    }
+
     #[test]
     fn registers_document_chunks_and_embeddings() {
         let mut catalog = InMemoryRetrievalCatalog::default();
@@ -614,6 +648,152 @@ mod tests {
 
         assert_eq!(catalog.chunks_for_document(&document.id), vec![chunk]);
         assert_eq!(embedding.dimensions, 3);
+    }
+
+    #[test]
+    fn retrieval_metadata_json_rejects_unknown_fields() {
+        let mut catalog = InMemoryRetrievalCatalog::default();
+        let (tenant, namespace) = ids();
+        let model = EmbeddingModelId::new("text-embedding-local").unwrap();
+        let document = register_scoped_doc(
+            &mut catalog,
+            tenant.clone(),
+            namespace.clone(),
+            "doc-strict",
+            "txn-doc-strict",
+        );
+        let chunk = register_chunk_with_text(
+            &mut catalog,
+            document.id.clone(),
+            "chunk-strict",
+            0,
+            "retrieval strict metadata".to_string(),
+            "txn-chunk-strict",
+        );
+        let embedding = register_embedding(
+            &mut catalog,
+            chunk.id.clone(),
+            &model,
+            vec![1.0, 0.0],
+            "txn-embedding-strict",
+        );
+        let vector_hit = catalog
+            .search_similar(VectorSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                limit: 1,
+            })
+            .unwrap()
+            .remove(0);
+        let text_hit = catalog
+            .search_text(TextSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                query: "retrieval".to_string(),
+                limit: 1,
+            })
+            .unwrap()
+            .remove(0);
+        let hybrid_hit = catalog
+            .search_hybrid(HybridSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 1,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .unwrap()
+            .remove(0);
+
+        assert_unknown_rejected::<Document>(serde_json::to_value(&document).unwrap(), "");
+        assert_unknown_rejected::<RegisterDocument>(
+            serde_json::to_value(RegisterDocument {
+                id: DocumentId::new("doc-request").unwrap(),
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                source_uri: "artifact://doc-request/source.md".to_string(),
+                content_type: "text/markdown".to_string(),
+                transaction_id: TransactionId::new("txn-doc-request").unwrap(),
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<Chunk>(serde_json::to_value(&chunk).unwrap(), "");
+        assert_unknown_rejected::<RegisterChunk>(
+            serde_json::to_value(RegisterChunk {
+                id: ChunkId::new("chunk-request").unwrap(),
+                document_id: document.id.clone(),
+                ordinal: 1,
+                text: "chunk request".to_string(),
+                checksum: "sha256-chunk-request".to_string(),
+                transaction_id: TransactionId::new("txn-chunk-request").unwrap(),
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<Embedding>(serde_json::to_value(&embedding).unwrap(), "");
+        assert_unknown_rejected::<RegisterEmbedding>(
+            serde_json::to_value(RegisterEmbedding {
+                chunk_id: chunk.id.clone(),
+                model_id: model.clone(),
+                dimensions: 2,
+                vector: vec![1.0, 0.0],
+                transaction_id: TransactionId::new("txn-embedding-request").unwrap(),
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<VectorSearch>(
+            serde_json::to_value(VectorSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                model_id: model.clone(),
+                query: vec![1.0, 0.0],
+                limit: 1,
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<VectorSearchHit>(serde_json::to_value(&vector_hit).unwrap(), "");
+        assert_unknown_rejected::<VectorSearchHit>(
+            serde_json::to_value(&vector_hit).unwrap(),
+            "/chunk",
+        );
+        assert_unknown_rejected::<TextSearch>(
+            serde_json::to_value(TextSearch {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                query: "retrieval".to_string(),
+                limit: 1,
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<TextSearchHit>(serde_json::to_value(&text_hit).unwrap(), "");
+        assert_unknown_rejected::<HybridSearch>(
+            serde_json::to_value(HybridSearch {
+                tenant,
+                namespace,
+                model_id: model,
+                query: vec![1.0, 0.0],
+                text_query: "retrieval".to_string(),
+                limit: 1,
+                vector_weight: 1.0,
+                text_weight: 1.0,
+            })
+            .unwrap(),
+            "",
+        );
+        assert_unknown_rejected::<HybridSearchHit>(serde_json::to_value(&hybrid_hit).unwrap(), "");
+        assert_unknown_rejected::<HybridSearchHit>(
+            serde_json::to_value(&hybrid_hit).unwrap(),
+            "/embedding",
+        );
     }
 
     #[test]
