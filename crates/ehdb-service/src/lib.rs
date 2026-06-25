@@ -590,6 +590,14 @@ impl ScanFlightTicket {
             .map_err(|err| EhdbError::InvalidState(format!("decode scan ticket: {err}")))?;
         ticket.validate_version()?;
         validate_scan_latest_table_request(&ticket.request)?;
+        let canonical = serde_json::to_vec(&ticket).map_err(|err| {
+            EhdbError::InvalidState(format!("encode canonical scan ticket: {err}"))
+        })?;
+        if canonical.as_slice() != bytes {
+            return Err(EhdbError::InvalidState(
+                "scan ticket payload must use canonical EHDB encoding".to_string(),
+            ));
+        }
         Ok(ticket)
     }
 
@@ -5765,6 +5773,22 @@ mod tests {
     fn flight_scan_ticket_rejects_malformed_payloads() {
         let error = ScanFlightTicket::decode(b"not-json").unwrap_err();
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn flight_scan_ticket_rejects_noncanonical_payloads() {
+        let ticket = ScanFlightTicket::new(filtered_request());
+        let pretty = serde_json::to_vec_pretty(&ticket).unwrap();
+
+        assert_ne!(pretty, ticket.encode().unwrap());
+        assert!(matches!(
+            ScanFlightTicket::decode(&pretty).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert_eq!(
+            ScanFlightTicket::decode(&ticket.encode().unwrap()).unwrap(),
+            ticket
+        );
     }
 
     #[test]
