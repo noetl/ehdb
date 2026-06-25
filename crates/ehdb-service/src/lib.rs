@@ -2535,9 +2535,9 @@ where
     }
 
     fn request_from_descriptor(descriptor: FlightDescriptor) -> Result<ScanLatestTableRequest> {
-        if descriptor.r#type != DescriptorType::Cmd as i32 {
+        if descriptor.r#type != DescriptorType::Cmd as i32 || !descriptor.path.is_empty() {
             return Err(EhdbError::InvalidState(
-                "EHDB scan Flight descriptor requires a command descriptor".to_string(),
+                "EHDB scan Flight descriptor requires an EHDB command descriptor".to_string(),
             ));
         }
 
@@ -7290,6 +7290,35 @@ mod tests {
             cmd: Vec::new().into(),
             path: vec!["tenant-a".to_string(), "system".to_string()],
         };
+        let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
+
+        let info_error = server
+            .get_flight_info(Request::new(descriptor.clone()))
+            .await
+            .unwrap_err();
+        let schema_error = server
+            .get_schema(Request::new(descriptor))
+            .await
+            .unwrap_err();
+
+        assert_eq!(info_error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(schema_error.code(), tonic::Code::InvalidArgument);
+        assert!(!log_path.exists());
+        if object_root.exists() {
+            fs::remove_dir_all(object_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_flight_server_rejects_command_descriptors_with_paths() {
+        let log_path = temp_log_path("local-flight-server-command-path-descriptor");
+        let object_root = temp_object_root("local-flight-server-command-path-descriptor");
+        let runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut descriptor = ScanFlightTicket::new(filtered_request())
+            .command_descriptor()
+            .unwrap();
+        descriptor.path.push("unexpected".to_string());
         let server = LocalArrowFlightServer::new(Arc::new(runtime), Arc::new(store));
 
         let info_error = server

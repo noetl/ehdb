@@ -210,9 +210,11 @@ trait adapter. It implements `get_flight_info`, `get_schema`, and
 streams `FlightData` responses, and returns explicit unimplemented
 statuses for non-scan Flight methods. It enforces the configured request
 metadata auth policy and optional tenant/namespace scan scope policy on
-implemented scan methods, but it does not bind a port, start a daemon,
-implement TLS/external identity, or give the gateway direct storage
-access.
+implemented scan methods. Direct scan descriptor requests must be EHDB
+command descriptors with no path entries; path descriptors and command
+descriptors carrying paths are rejected before scan execution. The
+adapter does not bind a port, start a daemon, implement TLS/external
+identity, or give the gateway direct storage access.
 
 `LocalArrowFlightServerConfig` adds the first bounded lifecycle
 configuration surface. It validates bind address, message sizes,
