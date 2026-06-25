@@ -206,6 +206,7 @@ pub struct NoetlWasmPluginRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishSystemLibrary {
     pub path: SystemLibraryPath,
     pub revision: SystemLibraryRevision,
@@ -219,6 +220,7 @@ pub struct PublishSystemLibrary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindSystemLibrary {
     pub tenant: TenantId,
     pub namespace: NamespaceName,
@@ -274,6 +276,7 @@ pub struct InMemorySystemLibraryCatalog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum SystemLibraryJournalEntry {
     Publish(PublishSystemLibrary),
     Bind(BindSystemLibrary),
@@ -928,6 +931,41 @@ mod tests {
             let error = LocalJsonlSystemLibraryCatalog::open(&path).unwrap_err();
 
             assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_jsonl_catalog_rejects_unknown_journal_fields_on_replay() {
+        for (case, mut entry, pointer) in [
+            ("entry", publish_entry_json(), ""),
+            ("publish", publish_entry_json(), "/Publish"),
+            ("bind", publish_bind_entry_json().1, "/Bind"),
+        ] {
+            let path = temp_log_path(&format!("unknown-journal-field-{case}"));
+            let target = if pointer.is_empty() {
+                &mut entry
+            } else {
+                entry.pointer_mut(pointer).unwrap()
+            };
+            target
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!("field"));
+
+            let entries = if case == "bind" {
+                let (publish, _) = publish_bind_entry_json();
+                vec![publish, entry]
+            } else {
+                vec![entry]
+            };
+            write_raw_journal(&path, &entries);
+
+            assert!(matches!(
+                LocalJsonlSystemLibraryCatalog::open(&path).unwrap_err(),
+                EhdbError::Storage(_)
+            ));
 
             fs::remove_file(path).unwrap();
         }
