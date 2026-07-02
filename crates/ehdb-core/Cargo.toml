@@ -9,3 +9,6 @@ rust-version.workspace = true
 [dependencies]
 arrow-schema.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

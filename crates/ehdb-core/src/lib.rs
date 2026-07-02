@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt};
 
 pub use arrow_schema::DataType;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 pub type Result<T> = std::result::Result<T, EhdbError>;
 
@@ -66,8 +66,7 @@ identifier_type!(DocumentId);
 identifier_type!(ChunkId);
 identifier_type!(EmbeddingModelId);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
@@ -86,8 +85,25 @@ impl ColumnSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl<'de> Deserialize<'de> for ColumnSchema {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ColumnSchemaJson {
+            name: String,
+            data_type: DataType,
+            nullable: bool,
+        }
+
+        let value = ColumnSchemaJson::deserialize(deserializer)?;
+        Self::new(value.name, value.data_type, value.nullable).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableSchema {
     columns: Vec<ColumnSchema>,
 }
@@ -114,6 +130,22 @@ impl TableSchema {
 
     pub fn columns(&self) -> &[ColumnSchema] {
         &self.columns
+    }
+}
+
+impl<'de> Deserialize<'de> for TableSchema {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TableSchemaJson {
+            columns: Vec<ColumnSchema>,
+        }
+
+        let value = TableSchemaJson::deserialize(deserializer)?;
+        Self::new(value.columns).map_err(de::Error::custom)
     }
 }
 
@@ -171,5 +203,28 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+    }
+
+    #[test]
+    fn schema_json_decode_rejects_invalid_columns_and_duplicates() {
+        let mut column =
+            serde_json::to_value(ColumnSchema::new("id", DataType::Utf8, false).unwrap()).unwrap();
+        column["name"] = serde_json::json!("bad column");
+        assert!(serde_json::from_value::<ColumnSchema>(column).is_err());
+
+        let mut schema = serde_json::to_value(
+            TableSchema::new(vec![ColumnSchema::new("id", DataType::Utf8, false).unwrap()])
+                .unwrap(),
+        )
+        .unwrap();
+        schema["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "id",
+                "data_type": "Int64",
+                "nullable": false
+            }));
+        assert!(serde_json::from_value::<TableSchema>(schema).is_err());
     }
 }
