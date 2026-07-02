@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 pub use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,15 @@ impl TableSchema {
                 "table schema requires at least one column".to_string(),
             ));
         }
+        let mut seen = BTreeSet::new();
+        for column in &columns {
+            if !seen.insert(column.name.as_str()) {
+                return Err(EhdbError::InvalidIdentifier(format!(
+                    "duplicate table schema column: {}",
+                    column.name
+                )));
+            }
+        }
         Ok(Self { columns })
     }
 
@@ -138,5 +147,16 @@ mod tests {
                 .unwrap();
 
         assert_eq!(schema.columns()[0].data_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn rejects_duplicate_table_schema_columns() {
+        let error = TableSchema::new(vec![
+            ColumnSchema::new("id", DataType::Utf8, false).unwrap(),
+            ColumnSchema::new("id", DataType::Int64, false).unwrap(),
+        ])
+        .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
     }
 }
