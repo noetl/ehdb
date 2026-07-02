@@ -333,7 +333,8 @@ revocation, and non-loopback service exposure remain future surfaces.
 Catalog metadata JSON decoding rejects unknown fields on tables,
 snapshots, scan grants, create-table requests, snapshot commits, scan
 grant requests, table schemas, and column schemas before persisted
-metadata is accepted for replay or catalog operations.
+metadata is accepted for replay or catalog operations. Table schemas
+also reject duplicate column names before catalog state is created.
 
 `ehdb-retrieval` now includes a local exact cosine-similarity fixture
 over registered chunk embeddings. `VectorSearch` scopes candidates by
