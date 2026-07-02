@@ -161,8 +161,9 @@ catalog/object boundary for columnar data.
 `LocalArrowSnapshotScanner` adds the first local scan fixture on top of
 that boundary. It resolves the latest table snapshot, verifies each
 Arrow IPC object before decoding, and can project named columns in the
-requested order. Predicate pushdown, SQL planning, distributed execution,
-and Arrow Flight remain future service surfaces.
+requested order. Empty projection lists and duplicate projection columns
+are rejected before object reads. Predicate pushdown, SQL planning,
+distributed execution, and Arrow Flight remain future service surfaces.
 
 The scanner also supports a first local equality-filter fixture. Filters
 are single-column equality predicates over UTF-8 or Int64 columns,
