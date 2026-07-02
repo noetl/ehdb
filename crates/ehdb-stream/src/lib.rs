@@ -212,6 +212,18 @@ fn validate_stream_record(record: &StreamRecord) -> Result<()> {
     TransactionId::new(record.transaction_id.as_str()).map(|_| ())
 }
 
+fn map_stream_journal_decode_error(line: usize, err: serde_json::Error) -> EhdbError {
+    let message = err.to_string();
+    if let Some(value) = message.strip_prefix("invalid identifier: ") {
+        let value = value
+            .rsplit_once(" at line ")
+            .map_or(value, |(identifier, _)| identifier);
+        EhdbError::InvalidIdentifier(value.to_string())
+    } else {
+        EhdbError::Storage(format!("invalid stream log record at line {line}: {err}"))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StreamState {
     config: StreamConfig,
@@ -561,12 +573,8 @@ impl LocalJsonlStreamLog {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let entry: StreamJournalEntry = serde_json::from_str(&line).map_err(|err| {
-                    EhdbError::Storage(format!(
-                        "invalid stream log record at line {}: {err}",
-                        index + 1
-                    ))
-                })?;
+                let entry: StreamJournalEntry = serde_json::from_str(&line)
+                    .map_err(|err| map_stream_journal_decode_error(index + 1, err))?;
                 apply_journal_entry(&mut inner, entry)?;
             }
         }

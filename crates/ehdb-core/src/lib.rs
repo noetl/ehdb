@@ -30,7 +30,7 @@ impl std::error::Error for EhdbError {}
 
 macro_rules! identifier_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         pub struct $name(String);
 
         impl $name {
@@ -48,6 +48,16 @@ macro_rules! identifier_type {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(de::Error::custom)
             }
         }
     };
@@ -171,6 +181,17 @@ mod tests {
     fn validates_identifiers() {
         assert!(TenantId::new("tenant-a").is_ok());
         assert!(TenantId::new("tenant a").is_err());
+    }
+
+    #[test]
+    fn identifier_json_decode_rejects_invalid_values() {
+        let tenant = TenantId::new("tenant-a").unwrap();
+        let value = serde_json::to_value(&tenant).unwrap();
+        assert_eq!(serde_json::from_value::<TenantId>(value).unwrap(), tenant);
+
+        assert!(serde_json::from_value::<TenantId>(serde_json::json!("tenant a")).is_err());
+        assert!(serde_json::from_value::<TableName>(serde_json::json!("table.name")).is_err());
+        assert!(serde_json::from_value::<TransactionId>(serde_json::json!("txn bad")).is_err());
     }
 
     #[test]

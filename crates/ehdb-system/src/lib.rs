@@ -303,13 +303,8 @@ impl LocalJsonlSystemLibraryCatalog {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let entry: SystemLibraryJournalEntry =
-                    serde_json::from_str(&line).map_err(|err| {
-                        EhdbError::Storage(format!(
-                            "invalid system library journal record at line {}: {err}",
-                            index + 1
-                        ))
-                    })?;
+                let entry: SystemLibraryJournalEntry = serde_json::from_str(&line)
+                    .map_err(|err| map_system_library_journal_decode_error(index + 1, err))?;
                 apply_journal_entry(&mut inner, entry)?;
             }
         }
@@ -376,6 +371,20 @@ fn apply_journal_entry(
     match entry {
         SystemLibraryJournalEntry::Publish(request) => inner.publish(request).map(|_| ()),
         SystemLibraryJournalEntry::Bind(request) => inner.bind(request).map(|_| ()),
+    }
+}
+
+fn map_system_library_journal_decode_error(line: usize, err: serde_json::Error) -> EhdbError {
+    let message = err.to_string();
+    if let Some(value) = message.strip_prefix("invalid identifier: ") {
+        let value = value
+            .rsplit_once(" at line ")
+            .map_or(value, |(identifier, _)| identifier);
+        EhdbError::InvalidIdentifier(value.to_string())
+    } else {
+        EhdbError::Storage(format!(
+            "invalid system library journal record at line {line}: {err}"
+        ))
     }
 }
 

@@ -587,7 +587,7 @@ impl ScanFlightTicket {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let ticket: Self = serde_json::from_slice(bytes)
-            .map_err(|err| EhdbError::InvalidState(format!("decode scan ticket: {err}")))?;
+            .map_err(|err| map_json_decode_error("decode scan ticket", err))?;
         ticket.validate_version()?;
         validate_scan_latest_table_request(&ticket.request)?;
         let canonical = serde_json::to_vec(&ticket).map_err(|err| {
@@ -1300,9 +1300,8 @@ impl RetrievalContextRequestPayload {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
-            EhdbError::InvalidState(format!("decode retrieval context request: {err}"))
-        })?;
+        let payload: Self = serde_json::from_slice(bytes)
+            .map_err(|err| map_json_decode_error("decode retrieval context request", err))?;
         payload.validate_version()?;
         validate_retrieval_context_request(&payload.request)?;
         let canonical = payload.encode()?;
@@ -1354,9 +1353,8 @@ impl RetrievalContextResultPayload {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
-            EhdbError::InvalidState(format!("decode retrieval context result: {err}"))
-        })?;
+        let payload: Self = serde_json::from_slice(bytes)
+            .map_err(|err| map_json_decode_error("decode retrieval context result", err))?;
         payload.validate_version()?;
         validate_retrieval_context(&payload.context)?;
         let canonical = payload.encode()?;
@@ -1936,9 +1934,7 @@ impl RetrievalContextPayloadExecutionReceiptEventPayload {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
-            EhdbError::InvalidState(format!(
-                "decode retrieval context execution receipt event: {err}"
-            ))
+            map_json_decode_error("decode retrieval context execution receipt event", err)
         })?;
         payload.validate()?;
         let canonical = payload.encode()?;
@@ -2006,7 +2002,7 @@ impl RetrievalContextPayloadExecutionReceiptPayload {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let payload: Self = serde_json::from_slice(bytes).map_err(|err| {
-            EhdbError::InvalidState(format!("decode retrieval context execution receipt: {err}"))
+            map_json_decode_error("decode retrieval context execution receipt", err)
         })?;
         payload.validate_version()?;
         payload.summary.validate()?;
@@ -2880,6 +2876,18 @@ fn error_to_status(error: EhdbError) -> Status {
         EhdbError::NotFound(_) => Status::not_found(error.to_string()),
         EhdbError::AlreadyExists(_) => Status::already_exists(error.to_string()),
         EhdbError::Storage(_) => Status::internal(error.to_string()),
+    }
+}
+
+fn map_json_decode_error(context: &str, err: serde_json::Error) -> EhdbError {
+    let message = err.to_string();
+    if let Some(value) = message.strip_prefix("invalid identifier: ") {
+        let value = value
+            .rsplit_once(" at line ")
+            .map_or(value, |(identifier, _)| identifier);
+        EhdbError::InvalidIdentifier(value.to_string())
+    } else {
+        EhdbError::InvalidState(format!("{context}: {err}"))
     }
 }
 

@@ -449,12 +449,8 @@ impl LocalJsonlTransactionLog {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record: TransactionRecord = serde_json::from_str(&line).map_err(|err| {
-                    EhdbError::Storage(format!(
-                        "invalid transaction log record at line {}: {err}",
-                        index + 1
-                    ))
-                })?;
+                let record: TransactionRecord = serde_json::from_str(&line)
+                    .map_err(|err| map_transaction_log_decode_error(index + 1, err))?;
                 inner.insert_record(record)?;
             }
         }
@@ -506,6 +502,20 @@ impl LocalJsonlTransactionLog {
         file.sync_data()
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
         Ok(())
+    }
+}
+
+fn map_transaction_log_decode_error(line: usize, err: serde_json::Error) -> EhdbError {
+    let message = err.to_string();
+    if let Some(value) = message.strip_prefix("invalid identifier: ") {
+        let value = value
+            .rsplit_once(" at line ")
+            .map_or(value, |(identifier, _)| identifier);
+        EhdbError::InvalidIdentifier(value.to_string())
+    } else {
+        EhdbError::Storage(format!(
+            "invalid transaction log record at line {line}: {err}"
+        ))
     }
 }
 

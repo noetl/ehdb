@@ -336,6 +336,10 @@ grant requests, table schemas, and column schemas before persisted
 metadata is accepted for replay or catalog operations. Table schemas
 also revalidate column identifiers and reject duplicate column names
 before catalog state is created, including during schema JSON decode.
+Core identifier JSON decode routes through constructor validation,
+preserving the string JSON shape while rejecting malformed tenant,
+namespace, table, transaction, stream, retrieval, and related
+identifiers.
 
 `ehdb-retrieval` now includes a local exact cosine-similarity fixture
 over registered chunk embeddings. `VectorSearch` scopes candidates by
