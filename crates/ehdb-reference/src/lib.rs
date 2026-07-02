@@ -10,8 +10,8 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
-    ColumnSchema, EhdbError, NamespaceName, Result, SnapshotId, TableName, TableSchema, TenantId,
-    TransactionId,
+    ColumnSchema, DataType, EhdbError, NamespaceName, Result, SnapshotId, TableName, TableSchema,
+    TenantId, TransactionId,
 };
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
@@ -646,6 +646,7 @@ fn projection_indices(schema: &Schema, columns: &[String]) -> Result<Vec<usize>>
 
     let mut seen = BTreeSet::new();
     for column in columns {
+        validate_arrow_scan_selector(column)?;
         if !seen.insert(column.as_str()) {
             return Err(EhdbError::InvalidState(format!(
                 "duplicate arrow scan projection column: {column}"
@@ -669,12 +670,17 @@ fn predicate_index(
     schema: &Schema,
     predicate: &ArrowEqualityPredicate,
 ) -> Result<(usize, ArrowScalarValue)> {
+    validate_arrow_scan_selector(&predicate.column)?;
     let index = schema
         .fields()
         .iter()
         .position(|field| field.name() == &predicate.column)
         .ok_or_else(|| EhdbError::NotFound(format!("predicate column {}", predicate.column)))?;
     Ok((index, predicate.value.clone()))
+}
+
+fn validate_arrow_scan_selector(column: &str) -> Result<()> {
+    ColumnSchema::new(column, DataType::Utf8, true).map(|_| ())
 }
 
 fn filter_batch(
@@ -1414,6 +1420,68 @@ mod tests {
 
             assert!(matches!(error, EhdbError::InvalidState(_)));
         }
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_scan_fixture_rejects_invalid_selector_identifiers() {
+        let log_path = temp_log_path("arrow-scan-invalid-selector-identifiers");
+        let object_root = temp_object_root("arrow-scan-invalid-selector-identifiers");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        let projection_error = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    projection: Some(vec!["bad selector".to_string()]),
+                    predicate: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(projection_error, EhdbError::InvalidIdentifier(_)));
+
+        let predicate_error = LocalArrowSnapshotScanner
+            .scan_latest(
+                &runtime,
+                &store,
+                ScanArrowSnapshot {
+                    tenant,
+                    namespace,
+                    table_name,
+                    projection: None,
+                    predicate: Some(ArrowEqualityPredicate {
+                        column: "bad selector".to_string(),
+                        value: ArrowScalarValue::Utf8("exec-1".to_string()),
+                    }),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(predicate_error, EhdbError::InvalidIdentifier(_)));
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();

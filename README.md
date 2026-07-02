@@ -162,15 +162,18 @@ catalog/object boundary for columnar data.
 that boundary. It resolves the latest table snapshot, verifies each
 Arrow IPC object before decoding, and can project named columns in the
 requested order. Empty projection lists and duplicate projection columns
-are rejected before object reads. Predicate pushdown, SQL planning,
-distributed execution, and Arrow Flight remain future service surfaces.
+are rejected before object reads, and projection-column identifiers are
+validated on the direct scanner boundary. Predicate pushdown, SQL
+planning, distributed execution, and Arrow Flight remain future service
+surfaces.
 
 The scanner also supports a first local equality-filter fixture. Filters
 are single-column equality predicates over UTF-8 or Int64 columns,
 applied after verified Arrow IPC decode and before optional projection.
-This is intentionally not predicate pushdown; object statistics,
-partition pruning, SQL planning, distributed execution, and Arrow Flight
-remain future work.
+Predicate-column identifiers are validated before object reads. This is
+intentionally not predicate pushdown; object statistics, partition
+pruning, SQL planning, distributed execution, and Arrow Flight remain
+future work.
 
 `ehdb-service` adds the first service-facing scan boundary. Its local
 adapter wraps `LocalArrowSnapshotScanner` with a typed latest-table scan
