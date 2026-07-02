@@ -101,6 +101,7 @@ impl TableSchema {
         }
         let mut seen = BTreeSet::new();
         for column in &columns {
+            validate_identifier(&column.name)?;
             if !seen.insert(column.name.as_str()) {
                 return Err(EhdbError::InvalidIdentifier(format!(
                     "duplicate table schema column: {}",
@@ -155,6 +156,18 @@ mod tests {
             ColumnSchema::new("id", DataType::Utf8, false).unwrap(),
             ColumnSchema::new("id", DataType::Int64, false).unwrap(),
         ])
+        .unwrap_err();
+
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_preconstructed_table_schema_columns() {
+        let error = TableSchema::new(vec![ColumnSchema {
+            name: "bad column".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+        }])
         .unwrap_err();
 
         assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
