@@ -1,7 +1,8 @@
-use std::sync::Arc;
 use std::{
+    collections::BTreeSet,
     io::Cursor,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -637,6 +638,21 @@ fn arrow_schema_from_table(schema: &TableSchema) -> Arc<Schema> {
 }
 
 fn projection_indices(schema: &Schema, columns: &[String]) -> Result<Vec<usize>> {
+    if columns.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "arrow scan projection must contain at least one column".to_string(),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for column in columns {
+        if !seen.insert(column.as_str()) {
+            return Err(EhdbError::InvalidState(format!(
+                "duplicate arrow scan projection column: {column}"
+            )));
+        }
+    }
+
     columns
         .iter()
         .map(|column| {
@@ -1348,6 +1364,56 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, EhdbError::NotFound(_)));
+
+        fs::remove_file(log_path).unwrap();
+        fs::remove_dir_all(object_root).unwrap();
+    }
+
+    #[test]
+    fn local_arrow_scan_fixture_rejects_invalid_projection_shape() {
+        let log_path = temp_log_path("arrow-scan-invalid-projection-shape");
+        let object_root = temp_object_root("arrow-scan-invalid-projection-shape");
+        let (tenant, namespace) = ids();
+        let table_name = TableName::new("executions").unwrap();
+        let store = LocalObjectStore::new(&object_root);
+        let mut runtime = LocalReferenceRuntime::open(&log_path).unwrap();
+        LocalArrowIpcTableStore
+            .write_batch(
+                &mut runtime,
+                &store,
+                WriteArrowIpcTable {
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    table_name: table_name.clone(),
+                    snapshot_id: SnapshotId::new("snapshot-0001").unwrap(),
+                    create_transaction_id: TransactionId::new("txn-create-table").unwrap(),
+                    snapshot_transaction_id: TransactionId::new("txn-commit-snapshot").unwrap(),
+                    file_name: "part-000.arrow".to_string(),
+                    batch: arrow_batch(),
+                },
+            )
+            .unwrap();
+
+        for projection in [
+            Vec::new(),
+            vec!["execution_id".to_string(), "execution_id".to_string()],
+        ] {
+            let error = LocalArrowSnapshotScanner
+                .scan_latest(
+                    &runtime,
+                    &store,
+                    ScanArrowSnapshot {
+                        tenant: tenant.clone(),
+                        namespace: namespace.clone(),
+                        table_name: table_name.clone(),
+                        projection: Some(projection),
+                        predicate: None,
+                    },
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, EhdbError::InvalidState(_)));
+        }
 
         fs::remove_file(log_path).unwrap();
         fs::remove_dir_all(object_root).unwrap();
