@@ -473,7 +473,15 @@ being silently repaired.
 the replay applier. It previews and applies a transaction to cloned
 reference state before the durable append; if projection fails, the JSONL
 log is not advanced. Reopening the runtime rebuilds the same local
-reference state from replay.
+reference state from replay. The NoETL runtime surface fixture now
+drives catalog, stream, retrieval, system WASM, and storage replica
+metadata only through `LocalReferenceRuntime` appends, then reopens the
+runtime and verifies lookups, stream replay, retrieval search, system
+library resolution, and replica inventory from the event log alone. This
+remains a local worker/playbook-shaped integration fixture; it adds no
+gateway route, gateway direct data access, persistent per-tenant service,
+production IAM, distributed execution, SQL planner, object movement, or
+external dependency replacement behavior.
 
 ## System WASM Libraries
 
