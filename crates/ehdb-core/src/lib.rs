@@ -76,6 +76,96 @@ identifier_type!(DocumentId);
 identifier_type!(ChunkId);
 identifier_type!(EmbeddingModelId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoetlEmbeddedRole {
+    Gateway,
+    Api,
+    Worker,
+    Playbook,
+    System,
+}
+
+impl NoetlEmbeddedRole {
+    pub fn default_capabilities(self) -> BTreeSet<EhdbCapability> {
+        match self {
+            NoetlEmbeddedRole::Gateway | NoetlEmbeddedRole::Api => {
+                BTreeSet::from([EhdbCapability::ControlPlane])
+            }
+            NoetlEmbeddedRole::Worker | NoetlEmbeddedRole::Playbook => {
+                EhdbCapability::worker_data_plane()
+            }
+            NoetlEmbeddedRole::System => EhdbCapability::all_capabilities(),
+        }
+    }
+
+    pub fn allows(self, capability: EhdbCapability) -> bool {
+        self.default_capabilities().contains(&capability)
+    }
+
+    pub fn require(self, capability: EhdbCapability) -> Result<()> {
+        if self.allows(capability) {
+            Ok(())
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "NoETL embedded role {:?} does not allow EHDB capability {:?}",
+                self, capability
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EhdbCapability {
+    ControlPlane,
+    CatalogRead,
+    CatalogWrite,
+    TransactionAppend,
+    StreamAppend,
+    StreamConsume,
+    ObjectRead,
+    ObjectWrite,
+    RetrievalRead,
+    RetrievalWrite,
+    ReplicationPlan,
+    SystemLibraryResolve,
+}
+
+impl EhdbCapability {
+    pub fn is_data_plane(self) -> bool {
+        !matches!(self, EhdbCapability::ControlPlane)
+    }
+
+    pub fn all_capabilities() -> BTreeSet<Self> {
+        BTreeSet::from([
+            EhdbCapability::ControlPlane,
+            EhdbCapability::CatalogRead,
+            EhdbCapability::CatalogWrite,
+            EhdbCapability::TransactionAppend,
+            EhdbCapability::StreamAppend,
+            EhdbCapability::StreamConsume,
+            EhdbCapability::ObjectRead,
+            EhdbCapability::ObjectWrite,
+            EhdbCapability::RetrievalRead,
+            EhdbCapability::RetrievalWrite,
+            EhdbCapability::ReplicationPlan,
+            EhdbCapability::SystemLibraryResolve,
+        ])
+    }
+
+    pub fn data_plane_capabilities() -> BTreeSet<Self> {
+        Self::all_capabilities()
+            .into_iter()
+            .filter(|capability| capability.is_data_plane())
+            .collect()
+    }
+
+    pub fn worker_data_plane() -> BTreeSet<Self> {
+        Self::data_plane_capabilities()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnSchema {
     pub name: String,
@@ -247,5 +337,60 @@ mod tests {
                 "nullable": false
             }));
         assert!(serde_json::from_value::<TableSchema>(schema).is_err());
+    }
+
+    #[test]
+    fn gateway_and_api_embed_only_control_plane_capability() {
+        for role in [NoetlEmbeddedRole::Gateway, NoetlEmbeddedRole::Api] {
+            assert!(role.allows(EhdbCapability::ControlPlane));
+
+            for capability in EhdbCapability::data_plane_capabilities() {
+                assert!(!role.allows(capability));
+                assert!(role.require(capability).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn worker_and_playbook_roles_allow_explicit_data_plane_capabilities() {
+        for role in [NoetlEmbeddedRole::Worker, NoetlEmbeddedRole::Playbook] {
+            assert!(!role.allows(EhdbCapability::ControlPlane));
+
+            for capability in EhdbCapability::data_plane_capabilities() {
+                assert!(
+                    role.allows(capability),
+                    "{role:?} should allow {capability:?}"
+                );
+                role.require(capability).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn system_role_allows_control_and_data_plane_capabilities() {
+        for capability in EhdbCapability::all_capabilities() {
+            assert!(NoetlEmbeddedRole::System.allows(capability));
+            NoetlEmbeddedRole::System.require(capability).unwrap();
+        }
+    }
+
+    #[test]
+    fn embedded_role_and_capability_json_decode_reject_unknown_values() {
+        let role = serde_json::to_value(NoetlEmbeddedRole::Gateway).unwrap();
+        assert_eq!(
+            serde_json::from_value::<NoetlEmbeddedRole>(role).unwrap(),
+            NoetlEmbeddedRole::Gateway
+        );
+        assert!(serde_json::from_value::<NoetlEmbeddedRole>(serde_json::json!("client")).is_err());
+
+        let capability = serde_json::to_value(EhdbCapability::TransactionAppend).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EhdbCapability>(capability).unwrap(),
+            EhdbCapability::TransactionAppend
+        );
+        assert!(
+            serde_json::from_value::<EhdbCapability>(serde_json::json!("gateway_data_read"))
+                .is_err()
+        );
     }
 }
