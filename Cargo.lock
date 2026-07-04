@@ -553,6 +553,7 @@ dependencies = [
  "ehdb-system",
  "ehdb-transaction",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
