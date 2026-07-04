@@ -18,6 +18,7 @@ ehdb-stream.workspace = true
 ehdb-system.workspace = true
 ehdb-transaction.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

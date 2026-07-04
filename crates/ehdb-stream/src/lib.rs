@@ -432,6 +432,24 @@ impl InMemoryStreamLog {
         Ok(consumer_state.clone())
     }
 
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.streams
+            .values()
+            .map(|stream| stream.records.len())
+            .sum()
+    }
+
+    pub fn consumer_count(&self) -> usize {
+        self.streams
+            .values()
+            .map(|stream| stream.consumers.len())
+            .sum()
+    }
+
     fn ensure_stream_absent(&self, config: &StreamConfig) -> Result<()> {
         let key = stream_key(&config.tenant, &config.namespace, &config.name);
         if self.streams.contains_key(&key) {

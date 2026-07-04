@@ -403,6 +403,18 @@ impl InMemoryRetrievalCatalog {
         Ok(hits)
     }
 
+    pub fn document_count(&self) -> usize {
+        self.documents.len()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn embedding_count(&self) -> usize {
+        self.embeddings.len()
+    }
+
     fn document_by_id(&self, document_id: &DocumentId) -> Result<&Document> {
         self.documents
             .values()

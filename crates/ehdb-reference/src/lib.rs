@@ -75,6 +75,59 @@ impl LocalReferenceRuntime {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReferenceSummary {
+    pub log_path: String,
+    pub transaction_count: usize,
+    pub table_count: usize,
+    pub snapshot_count: usize,
+    pub scan_grant_count: usize,
+    pub stream_count: usize,
+    pub stream_record_count: usize,
+    pub stream_consumer_count: usize,
+    pub retrieval_document_count: usize,
+    pub retrieval_chunk_count: usize,
+    pub retrieval_embedding_count: usize,
+    pub system_library_count: usize,
+    pub system_binding_count: usize,
+    pub storage_object_count: usize,
+    pub storage_replica_count: usize,
+}
+
+impl LocalReferenceSummary {
+    pub fn from_runtime(runtime: &LocalReferenceRuntime) -> Self {
+        let state = runtime.state();
+        Self {
+            log_path: runtime.path().display().to_string(),
+            transaction_count: runtime.replay().len(),
+            table_count: state.catalog.table_count(),
+            snapshot_count: state.catalog.snapshot_count(),
+            scan_grant_count: state.catalog.scan_grant_count(),
+            stream_count: state.streams.stream_count(),
+            stream_record_count: state.streams.record_count(),
+            stream_consumer_count: state.streams.consumer_count(),
+            retrieval_document_count: state.retrieval.document_count(),
+            retrieval_chunk_count: state.retrieval.chunk_count(),
+            retrieval_embedding_count: state.retrieval.embedding_count(),
+            system_library_count: state.system.library_count(),
+            system_binding_count: state.system.binding_count(),
+            storage_object_count: state.storage.object_count(),
+            storage_replica_count: state.storage.replica_count(),
+        }
+    }
+}
+
+pub fn summarize_local_reference(path: impl Into<PathBuf>) -> Result<LocalReferenceSummary> {
+    let runtime = LocalReferenceRuntime::open(path)?;
+    Ok(LocalReferenceSummary::from_runtime(&runtime))
+}
+
+pub fn summarize_local_reference_json(path: impl Into<PathBuf>) -> Result<String> {
+    serde_json::to_string(&summarize_local_reference(path)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode local reference summary: {err}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteReplication {
     pub tenant: TenantId,
@@ -1013,6 +1066,148 @@ mod tests {
             .catalog
             .can_scan(&tenant, &namespace, &table_id, &principal));
         assert_eq!(reopened.replay().len(), 3);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_reference_summary_reports_replayed_domain_counts() {
+        let path = temp_log_path("runtime-summary");
+        let (tenant, namespace) = ids();
+        let table_id = TableId::new("tenant-a_system_executions").unwrap();
+        let stream = StreamName::new("execution-events").unwrap();
+        let consumer = ConsumerName::new("materializer").unwrap();
+        let document = DocumentId::new("doc-001").unwrap();
+        let chunk = ChunkId::new("chunk-001").unwrap();
+        let model = EmbeddingModelId::new("embedding-model").unwrap();
+        let library_path = SystemLibraryPath::new("system/catalog/bootstrap").unwrap();
+        let library_revision = SystemLibraryRevision::new(1).unwrap();
+        let library_digest = ModuleDigest::new(format!("sha256:{}1", "d".repeat(63))).unwrap();
+        let mut runtime = LocalReferenceRuntime::open(&path).unwrap();
+
+        runtime.append(create_table_commit("txn-0001")).unwrap();
+        runtime.append(commit_snapshot_commit("txn-0002")).unwrap();
+        runtime
+            .append(grant_scan_commit("txn-0003", "worker-system"))
+            .unwrap();
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-0004").unwrap(),
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations: vec![
+                    Mutation::Stream(StreamMutation::CreateStream {
+                        stream: stream.clone(),
+                        retention: RetentionPolicy::KeepAll,
+                    }),
+                    Mutation::Stream(StreamMutation::CreateConsumer {
+                        stream: stream.clone(),
+                        consumer,
+                    }),
+                    Mutation::Stream(StreamMutation::Publish {
+                        stream,
+                        subject: Subject::new("noetl.execution.completed").unwrap(),
+                        payload: b"{\"execution_id\":\"exec-1\"}".to_vec(),
+                        sequence: 1,
+                    }),
+                ],
+            })
+            .unwrap();
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-0005").unwrap(),
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations: vec![
+                    Mutation::Retrieval(RetrievalMutation::RegisterDocument {
+                        document_id: document.clone(),
+                        source_uri: "artifact://exec-1/result.md".to_string(),
+                        content_type: "text/markdown".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterChunk {
+                        document_id: document.clone(),
+                        chunk_id: chunk.clone(),
+                        ordinal: 0,
+                        text: "EHDB summary helper keeps replay counts visible.".to_string(),
+                        checksum: "sha256-test".to_string(),
+                    }),
+                    Mutation::Retrieval(RetrievalMutation::RegisterEmbedding {
+                        chunk_id: chunk,
+                        model_id: model,
+                        dimensions: 3,
+                        vector: vec![0.1, 0.2, 0.3],
+                    }),
+                ],
+            })
+            .unwrap();
+        runtime
+            .append(CommitTransaction {
+                transaction_id: TransactionId::new("txn-0006").unwrap(),
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations: vec![
+                    Mutation::System(SystemMutation::PublishLibrary {
+                        path: library_path.clone(),
+                        revision: library_revision,
+                        digest: library_digest.clone(),
+                        entry: "run".to_string(),
+                        target: WasmTarget::Wasm32UnknownUnknown,
+                        object_path: ObjectPath::new(
+                            "system-libraries/system/catalog/bootstrap/1/module.wasm",
+                        )
+                        .unwrap(),
+                        byte_len: 512,
+                        capabilities: vec![SystemCapability::EhdbCatalogWrite],
+                    }),
+                    Mutation::System(SystemMutation::BindLibrary {
+                        path: library_path,
+                        environment: EnvironmentName::new("kind").unwrap(),
+                        channel: ReleaseChannel::stable(),
+                        revision: library_revision,
+                        digest: library_digest,
+                    }),
+                    Mutation::Storage(StorageMutation::RegisterReplica {
+                        replica: object_replica(
+                            "tenant-a/system/tables/tenant-a_system_executions/snapshots/snapshot-0001/part-000.arrow",
+                        ),
+                    }),
+                ],
+            })
+            .unwrap();
+        drop(runtime);
+
+        let summary = summarize_local_reference(&path).unwrap();
+        assert_eq!(summary.log_path, path.display().to_string());
+        assert_eq!(summary.transaction_count, 6);
+        assert_eq!(summary.table_count, 1);
+        assert_eq!(summary.snapshot_count, 1);
+        assert_eq!(summary.scan_grant_count, 1);
+        assert_eq!(summary.stream_count, 1);
+        assert_eq!(summary.stream_record_count, 1);
+        assert_eq!(summary.stream_consumer_count, 1);
+        assert_eq!(summary.retrieval_document_count, 1);
+        assert_eq!(summary.retrieval_chunk_count, 1);
+        assert_eq!(summary.retrieval_embedding_count, 1);
+        assert_eq!(summary.system_library_count, 1);
+        assert_eq!(summary.system_binding_count, 1);
+        assert_eq!(summary.storage_object_count, 1);
+        assert_eq!(summary.storage_replica_count, 1);
+
+        let json = summarize_local_reference_json(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["log_path"], path.display().to_string());
+        assert_eq!(value["transaction_count"], 6);
+        assert_eq!(value["storage_replica_count"], 1);
+        assert_eq!(value["retrieval_embedding_count"], 1);
+        assert_eq!(value.as_object().unwrap().len(), 15);
+
+        let reopened = LocalReferenceRuntime::open(&path).unwrap();
+        assert!(reopened.state().catalog.can_scan(
+            &tenant,
+            &namespace,
+            &table_id,
+            &PrincipalId::new("worker-system").unwrap()
+        ));
 
         fs::remove_file(path).unwrap();
     }
