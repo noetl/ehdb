@@ -10,8 +10,8 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
-    ColumnSchema, DataType, EhdbError, NamespaceName, Result, SnapshotId, TableName, TableSchema,
-    TenantId, TransactionId,
+    ColumnSchema, DataType, EhdbError, NamespaceName, Result, SnapshotId, StreamName, TableName,
+    TableSchema, TenantId, TransactionId,
 };
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
@@ -20,7 +20,7 @@ use ehdb_storage::{
     table_snapshot_object_path, ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectRef,
     ObjectReplica, ReplicationAction, ReplicationPlan,
 };
-use ehdb_stream::{InMemoryStreamLog, StreamConfig, StreamSequence};
+use ehdb_stream::{InMemoryStreamLog, RetentionPolicy, StreamConfig, StreamSequence, Subject};
 use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
 use ehdb_transaction::{
     CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
@@ -126,6 +126,233 @@ pub fn summarize_local_reference(path: impl Into<PathBuf>) -> Result<LocalRefere
 pub fn summarize_local_reference_json(path: impl Into<PathBuf>) -> Result<String> {
     serde_json::to_string(&summarize_local_reference(path)?)
         .map_err(|err| EhdbError::InvalidState(format!("encode local reference summary: {err}")))
+}
+
+/// Default tenant for NoETL worker/playbook bounded domain-record operations.
+pub const DEFAULT_LOCAL_REFERENCE_TENANT: &str = "noetl";
+/// Default namespace for NoETL worker/playbook bounded domain-record operations.
+pub const DEFAULT_LOCAL_REFERENCE_NAMESPACE: &str = "default";
+
+/// Bounded append request for a single NoETL domain record.
+///
+/// A "domain record" is a UTF-8 text payload published to a named local
+/// reference stream under a subject.  The operation is bounded (one commit,
+/// one payload) and stateless (the runtime is opened, appended, and dropped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendDomainRecordRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub subject: String,
+    pub transaction_id: String,
+    pub payload: String,
+}
+
+/// Secret-free result of appending a single domain record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppendDomainRecordOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub subject: String,
+    pub sequence: u64,
+    pub byte_len: usize,
+    pub created_stream: bool,
+    pub stream_record_count: usize,
+    pub transaction_count: usize,
+}
+
+/// Bounded read request for domain records on a single stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadDomainRecordsRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub after: Option<u64>,
+    pub limit: usize,
+}
+
+/// One replayed domain record projected for a bounded read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainRecordView {
+    pub sequence: u64,
+    pub subject: String,
+    pub transaction_id: String,
+    pub byte_len: usize,
+    pub payload: String,
+}
+
+/// Secret-free result of a bounded domain-record read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDomainRecordsOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub exists: bool,
+    pub record_count: usize,
+    pub returned: usize,
+    pub records: Vec<DomainRecordView>,
+}
+
+/// Append one bounded domain record to a local reference stream.
+///
+/// The stream is created on first use with `KeepAll` retention, then the
+/// payload is published under the given subject.  The operation is a single
+/// atomic commit; on any validation failure nothing is written.
+pub fn append_local_reference_domain_record(
+    request: AppendDomainRecordRequest,
+) -> Result<AppendDomainRecordOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let stream = StreamName::new(request.stream.clone())?;
+    let subject = Subject::new(request.subject.clone())?;
+    let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+    let payload = request.payload.into_bytes();
+    let byte_len = payload.len();
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+
+    // Determine stream existence + next sequence from replayed state.  A
+    // missing stream replays as an error; that is the create-on-first-use
+    // signal, not a failure.
+    let (created_stream, next_sequence) = match runtime
+        .state()
+        .streams
+        .replay(&tenant, &namespace, &stream, None)
+    {
+        Ok(records) => (false, records.len() as u64 + 1),
+        Err(_) => (true, StreamSequence::first().value()),
+    };
+
+    let mut mutations = Vec::with_capacity(2);
+    if created_stream {
+        mutations.push(Mutation::Stream(StreamMutation::CreateStream {
+            stream: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        }));
+    }
+    mutations.push(Mutation::Stream(StreamMutation::Publish {
+        stream: stream.clone(),
+        subject: subject.clone(),
+        payload,
+        sequence: next_sequence,
+    }));
+
+    runtime.append(CommitTransaction {
+        transaction_id,
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        mutations,
+    })?;
+
+    let stream_record_count = runtime
+        .state()
+        .streams
+        .replay(&tenant, &namespace, &stream, None)
+        .map(|records| records.len())
+        .unwrap_or(0);
+
+    Ok(AppendDomainRecordOutcome {
+        action: "append".to_string(),
+        log_path: runtime.path().display().to_string(),
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        stream: stream.to_string(),
+        subject: subject.as_str().to_string(),
+        sequence: next_sequence,
+        byte_len,
+        created_stream,
+        stream_record_count,
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Read up to `limit` bounded domain records from a local reference stream.
+///
+/// A missing stream is reported as `exists: false` with an empty record set
+/// rather than an error, so a reader can probe a stream that has never been
+/// written.  Payloads are decoded as UTF-8 (lossily) for the projection.
+pub fn read_local_reference_domain_records(
+    request: ReadDomainRecordsRequest,
+) -> Result<ReadDomainRecordsOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let stream = StreamName::new(request.stream.clone())?;
+    let after = match request.after {
+        Some(value) => Some(StreamSequence::new(value)?),
+        None => None,
+    };
+
+    let runtime = LocalReferenceRuntime::open(&request.log_path)?;
+    let log_path = runtime.path().display().to_string();
+
+    match runtime
+        .state()
+        .streams
+        .replay(&tenant, &namespace, &stream, after)
+    {
+        Ok(records) => {
+            let record_count = records.len();
+            let projected: Vec<DomainRecordView> = records
+                .into_iter()
+                .take(request.limit)
+                .map(|record| DomainRecordView {
+                    sequence: record.sequence.value(),
+                    subject: record.subject.as_str().to_string(),
+                    transaction_id: record.transaction_id.to_string(),
+                    byte_len: record.payload.len(),
+                    payload: String::from_utf8_lossy(&record.payload).into_owned(),
+                })
+                .collect();
+            Ok(ReadDomainRecordsOutcome {
+                action: "read".to_string(),
+                log_path,
+                tenant: tenant.to_string(),
+                namespace: namespace.to_string(),
+                stream: stream.to_string(),
+                exists: true,
+                record_count,
+                returned: projected.len(),
+                records: projected,
+            })
+        }
+        Err(_) => Ok(ReadDomainRecordsOutcome {
+            action: "read".to_string(),
+            log_path,
+            tenant: tenant.to_string(),
+            namespace: namespace.to_string(),
+            stream: stream.to_string(),
+            exists: false,
+            record_count: 0,
+            returned: 0,
+            records: Vec::new(),
+        }),
+    }
+}
+
+/// Append one domain record and return the outcome as a JSON string.
+pub fn append_local_reference_domain_record_json(
+    request: AppendDomainRecordRequest,
+) -> Result<String> {
+    serde_json::to_string(&append_local_reference_domain_record(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode append outcome: {err}")))
+}
+
+/// Read domain records and return the outcome as a JSON string.
+pub fn read_local_reference_domain_records_json(
+    request: ReadDomainRecordsRequest,
+) -> Result<String> {
+    serde_json::to_string(&read_local_reference_domain_records(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode read outcome: {err}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2149,5 +2376,174 @@ mod tests {
         let error = reference.apply_record(&record).unwrap_err();
 
         assert!(matches!(error, EhdbError::InvalidState(_)));
+    }
+
+    fn append_request(
+        path: &std::path::Path,
+        stream: &str,
+        subject: &str,
+        transaction_id: &str,
+        payload: &str,
+    ) -> AppendDomainRecordRequest {
+        AppendDomainRecordRequest {
+            log_path: path.to_path_buf(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: stream.to_string(),
+            subject: subject.to_string(),
+            transaction_id: transaction_id.to_string(),
+            payload: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn append_domain_record_creates_stream_then_appends_and_reads_back() {
+        let path = temp_log_path("domain-append-read");
+
+        let first = append_local_reference_domain_record(append_request(
+            &path,
+            "muno-itinerary",
+            "muno.itinerary.created",
+            "txn-c-0001",
+            "{\"trip\":\"paris\"}",
+        ))
+        .unwrap();
+        assert!(first.created_stream);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.stream_record_count, 1);
+        assert_eq!(first.byte_len, "{\"trip\":\"paris\"}".len());
+
+        let second = append_local_reference_domain_record(append_request(
+            &path,
+            "muno-itinerary",
+            "muno.itinerary.updated",
+            "txn-c-0002",
+            "{\"trip\":\"rome\"}",
+        ))
+        .unwrap();
+        assert!(!second.created_stream);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.stream_record_count, 2);
+        assert_eq!(second.transaction_count, 2);
+
+        let read = read_local_reference_domain_records(ReadDomainRecordsRequest {
+            log_path: path.clone(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: "muno-itinerary".to_string(),
+            after: None,
+            limit: 100,
+        })
+        .unwrap();
+        assert!(read.exists);
+        assert_eq!(read.record_count, 2);
+        assert_eq!(read.returned, 2);
+        assert_eq!(read.records[0].sequence, 1);
+        assert_eq!(read.records[0].payload, "{\"trip\":\"paris\"}");
+        assert_eq!(read.records[1].subject, "muno.itinerary.updated");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn append_domain_record_survives_reopen() {
+        let path = temp_log_path("domain-reopen");
+        append_local_reference_domain_record(append_request(
+            &path,
+            "orders",
+            "orders.placed",
+            "txn-r-0001",
+            "one",
+        ))
+        .unwrap();
+        // A second call reopens the log from scratch (stateless), proving the
+        // record is durable across independent bounded invocations.
+        let outcome = append_local_reference_domain_record(append_request(
+            &path,
+            "orders",
+            "orders.placed",
+            "txn-r-0002",
+            "two",
+        ))
+        .unwrap();
+        assert_eq!(outcome.sequence, 2);
+        assert_eq!(outcome.transaction_count, 2);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_missing_stream_reports_absent_without_error() {
+        let path = temp_log_path("domain-missing");
+        let read = read_local_reference_domain_records(ReadDomainRecordsRequest {
+            log_path: path.clone(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: "never-written".to_string(),
+            after: None,
+            limit: 10,
+        })
+        .unwrap();
+        assert!(!read.exists);
+        assert_eq!(read.record_count, 0);
+        assert!(read.records.is_empty());
+        // Probing a missing stream must not create the log file.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_honors_limit_and_after_cursor() {
+        let path = temp_log_path("domain-cursor");
+        for index in 1..=5 {
+            append_local_reference_domain_record(append_request(
+                &path,
+                "events",
+                "events.tick",
+                &format!("txn-cursor-{index:04}"),
+                &format!("payload-{index}"),
+            ))
+            .unwrap();
+        }
+
+        let limited = read_local_reference_domain_records(ReadDomainRecordsRequest {
+            log_path: path.clone(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: "events".to_string(),
+            after: None,
+            limit: 2,
+        })
+        .unwrap();
+        assert_eq!(limited.record_count, 5);
+        assert_eq!(limited.returned, 2);
+        assert_eq!(limited.records[0].sequence, 1);
+
+        let after = read_local_reference_domain_records(ReadDomainRecordsRequest {
+            log_path: path.clone(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: "events".to_string(),
+            after: Some(3),
+            limit: 100,
+        })
+        .unwrap();
+        assert_eq!(after.record_count, 2);
+        assert_eq!(after.records[0].sequence, 4);
+        assert_eq!(after.records[1].sequence, 5);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn append_rejects_invalid_identifiers() {
+        let path = temp_log_path("domain-invalid");
+        let error = append_local_reference_domain_record(append_request(
+            &path,
+            "bad stream name",
+            "orders.placed",
+            "txn-x-0001",
+            "payload",
+        ))
+        .unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
     }
 }
