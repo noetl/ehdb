@@ -34,6 +34,18 @@ use ehdb_transaction::{
 };
 use serde::{Deserialize, Serialize};
 
+/// EHDB event-log core engine (completion program Phase 6) — the durable
+/// persistence + ordering + serving layer for NoETL's append-only event log,
+/// exposed behind a driver interface.  See [`eventlog`].
+pub mod eventlog;
+pub use eventlog::{
+    compare_shadow_parity, EventLogAckOutcome, EventLogAckRequest, EventLogAppendOutcome,
+    EventLogAppendRequest, EventLogDriver, EventLogParityReport, EventLogReadExecutionOutcome,
+    EventLogReadExecutionRequest, EventLogRecordView, EventLogScanOutcome, EventLogScanRequest,
+    EventLogTailOutcome, EventLogTailRequest, LocalReferenceEventLogDriver, EVENT_LOG_STREAM,
+    EVENT_LOG_SUBJECT_PREFIX,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
     pub catalog: InMemoryCatalog,

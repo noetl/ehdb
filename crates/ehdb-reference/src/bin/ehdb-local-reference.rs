@@ -1,14 +1,18 @@
 use std::{collections::HashMap, env, path::PathBuf, process};
 
+use ehdb_core::EhdbError;
 use ehdb_reference::{
     ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
-    bind_local_reference_system_channel_json, consume_local_reference_event_records_json,
-    ingest_local_reference_retrieval_document_json, publish_local_reference_system_module_json,
-    read_local_reference_domain_records_json, resolve_local_reference_system_module_json,
-    retrieve_local_reference_context, summarize_local_reference_json, AckEventConsumerRequest,
-    AppendDomainRecordRequest, BindSystemChannelRequest, ConsumeEventRecordsRequest,
-    IngestChunkInput, IngestRetrievalDocumentRequest, PublishSystemModuleRequest,
-    ReadDomainRecordsRequest, ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
+    bind_local_reference_system_channel_json, compare_shadow_parity,
+    consume_local_reference_event_records_json, ingest_local_reference_retrieval_document_json,
+    publish_local_reference_system_module_json, read_local_reference_domain_records_json,
+    resolve_local_reference_system_module_json, retrieve_local_reference_context,
+    summarize_local_reference_json, AckEventConsumerRequest, AppendDomainRecordRequest,
+    BindSystemChannelRequest, ConsumeEventRecordsRequest, EventLogAckRequest,
+    EventLogAppendRequest, EventLogDriver, EventLogReadExecutionRequest, EventLogScanRequest,
+    EventLogTailRequest, IngestChunkInput, IngestRetrievalDocumentRequest,
+    LocalReferenceEventLogDriver, PublishSystemModuleRequest, ReadDomainRecordsRequest,
+    ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
     DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
@@ -45,8 +49,244 @@ fn run(args: Vec<String>) -> Result<(String, i32), String> {
         Some((command, rest)) if command == "resolve-system" => run_resolve_system(rest).map(ok0),
         Some((command, rest)) if command == "ingest-doc" => run_ingest(rest).map(ok0),
         Some((command, rest)) if command == "retrieve" => run_retrieve(rest),
+        Some((command, rest)) if command == "eventlog-append" => run_eventlog_append(rest),
+        Some((command, rest)) if command == "eventlog-scan" => run_eventlog_scan(rest),
+        Some((command, rest)) if command == "eventlog-read-exec" => run_eventlog_read_exec(rest),
+        Some((command, rest)) if command == "eventlog-tail" => run_eventlog_tail(rest),
+        Some((command, rest)) if command == "eventlog-ack" => run_eventlog_ack(rest),
+        Some((command, rest)) if command == "eventlog-suite" => run_eventlog_suite(rest),
         _ => Err(usage().to_string()),
     }
+}
+
+/// Classify an engine error into the selfcheck exit-code contract:
+/// 3 = rejected (bound/state), 4 = invalid (bad identifier), 5 = unavailable.
+fn eventlog_exit_code(err: &EhdbError) -> i32 {
+    match err {
+        EhdbError::InvalidIdentifier(_) => 4,
+        EhdbError::InvalidState(_) => 3,
+        _ => 5,
+    }
+}
+
+/// Build the event-log driver from the shared `--log` / `--tenant` / `--namespace`
+/// flags (defaults match the rest of the local-reference verbs).
+fn eventlog_driver(
+    flags: &mut HashMap<String, String>,
+) -> Result<LocalReferenceEventLogDriver, String> {
+    let log = take_required(flags, "log")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    Ok(LocalReferenceEventLogDriver::new(
+        PathBuf::from(log),
+        tenant,
+        namespace,
+    ))
+}
+
+fn run_eventlog_append(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    let execution_id = take_required(&mut flags, "execution-id")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let payload = take_required(&mut flags, "payload")?;
+    ensure_no_unknown_flags(&flags)?;
+    match driver.append(&EventLogAppendRequest {
+        execution_id,
+        transaction_id,
+        payload,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_eventlog_scan(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    let limit = parse_limit(&mut flags, 100)?;
+    let after = parse_after(&mut flags)?;
+    ensure_no_unknown_flags(&flags)?;
+    match driver.scan_global(&EventLogScanRequest { after, limit }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_eventlog_read_exec(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    let execution_id = take_required(&mut flags, "execution-id")?;
+    let limit = parse_limit(&mut flags, 100)?;
+    let after = parse_after(&mut flags)?;
+    ensure_no_unknown_flags(&flags)?;
+    match driver.read_execution(&EventLogReadExecutionRequest {
+        execution_id,
+        after,
+        limit,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_eventlog_tail(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    let consumer = take_required(&mut flags, "consumer")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let limit = parse_limit(&mut flags, 100)?;
+    ensure_no_unknown_flags(&flags)?;
+    match driver.tail(&EventLogTailRequest {
+        consumer,
+        transaction_id,
+        limit,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_eventlog_ack(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    let consumer = take_required(&mut flags, "consumer")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let sequence = take_required(&mut flags, "sequence")?
+        .parse::<u64>()
+        .map_err(|_| "invalid --sequence value".to_string())?;
+    ensure_no_unknown_flags(&flags)?;
+    match driver.ack(&EventLogAckRequest {
+        consumer,
+        transaction_id,
+        sequence,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// Deterministic one-process drive of the whole engine surface:
+/// append(exec A)×2 → append(exec B) → scan(global order) → read-exec(A scoped)
+/// → tail(create+pending) → ack → tail(cursor advanced) → shadow-parity check.
+/// Exit 0 only when every expected outcome AND the parity report hold.
+fn run_eventlog_suite(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let driver = eventlog_driver(&mut flags)?;
+    ensure_no_unknown_flags(&flags)?;
+
+    let mut steps = Vec::new();
+    let mut ok = true;
+
+    // Append two events for exec 100 and one for exec 200 (global seq 1,2,3).
+    let mut prev_seq = 0u64;
+    let mut mirrored = 0usize;
+    let mut parity_ok = true;
+    for (exec, auth_seq) in [("100", 1u64), ("100", 2), ("200", 3)] {
+        let a = driver
+            .append(&EventLogAppendRequest {
+                execution_id: exec.to_string(),
+                transaction_id: format!("suite-{exec}-{auth_seq}"),
+                payload: format!("{{\"exec\":\"{exec}\",\"seq\":{auth_seq}}}"),
+            })
+            .map_err(|err| err.to_string())?;
+        mirrored += 1;
+        let report = compare_shadow_parity(Some(auth_seq), &a, prev_seq, mirrored);
+        parity_ok &= report.holds();
+        prev_seq = a.global_sequence;
+        steps.push(serde_json::json!({
+            "step": "append", "execution_id": exec,
+            "global_sequence": a.global_sequence, "parity_holds": report.holds(),
+        }));
+    }
+    ok &= parity_ok;
+
+    let scan = driver
+        .scan_global(&EventLogScanRequest {
+            after: None,
+            limit: 100,
+        })
+        .map_err(|err| err.to_string())?;
+    let global_order: Vec<u64> = scan.records.iter().map(|r| r.global_sequence).collect();
+    ok &= global_order == vec![1, 2, 3];
+    steps.push(serde_json::json!({"step": "scan_global", "order": global_order}));
+
+    let ex = driver
+        .read_execution(&EventLogReadExecutionRequest {
+            execution_id: "100".to_string(),
+            after: None,
+            limit: 100,
+        })
+        .map_err(|err| err.to_string())?;
+    // Exec 100 scoped read returns its two events (global seq 1 and 2).
+    ok &= ex.returned == 2 && ex.records.iter().all(|r| r.execution_id == "100");
+    steps.push(serde_json::json!({"step": "read_execution", "returned": ex.returned}));
+
+    let t1 = driver
+        .tail(&EventLogTailRequest {
+            consumer: "suite-projector".to_string(),
+            transaction_id: "suite-c1".to_string(),
+            limit: 100,
+        })
+        .map_err(|err| err.to_string())?;
+    ok &= t1.created_consumer && t1.pending_count == 3;
+    steps.push(serde_json::json!({"step": "tail_initial", "pending": t1.pending_count}));
+
+    driver
+        .ack(&EventLogAckRequest {
+            consumer: "suite-projector".to_string(),
+            transaction_id: "suite-ack1".to_string(),
+            sequence: 1,
+        })
+        .map_err(|err| err.to_string())?;
+
+    let t2 = driver
+        .tail(&EventLogTailRequest {
+            consumer: "suite-projector".to_string(),
+            transaction_id: "suite-c2".to_string(),
+            limit: 100,
+        })
+        .map_err(|err| err.to_string())?;
+    ok &= t2.pending_count == 2 && t2.acked_sequence == Some(1);
+    steps.push(serde_json::json!({"step": "tail_after_ack", "pending": t2.pending_count}));
+
+    let report = serde_json::json!({
+        "suite": "ehdb-eventlog", "driver": driver.driver_name(),
+        "ok": ok, "parity_ok": parity_ok, "steps": steps,
+    });
+    let output = serde_json::to_string(&report).map_err(|err| err.to_string())?;
+    Ok((output, if ok { 0 } else { 1 }))
+}
+
+fn parse_limit(flags: &mut HashMap<String, String>, default: usize) -> Result<usize, String> {
+    match flags.remove("limit") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --limit value: {raw}")),
+        None => Ok(default),
+    }
+}
+
+fn parse_after(flags: &mut HashMap<String, String>) -> Result<Option<u64>, String> {
+    match flags.remove("after") {
+        Some(raw) => Ok(Some(
+            raw.parse::<u64>()
+                .map_err(|_| format!("invalid --after value: {raw}"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|err| err.to_string())
+}
+
+fn json_error(err: &EhdbError) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({"error": err.to_string()})).map_err(|e| e.to_string())
 }
 
 /// Wrap an always-exit-0 verb output as `(output, code)`.
@@ -441,5 +681,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]"
 }
