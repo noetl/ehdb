@@ -70,6 +70,19 @@ pub use kv::{
     KV_SUBJECT_PREFIX, MAX_KV_SCAN_LIMIT, MAX_KV_VALUE_BYTES,
 };
 
+/// EHDB object / blob core engine (completion program Phase 8, slice 2) — the
+/// durable content-addressed object engine underneath NoETL's internal external
+/// object-store platform-artifact tier (state shards + result tier), exposed
+/// behind a driver interface.  See [`object`].
+pub mod object;
+pub use object::{
+    compare_object_parity, AuthoritativeObject, LocalReferenceObjectBlobDriver, ObjectBlobDriver,
+    ObjectDeleteOutcome, ObjectDeleteRequest, ObjectEntryView, ObjectGetOutcome, ObjectGetRequest,
+    ObjectListOutcome, ObjectListRequest, ObjectLocateOutcome, ObjectLocateRequest,
+    ObjectParityReport, ObjectPutOutcome, ObjectPutRequest, MAX_OBJECT_BYTES,
+    MAX_OBJECT_LIST_LIMIT, OBJECT_CONTENT_PREFIX, OBJECT_STORE_STREAM, OBJECT_SUBJECT_PREFIX,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
     pub catalog: InMemoryCatalog,
