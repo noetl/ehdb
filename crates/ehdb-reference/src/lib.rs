@@ -46,6 +46,19 @@ pub use eventlog::{
     EVENT_LOG_SUBJECT_PREFIX,
 };
 
+/// EHDB projection / read-model core engine (completion program Phase 7) — builds
+/// + serves the materialized read-models off the Phase-6 event-log tail, exposed
+/// behind a driver interface, retiring the PostgreSQL materializer.  See
+/// [`projection`].
+pub mod projection;
+pub use projection::{
+    compare_projection_parity, AuthoritativeExecutionState, EventReadModelView, ExecutionStateView,
+    LocalReferenceProjectionEngine, ProjectionApplyOutcome, ProjectionApplyRequest,
+    ProjectionCheckpoint, ProjectionDriver, ProjectionEventInput, ProjectionListExecutionsOutcome,
+    ProjectionParityReport, ProjectionReadEventOutcome, ProjectionReadExecutionOutcome,
+    PROJECTION_STREAM, PROJECTION_SUBJECT_PREFIX,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
     pub catalog: InMemoryCatalog,
