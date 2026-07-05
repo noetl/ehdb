@@ -17,11 +17,15 @@ use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
 };
 use ehdb_storage::{
-    table_snapshot_object_path, ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectRef,
-    ObjectReplica, ReplicationAction, ReplicationPlan,
+    table_snapshot_object_path, ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectPath,
+    ObjectRef, ObjectReplica, ReplicationAction, ReplicationPlan,
 };
 use ehdb_stream::{InMemoryStreamLog, RetentionPolicy, StreamConfig, StreamSequence, Subject};
-use ehdb_system::{BindSystemLibrary, InMemorySystemLibraryCatalog, PublishSystemLibrary};
+use ehdb_system::{
+    BindSystemLibrary, EnvironmentName, InMemorySystemLibraryCatalog, ModuleDigest,
+    PublishSystemLibrary, ReleaseChannel, ResolveSystemLibrary, SystemCapability,
+    SystemLibraryPath, SystemLibraryRevision, WasmTarget,
+};
 use ehdb_transaction::{
     CatalogMutation, CommitTransaction, LocalJsonlTransactionLog, Mutation, RetrievalMutation,
     StorageMutation, StreamMutation, SystemMutation, TransactionRecord,
@@ -600,6 +604,377 @@ pub fn consume_local_reference_event_records_json(
 pub fn ack_local_reference_event_consumer_json(request: AckEventConsumerRequest) -> Result<String> {
     serde_json::to_string(&ack_local_reference_event_consumer(request)?)
         .map_err(|err| EhdbError::InvalidState(format!("encode ack outcome: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// System WASM library store integration path (NoETL integration Phase E).
+//
+// EHDB owns the durable catalog side of NoETL's system WASM library model:
+// immutable module manifests (path/revision/digest/entry/target/object/caps)
+// and mutable environment/channel bindings that resolve a logical library to a
+// concrete module for a tenant/namespace/environment/channel.  WASM *execution*
+// stays in the worker/system-pool host; these bounded helpers only publish a
+// manifest, (re)bind a channel, and resolve the active module ref that host
+// then loads.  Each op is one atomic transaction-log commit (publish/bind) or a
+// read-only replay (resolve), opened + dropped per call, so the runtime is
+// bounded and stateless — the same discipline as the Phase C/D helpers.
+//
+// Rebinding a channel to a new revision/digest hot-replaces the active module
+// while every previously-published immutable manifest is retained, so a
+// resolve after a rebind returns the new module and the old manifests stay
+// addressable in the log.
+
+/// Parse a NoETL-style WASM target token (`wasm32-unknown-unknown` /
+/// `wasm32-wasi-preview1`) into a [`WasmTarget`].
+fn parse_wasm_target(raw: &str) -> Result<WasmTarget> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "wasm32-unknown-unknown" | "wasm32_unknown_unknown" => Ok(WasmTarget::Wasm32UnknownUnknown),
+        "wasm32-wasi-preview1" | "wasm32_wasi_preview1" => Ok(WasmTarget::Wasm32WasiPreview1),
+        other => Err(EhdbError::InvalidState(format!(
+            "unsupported system library wasm target: {other}"
+        ))),
+    }
+}
+
+/// Parse a NoETL-style host-capability token into a [`SystemCapability`].
+fn parse_system_capability(raw: &str) -> Result<SystemCapability> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "event_publish" => Ok(SystemCapability::EventPublish),
+        "object_put" => Ok(SystemCapability::ObjectPut),
+        "result_put" => Ok(SystemCapability::ResultPut),
+        "ehdb_catalog_read" => Ok(SystemCapability::EhdbCatalogRead),
+        "ehdb_catalog_write" => Ok(SystemCapability::EhdbCatalogWrite),
+        "ehdb_stream_publish" => Ok(SystemCapability::EhdbStreamPublish),
+        "ehdb_retrieval_write" => Ok(SystemCapability::EhdbRetrievalWrite),
+        other => Err(EhdbError::InvalidState(format!(
+            "unsupported system library host capability: {other}"
+        ))),
+    }
+}
+
+fn wasm_target_str(target: &WasmTarget) -> &'static str {
+    match target {
+        WasmTarget::Wasm32UnknownUnknown => "wasm32-unknown-unknown",
+        WasmTarget::Wasm32WasiPreview1 => "wasm32-wasi-preview1",
+    }
+}
+
+fn system_capability_str(capability: &SystemCapability) -> &'static str {
+    match capability {
+        SystemCapability::EventPublish => "event_publish",
+        SystemCapability::ObjectPut => "object_put",
+        SystemCapability::ResultPut => "result_put",
+        SystemCapability::EhdbCatalogRead => "ehdb_catalog_read",
+        SystemCapability::EhdbCatalogWrite => "ehdb_catalog_write",
+        SystemCapability::EhdbStreamPublish => "ehdb_stream_publish",
+        SystemCapability::EhdbRetrievalWrite => "ehdb_retrieval_write",
+    }
+}
+
+/// Bounded request to publish one immutable system WASM library manifest.
+///
+/// String/scalar fields are validated + parsed inside the helper (the caller —
+/// worker-rust — stays decoupled from the `ehdb_system` typed identifiers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishSystemModuleRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub path: String,
+    pub revision: u32,
+    pub digest: String,
+    pub entry: String,
+    pub target: String,
+    pub object_path: String,
+    pub byte_len: u64,
+    pub capabilities: Vec<String>,
+    pub transaction_id: String,
+}
+
+/// Secret-free result of publishing a system WASM library manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishSystemModuleOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub path: String,
+    pub revision: u32,
+    pub digest: String,
+    pub entry: String,
+    pub target: String,
+    pub byte_len: u64,
+    pub capabilities: Vec<String>,
+    pub library_count: usize,
+    pub transaction_count: usize,
+}
+
+/// Bounded request to bind a release channel to a published module revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindSystemChannelRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub environment: String,
+    pub channel: String,
+    pub path: String,
+    pub revision: u32,
+    pub digest: String,
+    pub transaction_id: String,
+}
+
+/// Secret-free result of binding a release channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindSystemChannelOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub environment: String,
+    pub channel: String,
+    pub path: String,
+    pub revision: u32,
+    pub digest: String,
+    pub binding_count: usize,
+    pub transaction_count: usize,
+}
+
+/// Bounded request to resolve the active module for a channel binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveSystemModuleRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub environment: String,
+    pub channel: String,
+    pub path: String,
+}
+
+/// Secret-free result of resolving the active module for a channel binding.
+///
+/// A never-bound (or unpublished) channel resolves to `exists: false` with an
+/// empty module ref rather than an error, mirroring the read/consume "absent
+/// probe" contract so a caller can safely probe a channel it has not bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveSystemModuleOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub environment: String,
+    pub channel: String,
+    pub path: String,
+    pub exists: bool,
+    pub revision: Option<u32>,
+    pub digest: Option<String>,
+    pub entry: Option<String>,
+    pub target: Option<String>,
+    pub object_path: Option<String>,
+    pub byte_len: Option<u64>,
+    pub capabilities: Vec<String>,
+}
+
+/// Publish one immutable system WASM library manifest as a single atomic
+/// transaction-log commit.  On any validation failure nothing is written.
+/// Re-publishing an identical (path, revision, digest) is rejected by the
+/// engine (`AlreadyExists`) — manifests are immutable.
+pub fn publish_local_reference_system_module(
+    request: PublishSystemModuleRequest,
+) -> Result<PublishSystemModuleOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let path = SystemLibraryPath::new(request.path.clone())?;
+    let revision = SystemLibraryRevision::new(request.revision)?;
+    let digest = ModuleDigest::new(request.digest.clone())?;
+    let target = parse_wasm_target(&request.target)?;
+    let object_path = ObjectPath::new(request.object_path.clone())?;
+    let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+    let capabilities = request
+        .capabilities
+        .iter()
+        .map(|c| parse_system_capability(c))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+
+    runtime.append(CommitTransaction {
+        transaction_id,
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        mutations: vec![Mutation::System(SystemMutation::PublishLibrary {
+            path: path.clone(),
+            revision,
+            digest: digest.clone(),
+            entry: request.entry.clone(),
+            target: target.clone(),
+            object_path,
+            byte_len: request.byte_len,
+            capabilities: capabilities.clone(),
+        })],
+    })?;
+
+    Ok(PublishSystemModuleOutcome {
+        action: "publish".to_string(),
+        log_path: runtime.path().display().to_string(),
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        path: path.as_str().to_string(),
+        revision: revision.value(),
+        digest: digest.as_str().to_string(),
+        entry: request.entry,
+        target: wasm_target_str(&target).to_string(),
+        byte_len: request.byte_len,
+        capabilities: capabilities
+            .iter()
+            .map(|c| system_capability_str(c).to_string())
+            .collect(),
+        library_count: runtime.state().system.library_count(),
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Bind (or hot-rebind) a release channel to a published module revision as a
+/// single atomic transaction-log commit.  The target revision/digest must
+/// already be published (`NotFound` otherwise).  Rebinding an existing channel
+/// replaces the active module while every prior immutable manifest is retained.
+pub fn bind_local_reference_system_channel(
+    request: BindSystemChannelRequest,
+) -> Result<BindSystemChannelOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let environment = EnvironmentName::new(request.environment.clone())?;
+    let channel = ReleaseChannel::new(request.channel.clone())?;
+    let path = SystemLibraryPath::new(request.path.clone())?;
+    let revision = SystemLibraryRevision::new(request.revision)?;
+    let digest = ModuleDigest::new(request.digest.clone())?;
+    let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+
+    // tenant/namespace ride the enclosing CommitTransaction (see apply_system).
+    runtime.append(CommitTransaction {
+        transaction_id,
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        mutations: vec![Mutation::System(SystemMutation::BindLibrary {
+            path: path.clone(),
+            environment: environment.clone(),
+            channel: channel.clone(),
+            revision,
+            digest: digest.clone(),
+        })],
+    })?;
+
+    Ok(BindSystemChannelOutcome {
+        action: "bind".to_string(),
+        log_path: runtime.path().display().to_string(),
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        environment: environment.as_str().to_string(),
+        channel: channel.as_str().to_string(),
+        path: path.as_str().to_string(),
+        revision: revision.value(),
+        digest: digest.as_str().to_string(),
+        binding_count: runtime.state().system.binding_count(),
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Resolve the active module a channel binding points at (read-only replay).
+///
+/// A never-bound channel resolves to `exists: false` rather than an error, so a
+/// caller can probe a channel it has not bound.  Any other error propagates.
+pub fn resolve_local_reference_system_module(
+    request: ResolveSystemModuleRequest,
+) -> Result<ResolveSystemModuleOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let environment = EnvironmentName::new(request.environment.clone())?;
+    let channel = ReleaseChannel::new(request.channel.clone())?;
+    let path = SystemLibraryPath::new(request.path.clone())?;
+
+    let runtime = LocalReferenceRuntime::open(&request.log_path)?;
+    let log_path = runtime.path().display().to_string();
+
+    let absent = |log_path: String| ResolveSystemModuleOutcome {
+        action: "resolve".to_string(),
+        log_path,
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        environment: environment.as_str().to_string(),
+        channel: channel.as_str().to_string(),
+        path: path.as_str().to_string(),
+        exists: false,
+        revision: None,
+        digest: None,
+        entry: None,
+        target: None,
+        object_path: None,
+        byte_len: None,
+        capabilities: Vec::new(),
+    };
+
+    match runtime.state().system.resolve(ResolveSystemLibrary {
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        environment: environment.clone(),
+        channel: channel.clone(),
+        path: path.clone(),
+    }) {
+        Ok(library) => Ok(ResolveSystemModuleOutcome {
+            action: "resolve".to_string(),
+            log_path,
+            tenant: tenant.to_string(),
+            namespace: namespace.to_string(),
+            environment: environment.as_str().to_string(),
+            channel: channel.as_str().to_string(),
+            path: library.path.as_str().to_string(),
+            exists: true,
+            revision: Some(library.revision.value()),
+            digest: Some(library.digest.as_str().to_string()),
+            entry: Some(library.entry.clone()),
+            target: Some(wasm_target_str(&library.target).to_string()),
+            object_path: Some(library.object_path.as_str().to_string()),
+            byte_len: Some(library.byte_len),
+            capabilities: library
+                .capabilities
+                .iter()
+                .map(|c| system_capability_str(c).to_string())
+                .collect(),
+        }),
+        // An unbound channel (or a binding whose manifest is missing) is the
+        // absent-probe signal, not a failure.
+        Err(EhdbError::NotFound(_)) => Ok(absent(log_path)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Publish a system WASM library manifest and return the outcome as JSON.
+pub fn publish_local_reference_system_module_json(
+    request: PublishSystemModuleRequest,
+) -> Result<String> {
+    serde_json::to_string(&publish_local_reference_system_module(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode publish outcome: {err}")))
+}
+
+/// Bind a release channel and return the outcome as JSON.
+pub fn bind_local_reference_system_channel_json(
+    request: BindSystemChannelRequest,
+) -> Result<String> {
+    serde_json::to_string(&bind_local_reference_system_channel(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode bind outcome: {err}")))
+}
+
+/// Resolve the active module for a channel binding and return the outcome as
+/// JSON.
+pub fn resolve_local_reference_system_module_json(
+    request: ResolveSystemModuleRequest,
+) -> Result<String> {
+    serde_json::to_string(&resolve_local_reference_system_module(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode resolve outcome: {err}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3043,5 +3418,254 @@ mod tests {
         // StreamSequence::new(0) is rejected before the log is even opened.
         assert!(matches!(error, EhdbError::InvalidState(_)));
         assert!(!path.exists());
+    }
+
+    // --- System WASM library store helpers (Phase E) -----------------------
+
+    fn sys_digest(last: char) -> String {
+        format!("sha256:{}{last}", "a".repeat(63))
+    }
+
+    fn publish_req(
+        path: &Path,
+        library_path: &str,
+        revision: u32,
+        digest: &str,
+        txn: &str,
+    ) -> PublishSystemModuleRequest {
+        PublishSystemModuleRequest {
+            log_path: path.to_path_buf(),
+            tenant: "tenant-a".to_string(),
+            namespace: "system".to_string(),
+            path: library_path.to_string(),
+            revision,
+            digest: digest.to_string(),
+            entry: "run".to_string(),
+            target: "wasm32-unknown-unknown".to_string(),
+            object_path: format!("system-libraries/{library_path}/{revision}/module.wasm"),
+            byte_len: 512,
+            capabilities: vec!["ehdb_catalog_write".to_string()],
+            transaction_id: txn.to_string(),
+        }
+    }
+
+    fn bind_req(
+        path: &Path,
+        library_path: &str,
+        revision: u32,
+        digest: &str,
+        txn: &str,
+    ) -> BindSystemChannelRequest {
+        BindSystemChannelRequest {
+            log_path: path.to_path_buf(),
+            tenant: "tenant-a".to_string(),
+            namespace: "system".to_string(),
+            environment: "kind".to_string(),
+            channel: "stable".to_string(),
+            path: library_path.to_string(),
+            revision,
+            digest: digest.to_string(),
+            transaction_id: txn.to_string(),
+        }
+    }
+
+    fn resolve_req(path: &Path, library_path: &str) -> ResolveSystemModuleRequest {
+        ResolveSystemModuleRequest {
+            log_path: path.to_path_buf(),
+            tenant: "tenant-a".to_string(),
+            namespace: "system".to_string(),
+            environment: "kind".to_string(),
+            channel: "stable".to_string(),
+            path: library_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn system_publish_bind_resolve_roundtrip() {
+        let path = temp_log_path("system-roundtrip");
+        let d1 = sys_digest('1');
+        let p = publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-0",
+        ))
+        .unwrap();
+        assert_eq!(p.library_count, 1);
+        assert_eq!(p.revision, 1);
+        assert_eq!(p.target, "wasm32-unknown-unknown");
+        assert_eq!(p.capabilities, vec!["ehdb_catalog_write".to_string()]);
+
+        let b = bind_local_reference_system_channel(bind_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-1",
+        ))
+        .unwrap();
+        assert_eq!(b.binding_count, 1);
+
+        let r =
+            resolve_local_reference_system_module(resolve_req(&path, "system/catalog/bootstrap"))
+                .unwrap();
+        assert!(r.exists);
+        assert_eq!(r.revision, Some(1));
+        assert_eq!(r.digest, Some(d1));
+        assert_eq!(r.entry.as_deref(), Some("run"));
+        assert_eq!(r.target.as_deref(), Some("wasm32-unknown-unknown"));
+        assert_eq!(r.capabilities, vec!["ehdb_catalog_write".to_string()]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_resolve_absent_when_unbound() {
+        let path = temp_log_path("system-absent");
+        // Fresh log, nothing published/bound: resolve is an absent probe.
+        let r =
+            resolve_local_reference_system_module(resolve_req(&path, "system/catalog/bootstrap"))
+                .unwrap();
+        assert!(!r.exists);
+        assert_eq!(r.revision, None);
+
+        // Published but not bound is still absent (the channel binding is what
+        // resolve reads).
+        publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &sys_digest('1'),
+            "txn-sys-0",
+        ))
+        .unwrap();
+        let r2 =
+            resolve_local_reference_system_module(resolve_req(&path, "system/catalog/bootstrap"))
+                .unwrap();
+        assert!(!r2.exists);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_rebind_hot_replaces_and_preserves_old_manifest() {
+        let path = temp_log_path("system-rebind");
+        let d1 = sys_digest('1');
+        let d2 = sys_digest('2');
+        // Publish two immutable manifests (rev1, rev2).
+        publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-0",
+        ))
+        .unwrap();
+        let p2 = publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            2,
+            &d2,
+            "txn-sys-1",
+        ))
+        .unwrap();
+        assert_eq!(p2.library_count, 2);
+
+        // Bind stable→rev1, resolve→rev1.
+        bind_local_reference_system_channel(bind_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-2",
+        ))
+        .unwrap();
+        let r1 =
+            resolve_local_reference_system_module(resolve_req(&path, "system/catalog/bootstrap"))
+                .unwrap();
+        assert_eq!(r1.revision, Some(1));
+
+        // Hot-rebind stable→rev2, resolve→rev2; both manifests still retained.
+        let b2 = bind_local_reference_system_channel(bind_req(
+            &path,
+            "system/catalog/bootstrap",
+            2,
+            &d2,
+            "txn-sys-3",
+        ))
+        .unwrap();
+        assert_eq!(
+            b2.binding_count, 1,
+            "rebind replaces, not adds, the binding"
+        );
+        let r2 =
+            resolve_local_reference_system_module(resolve_req(&path, "system/catalog/bootstrap"))
+                .unwrap();
+        assert_eq!(r2.revision, Some(2));
+        assert_eq!(r2.digest, Some(d2));
+
+        // The old immutable manifest is still addressable in the log.
+        let summary = summarize_local_reference(&path).unwrap();
+        assert_eq!(summary.system_library_count, 2);
+        assert_eq!(summary.system_binding_count, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_republish_identical_manifest_rejected() {
+        let path = temp_log_path("system-republish");
+        let d1 = sys_digest('1');
+        publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-0",
+        ))
+        .unwrap();
+        let err = publish_local_reference_system_module(publish_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &d1,
+            "txn-sys-1",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, EhdbError::AlreadyExists(_)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_bind_before_publish_not_found() {
+        let path = temp_log_path("system-bind-first");
+        let err = bind_local_reference_system_channel(bind_req(
+            &path,
+            "system/catalog/bootstrap",
+            1,
+            &sys_digest('1'),
+            "txn-sys-0",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, EhdbError::NotFound(_)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_publish_rejects_bad_target_and_capability() {
+        let path = temp_log_path("system-bad-target");
+        let mut bad_target = publish_req(&path, "system/x", 1, &sys_digest('1'), "txn-sys-0");
+        bad_target.target = "wasm64-nope".to_string();
+        assert!(matches!(
+            publish_local_reference_system_module(bad_target).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+
+        let mut bad_cap = publish_req(&path, "system/x", 1, &sys_digest('1'), "txn-sys-0");
+        bad_cap.capabilities = vec!["not_a_capability".to_string()];
+        assert!(matches!(
+            publish_local_reference_system_module(bad_cap).unwrap_err(),
+            EhdbError::InvalidState(_)
+        ));
+        assert!(!path.exists(), "no commit on validation failure");
+        let _ = fs::remove_file(&path);
     }
 }

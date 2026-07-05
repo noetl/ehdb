@@ -2,10 +2,12 @@ use std::{collections::HashMap, env, path::PathBuf, process};
 
 use ehdb_reference::{
     ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
-    consume_local_reference_event_records_json, read_local_reference_domain_records_json,
-    summarize_local_reference_json, AckEventConsumerRequest, AppendDomainRecordRequest,
-    ConsumeEventRecordsRequest, ReadDomainRecordsRequest, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
-    DEFAULT_LOCAL_REFERENCE_TENANT,
+    bind_local_reference_system_channel_json, consume_local_reference_event_records_json,
+    publish_local_reference_system_module_json, read_local_reference_domain_records_json,
+    resolve_local_reference_system_module_json, summarize_local_reference_json,
+    AckEventConsumerRequest, AppendDomainRecordRequest, BindSystemChannelRequest,
+    ConsumeEventRecordsRequest, PublishSystemModuleRequest, ReadDomainRecordsRequest,
+    ResolveSystemModuleRequest, DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 fn main() {
@@ -33,6 +35,9 @@ fn run(args: Vec<String>) -> Result<String, String> {
         Some((command, rest)) if command == "read" => run_read(rest),
         Some((command, rest)) if command == "consume" => run_consume(rest),
         Some((command, rest)) if command == "ack" => run_ack(rest),
+        Some((command, rest)) if command == "publish-system" => run_publish_system(rest),
+        Some((command, rest)) if command == "bind-system" => run_bind_system(rest),
+        Some((command, rest)) if command == "resolve-system" => run_resolve_system(rest),
         _ => Err(usage().to_string()),
     }
 }
@@ -169,6 +174,112 @@ fn run_ack(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())
 }
 
+fn run_publish_system(args: &[String]) -> Result<String, String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let path = take_required(&mut flags, "path")?;
+    let revision_raw = take_required(&mut flags, "revision")?;
+    let revision = revision_raw
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --revision value: {revision_raw}"))?;
+    let digest = take_required(&mut flags, "digest")?;
+    let entry = take_required(&mut flags, "entry")?;
+    let target = take_required(&mut flags, "target")?;
+    let object_path = take_required(&mut flags, "object-path")?;
+    let byte_len_raw = take_required(&mut flags, "byte-len")?;
+    let byte_len = byte_len_raw
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --byte-len value: {byte_len_raw}"))?;
+    let capabilities = take_required(&mut flags, "capabilities")?
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    publish_local_reference_system_module_json(PublishSystemModuleRequest {
+        log_path: PathBuf::from(log),
+        tenant,
+        namespace,
+        path,
+        revision,
+        digest,
+        entry,
+        target,
+        object_path,
+        byte_len,
+        capabilities,
+        transaction_id,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn run_bind_system(args: &[String]) -> Result<String, String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let environment = take_required(&mut flags, "environment")?;
+    let channel = take_required(&mut flags, "channel")?;
+    let path = take_required(&mut flags, "path")?;
+    let revision_raw = take_required(&mut flags, "revision")?;
+    let revision = revision_raw
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --revision value: {revision_raw}"))?;
+    let digest = take_required(&mut flags, "digest")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    bind_local_reference_system_channel_json(BindSystemChannelRequest {
+        log_path: PathBuf::from(log),
+        tenant,
+        namespace,
+        environment,
+        channel,
+        path,
+        revision,
+        digest,
+        transaction_id,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn run_resolve_system(args: &[String]) -> Result<String, String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let environment = take_required(&mut flags, "environment")?;
+    let channel = take_required(&mut flags, "channel")?;
+    let path = take_required(&mut flags, "path")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    resolve_local_reference_system_module_json(ResolveSystemModuleRequest {
+        log_path: PathBuf::from(log),
+        tenant,
+        namespace,
+        environment,
+        channel,
+        path,
+    })
+    .map_err(|err| err.to_string())
+}
+
 /// Parse `--key value` pairs into a map.  Rejects positional args and flags
 /// without a value so a malformed invocation fails loudly rather than being
 /// silently ignored.
@@ -213,5 +324,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]"
 }
