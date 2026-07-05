@@ -1,6 +1,7 @@
 use std::{collections::HashMap, env, path::PathBuf, process};
 
 use ehdb_core::EhdbError;
+use ehdb_reference::compare_projection_parity;
 use ehdb_reference::{
     ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
     bind_local_reference_system_channel_json, compare_shadow_parity,
@@ -8,10 +9,11 @@ use ehdb_reference::{
     publish_local_reference_system_module_json, read_local_reference_domain_records_json,
     resolve_local_reference_system_module_json, retrieve_local_reference_context,
     summarize_local_reference_json, AckEventConsumerRequest, AppendDomainRecordRequest,
-    BindSystemChannelRequest, ConsumeEventRecordsRequest, EventLogAckRequest,
-    EventLogAppendRequest, EventLogDriver, EventLogReadExecutionRequest, EventLogScanRequest,
-    EventLogTailRequest, IngestChunkInput, IngestRetrievalDocumentRequest,
-    LocalReferenceEventLogDriver, PublishSystemModuleRequest, ReadDomainRecordsRequest,
+    AuthoritativeExecutionState, BindSystemChannelRequest, ConsumeEventRecordsRequest,
+    EventLogAckRequest, EventLogAppendRequest, EventLogDriver, EventLogReadExecutionRequest,
+    EventLogScanRequest, EventLogTailRequest, IngestChunkInput, IngestRetrievalDocumentRequest,
+    LocalReferenceEventLogDriver, LocalReferenceProjectionEngine, ProjectionApplyRequest,
+    ProjectionDriver, ProjectionEventInput, PublishSystemModuleRequest, ReadDomainRecordsRequest,
     ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
     DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
@@ -55,6 +57,21 @@ fn run(args: Vec<String>) -> Result<(String, i32), String> {
         Some((command, rest)) if command == "eventlog-tail" => run_eventlog_tail(rest),
         Some((command, rest)) if command == "eventlog-ack" => run_eventlog_ack(rest),
         Some((command, rest)) if command == "eventlog-suite" => run_eventlog_suite(rest),
+        Some((command, rest)) if command == "projection-apply" => run_projection_apply(rest),
+        Some((command, rest)) if command == "projection-read-exec" => {
+            run_projection_read_exec(rest)
+        }
+        Some((command, rest)) if command == "projection-read-event" => {
+            run_projection_read_event(rest)
+        }
+        Some((command, rest)) if command == "projection-list" => run_projection_list(rest),
+        Some((command, rest)) if command == "projection-checkpoint" => {
+            run_projection_checkpoint(rest)
+        }
+        Some((command, rest)) if command == "projection-from-eventlog" => {
+            run_projection_from_eventlog(rest)
+        }
+        Some((command, rest)) if command == "projection-suite" => run_projection_suite(rest),
         _ => Err(usage().to_string()),
     }
 }
@@ -256,6 +273,252 @@ fn run_eventlog_suite(args: &[String]) -> Result<(String, i32), String> {
 
     let report = serde_json::json!({
         "suite": "ehdb-eventlog", "driver": driver.driver_name(),
+        "ok": ok, "parity_ok": parity_ok, "steps": steps,
+    });
+    let output = serde_json::to_string(&report).map_err(|err| err.to_string())?;
+    Ok((output, if ok { 0 } else { 1 }))
+}
+
+// ---------------------------------------------------------------------------
+// Projection / read-model engine verbs (completion program Phase 7)
+// ---------------------------------------------------------------------------
+
+/// Build the projection engine from the shared `--log` / `--tenant` /
+/// `--namespace` flags (defaults match the rest of the local-reference verbs).
+fn projection_engine(
+    flags: &mut HashMap<String, String>,
+) -> Result<LocalReferenceProjectionEngine, String> {
+    let log = take_required(flags, "log")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    Ok(LocalReferenceProjectionEngine::new(
+        PathBuf::from(log),
+        tenant,
+        namespace,
+    ))
+}
+
+fn run_projection_apply(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    let consumer = flags
+        .remove("consumer")
+        .unwrap_or_else(|| "projector".to_string());
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let events_json = take_required(&mut flags, "events-json")?;
+    ensure_no_unknown_flags(&flags)?;
+    let events: Vec<ProjectionEventInput> = serde_json::from_str(&events_json)
+        .map_err(|e| format!("invalid --events-json (expected [ProjectionEventInput]): {e}"))?;
+    match engine.apply(&ProjectionApplyRequest {
+        consumer,
+        transaction_id,
+        events,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_projection_read_exec(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    let execution_id = take_required(&mut flags, "execution-id")?;
+    ensure_no_unknown_flags(&flags)?;
+    match engine.read_execution_state(&execution_id) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_projection_read_event(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    let event_id = take_required(&mut flags, "event-id")?
+        .parse::<i64>()
+        .map_err(|_| "invalid --event-id value".to_string())?;
+    ensure_no_unknown_flags(&flags)?;
+    match engine.read_event(event_id) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_projection_list(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    let limit = parse_limit(&mut flags, 100)?;
+    ensure_no_unknown_flags(&flags)?;
+    match engine.list_executions(limit) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+fn run_projection_checkpoint(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    let consumer = flags
+        .remove("consumer")
+        .unwrap_or_else(|| "projector".to_string());
+    ensure_no_unknown_flags(&flags)?;
+    match engine.checkpoint(&consumer) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// Integration bridge: scan an existing Phase-6 event log and materialize its
+/// tail into a projection store, proving the eventlog-tail → projection-apply
+/// path end to end.  `--eventlog-log` is the event-log JSONL; `--log` is the
+/// (distinct) projection JSONL.
+fn run_projection_from_eventlog(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    // The event-log driver (source) and the projection engine (sink) use
+    // distinct log paths so the projection store never contends the log.
+    let eventlog_path = take_required(&mut flags, "eventlog-log")?;
+    let engine = projection_engine(&mut flags)?;
+    let consumer = flags
+        .remove("consumer")
+        .unwrap_or_else(|| "projector".to_string());
+    let transaction_id = flags
+        .remove("transaction-id")
+        .unwrap_or_else(|| "projection-from-eventlog".to_string());
+    let limit = parse_limit(&mut flags, 1000)?;
+    ensure_no_unknown_flags(&flags)?;
+
+    let source = LocalReferenceEventLogDriver::new(
+        PathBuf::from(eventlog_path),
+        DEFAULT_LOCAL_REFERENCE_TENANT,
+        DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    );
+    let scan = source
+        .scan_global(&EventLogScanRequest { after: None, limit })
+        .map_err(|err| err.to_string())?;
+    let events: Vec<ProjectionEventInput> = scan
+        .records
+        .iter()
+        .filter_map(ProjectionEventInput::from_event_log_record)
+        .collect();
+    match engine.apply(&ProjectionApplyRequest {
+        consumer,
+        transaction_id,
+        events,
+    }) {
+        Ok(outcome) => Ok((json(&outcome)?, 0)),
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// Deterministic one-process drive of the whole projection surface:
+/// apply(3 events, exec 100 → terminal) → read-execution (folded completed) →
+/// read-event → list → re-apply (idempotent no-op) → checkpoint → parity-compare
+/// vs a matching authoritative snapshot.  Exit 0 only when every expected
+/// outcome AND the parity report hold.
+fn run_projection_suite(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let engine = projection_engine(&mut flags)?;
+    ensure_no_unknown_flags(&flags)?;
+
+    let mut steps = Vec::new();
+    let mut ok = true;
+
+    let events = vec![
+        ProjectionEventInput {
+            global_sequence: 1,
+            event_id: 10,
+            execution_id: "100".to_string(),
+            event_type: "playbook_started".to_string(),
+            node_name: Some("start".to_string()),
+            status: Some("running".to_string()),
+            prev_event_id: None,
+        },
+        ProjectionEventInput {
+            global_sequence: 2,
+            event_id: 11,
+            execution_id: "100".to_string(),
+            event_type: "command.completed".to_string(),
+            node_name: Some("load".to_string()),
+            status: Some("completed".to_string()),
+            prev_event_id: Some(10),
+        },
+        ProjectionEventInput {
+            global_sequence: 3,
+            event_id: 12,
+            execution_id: "100".to_string(),
+            event_type: "playbook.completed".to_string(),
+            node_name: Some("finish".to_string()),
+            status: Some("completed".to_string()),
+            prev_event_id: Some(11),
+        },
+    ];
+
+    let apply = engine
+        .apply(&ProjectionApplyRequest {
+            consumer: "suite-projector".to_string(),
+            transaction_id: "suite-t1".to_string(),
+            events: events.clone(),
+        })
+        .map_err(|err| err.to_string())?;
+    ok &= apply.applied == 3 && apply.checkpoint.applied_through_sequence == 3;
+    steps.push(serde_json::json!({"step": "apply", "applied": apply.applied}));
+
+    let read = engine
+        .read_execution_state("100")
+        .map_err(|err| err.to_string())?;
+    let state = read.state.clone().ok_or("missing execution state")?;
+    ok &= state.status == "completed" && state.terminal && state.event_count == 3;
+    steps.push(serde_json::json!({"step": "read_execution", "status": state.status}));
+
+    let ev = engine.read_event(11).map_err(|err| err.to_string())?;
+    ok &= ev.exists;
+    steps.push(serde_json::json!({"step": "read_event", "exists": ev.exists}));
+
+    let list = engine.list_executions(100).map_err(|err| err.to_string())?;
+    ok &= list.total == 1;
+    steps.push(serde_json::json!({"step": "list", "total": list.total}));
+
+    // Re-apply the same batch → idempotent no-op (exactly-once on global seq).
+    let replay = engine
+        .apply(&ProjectionApplyRequest {
+            consumer: "suite-projector".to_string(),
+            transaction_id: "suite-t2".to_string(),
+            events,
+        })
+        .map_err(|err| err.to_string())?;
+    ok &= replay.applied == 0 && replay.skipped_below_checkpoint == 3;
+    steps.push(serde_json::json!({"step": "reapply_idempotent", "applied": replay.applied}));
+
+    let checkpoint = engine
+        .checkpoint("suite-projector")
+        .map_err(|err| err.to_string())?;
+    ok &= checkpoint.applied_through_sequence == 3 && checkpoint.applied_count == 3;
+    steps.push(
+        serde_json::json!({"step": "checkpoint", "through": checkpoint.applied_through_sequence}),
+    );
+
+    // Parity vs a matching authoritative (Postgres-materializer) snapshot.
+    let authoritative = vec![AuthoritativeExecutionState {
+        execution_id: "100".to_string(),
+        status: "completed".to_string(),
+        event_count: 3,
+        terminal: true,
+    }];
+    let parity = compare_projection_parity(
+        &list.states,
+        &authoritative,
+        checkpoint.applied_through_sequence,
+        Some(3),
+    );
+    let parity_ok = parity.holds();
+    ok &= parity_ok;
+    steps.push(serde_json::json!({"step": "parity", "holds": parity_ok}));
+
+    let report = serde_json::json!({
+        "suite": "ehdb-projection", "driver": engine.driver_name(),
         "ok": ok, "parity_ok": parity_ok, "steps": steps,
     });
     let output = serde_json::to_string(&report).map_err(|err| err.to_string())?;
@@ -681,5 +944,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]"
 }
