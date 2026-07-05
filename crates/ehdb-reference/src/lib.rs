@@ -83,6 +83,18 @@ pub use object::{
     MAX_OBJECT_LIST_LIMIT, OBJECT_CONTENT_PREFIX, OBJECT_STORE_STREAM, OBJECT_SUBJECT_PREFIX,
 };
 
+/// EHDB vector core engine (completion program Phase 8, slice 3) — the durable
+/// vector engine underneath NoETL's internal platform vector tier (RAG / catalog
+/// embeddings), formalizing the Phase-E in-process retrieval path behind a driver
+/// interface.  See [`vector`].
+pub mod vector;
+pub use vector::{
+    compare_vector_parity, AuthoritativeVectorHit, LocalReferenceVectorDriver, VectorDeleteOutcome,
+    VectorDeleteRequest, VectorDriver, VectorHit, VectorParityReport, VectorQueryOutcome,
+    VectorQueryRequest, VectorUpsertOutcome, VectorUpsertRequest, MAX_VECTOR_DIMENSIONS,
+    MAX_VECTOR_PAYLOAD_BYTES, MAX_VECTOR_QUERY_TOP_K, VECTOR_INDEX_STREAM, VECTOR_SUBJECT_PREFIX,
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceDatabase {
     pub catalog: InMemoryCatalog,
