@@ -10,8 +10,8 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
-    ColumnSchema, DataType, EhdbError, NamespaceName, Result, SnapshotId, StreamName, TableName,
-    TableSchema, TenantId, TransactionId,
+    ColumnSchema, ConsumerName, DataType, EhdbError, NamespaceName, Result, SnapshotId, StreamName,
+    TableName, TableSchema, TenantId, TransactionId,
 };
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
@@ -353,6 +353,253 @@ pub fn read_local_reference_domain_records_json(
 ) -> Result<String> {
     serde_json::to_string(&read_local_reference_domain_records(request)?)
         .map_err(|err| EhdbError::InvalidState(format!("encode read outcome: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Event-stream integration path (NoETL integration Phase D).
+//
+// The NoETL event log (Postgres `noetl.event` / NATS JetStream) remains the
+// authoritative, append-only source of truth.  EHDB is a *derived, auxiliary*
+// consumer of already-emitted NoETL events: a NoETL worker/playbook step
+// projects an event payload into a local-reference EHDB stream (the existing
+// `append` primitive), then drains it through a durable consumer with explicit
+// ack-after-materialize semantics.  Nothing here writes back to the NoETL event
+// log — the EHDB local-reference stream is a separate JSONL fabric, and these
+// functions only ever touch that fabric.  Durable-consumer replay is bounded by
+// an explicit `limit`; the ack cursor is never moved backwards.
+// ---------------------------------------------------------------------------
+
+/// Bounded pull request for a durable consumer over a local-reference stream.
+///
+/// A durable consumer models the NoETL command/event drain: it is created on
+/// first pull (`transaction_id` names that create commit) and thereafter
+/// remembers its ack cursor across process restarts (the cursor lives in the
+/// transaction log).  The pull returns records *after* the cursor, bounded by
+/// `limit`, without moving the cursor — advancing the cursor is a separate,
+/// explicit `ack` after the caller has materialized the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumeEventRecordsRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub consumer: String,
+    /// Transaction id for the create-consumer commit (used only on first pull).
+    pub transaction_id: String,
+    pub limit: usize,
+}
+
+/// Secret-free result of a bounded durable-consumer pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumeEventRecordsOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub consumer: String,
+    /// Whether the underlying stream exists yet.
+    pub exists: bool,
+    /// Whether the durable consumer was created on this pull.
+    pub created_consumer: bool,
+    /// The consumer ack cursor before this pull (`None` = nothing acked yet).
+    pub acked_sequence: Option<u64>,
+    /// Total records pending after the cursor (before `limit` is applied).
+    pub pending_count: usize,
+    /// Records actually returned (`min(pending_count, limit)`).
+    pub returned: usize,
+    pub records: Vec<DomainRecordView>,
+    pub transaction_count: usize,
+}
+
+/// Bounded ack request advancing a durable consumer's cursor after materialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckEventConsumerRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub consumer: String,
+    /// Transaction id for the ack commit.
+    pub transaction_id: String,
+    /// The stream sequence being acked (must be a real record; nonzero).
+    pub sequence: u64,
+}
+
+/// Secret-free result of advancing a durable consumer's ack cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AckEventConsumerOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub stream: String,
+    pub consumer: String,
+    pub acked_sequence: u64,
+    pub transaction_count: usize,
+}
+
+/// Pull up to `limit` records for a durable consumer over a local-reference
+/// stream, creating the consumer on first use.
+///
+/// A missing stream is reported as `exists: false` with an empty batch (and no
+/// consumer created) rather than an error, so a drain step can probe a stream
+/// that has never received a projected event.  The pull does not move the ack
+/// cursor; call [`ack_local_reference_event_consumer`] after materializing.
+pub fn consume_local_reference_event_records(
+    request: ConsumeEventRecordsRequest,
+) -> Result<ConsumeEventRecordsOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let stream = StreamName::new(request.stream.clone())?;
+    let consumer = ConsumerName::new(request.consumer.clone())?;
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+    let log_path = runtime.path().display().to_string();
+
+    // A durable consumer over a stream that has never been written is a no-op
+    // probe: report absent without creating consumer state.
+    if runtime
+        .state()
+        .streams
+        .replay(&tenant, &namespace, &stream, None)
+        .is_err()
+    {
+        return Ok(ConsumeEventRecordsOutcome {
+            action: "consume".to_string(),
+            log_path,
+            tenant: tenant.to_string(),
+            namespace: namespace.to_string(),
+            stream: stream.to_string(),
+            consumer: consumer.to_string(),
+            exists: false,
+            created_consumer: false,
+            acked_sequence: None,
+            pending_count: 0,
+            returned: 0,
+            records: Vec::new(),
+            transaction_count: runtime.replay().len(),
+        });
+    }
+
+    // Create the durable consumer on first pull (JetStream-style durable).
+    let created_consumer = runtime
+        .state()
+        .streams
+        .consumer(&tenant, &namespace, &stream, &consumer)
+        .is_err();
+    if created_consumer {
+        let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+        runtime.append(CommitTransaction {
+            transaction_id,
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            mutations: vec![Mutation::Stream(StreamMutation::CreateConsumer {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+            })],
+        })?;
+    }
+
+    let acked_sequence = runtime
+        .state()
+        .streams
+        .consumer(&tenant, &namespace, &stream, &consumer)
+        .ok()
+        .and_then(|durable| durable.acked_sequence.map(|sequence| sequence.value()));
+
+    let pending = runtime
+        .state()
+        .streams
+        .replay_for_consumer(&tenant, &namespace, &stream, &consumer)?;
+    let pending_count = pending.len();
+    let records: Vec<DomainRecordView> = pending
+        .into_iter()
+        .take(request.limit)
+        .map(|record| DomainRecordView {
+            sequence: record.sequence.value(),
+            subject: record.subject.as_str().to_string(),
+            transaction_id: record.transaction_id.to_string(),
+            byte_len: record.payload.len(),
+            payload: String::from_utf8_lossy(&record.payload).into_owned(),
+        })
+        .collect();
+    let returned = records.len();
+
+    Ok(ConsumeEventRecordsOutcome {
+        action: "consume".to_string(),
+        log_path,
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        stream: stream.to_string(),
+        consumer: consumer.to_string(),
+        exists: true,
+        created_consumer,
+        acked_sequence,
+        pending_count,
+        returned,
+        records,
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Advance a durable consumer's ack cursor to `sequence` after materialize.
+///
+/// The commit is atomic: the sequence must reference a real record and may not
+/// move the cursor backwards (both enforced during replay-preview before
+/// anything is written).  This is the explicit ack-after-materialize step of
+/// the drain contract.
+pub fn ack_local_reference_event_consumer(
+    request: AckEventConsumerRequest,
+) -> Result<AckEventConsumerOutcome> {
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let stream = StreamName::new(request.stream.clone())?;
+    let consumer = ConsumerName::new(request.consumer.clone())?;
+    let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+    // Reject sequence 0 up front (StreamSequence is nonzero); a real ack always
+    // names a published record.
+    let sequence = StreamSequence::new(request.sequence)?;
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+
+    runtime.append(CommitTransaction {
+        transaction_id,
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        mutations: vec![Mutation::Stream(StreamMutation::Ack {
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+            sequence: sequence.value(),
+        })],
+    })?;
+
+    Ok(AckEventConsumerOutcome {
+        action: "ack".to_string(),
+        log_path: runtime.path().display().to_string(),
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        stream: stream.to_string(),
+        consumer: consumer.to_string(),
+        acked_sequence: sequence.value(),
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Pull durable-consumer records and return the outcome as a JSON string.
+pub fn consume_local_reference_event_records_json(
+    request: ConsumeEventRecordsRequest,
+) -> Result<String> {
+    serde_json::to_string(&consume_local_reference_event_records(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode consume outcome: {err}")))
+}
+
+/// Advance a durable consumer cursor and return the outcome as a JSON string.
+pub fn ack_local_reference_event_consumer_json(request: AckEventConsumerRequest) -> Result<String> {
+    serde_json::to_string(&ack_local_reference_event_consumer(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode ack outcome: {err}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2545,5 +2792,256 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(error, EhdbError::InvalidIdentifier(_)));
+    }
+
+    // ---- Event-stream integration path (Phase D) ----
+
+    fn consume_request(
+        path: &std::path::Path,
+        stream: &str,
+        consumer: &str,
+        transaction_id: &str,
+        limit: usize,
+    ) -> ConsumeEventRecordsRequest {
+        ConsumeEventRecordsRequest {
+            log_path: path.to_path_buf(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: stream.to_string(),
+            consumer: consumer.to_string(),
+            transaction_id: transaction_id.to_string(),
+            limit,
+        }
+    }
+
+    fn ack_request(
+        path: &std::path::Path,
+        stream: &str,
+        consumer: &str,
+        transaction_id: &str,
+        sequence: u64,
+    ) -> AckEventConsumerRequest {
+        AckEventConsumerRequest {
+            log_path: path.to_path_buf(),
+            tenant: DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            namespace: DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            stream: stream.to_string(),
+            consumer: consumer.to_string(),
+            transaction_id: transaction_id.to_string(),
+            sequence,
+        }
+    }
+
+    #[test]
+    fn event_stream_drain_projects_consumes_acks_and_survives_reopen() {
+        let path = temp_log_path("eventstream-drain");
+
+        // Project two already-emitted NoETL events into the derived EHDB stream
+        // (the existing `append` primitive is the project leg).
+        for (index, payload) in ["{\"n\":1}", "{\"n\":2}"].iter().enumerate() {
+            append_local_reference_domain_record(append_request(
+                &path,
+                "noetl-events",
+                "noetl.execution.completed",
+                &format!("txn-proj-{:04}", index + 1),
+                payload,
+            ))
+            .unwrap();
+        }
+
+        // First durable-consumer pull creates the consumer and delivers all
+        // pending records without moving the cursor.
+        let first = consume_local_reference_event_records(consume_request(
+            &path,
+            "noetl-events",
+            "materializer",
+            "txn-consume-0001",
+            100,
+        ))
+        .unwrap();
+        assert!(first.exists);
+        assert!(first.created_consumer);
+        assert_eq!(first.acked_sequence, None);
+        assert_eq!(first.pending_count, 2);
+        assert_eq!(first.returned, 2);
+        assert_eq!(first.records[0].sequence, 1);
+        assert_eq!(first.records[1].sequence, 2);
+
+        // Ack-after-materialize: advance the cursor past the first record only.
+        let acked = ack_local_reference_event_consumer(ack_request(
+            &path,
+            "noetl-events",
+            "materializer",
+            "txn-ack-0001",
+            1,
+        ))
+        .unwrap();
+        assert_eq!(acked.acked_sequence, 1);
+
+        // Reopen from scratch (stateless): the durable cursor is restored from
+        // the transaction log, the consumer is not recreated, and only the
+        // unacked record is pending.
+        let second = consume_local_reference_event_records(consume_request(
+            &path,
+            "noetl-events",
+            "materializer",
+            "txn-consume-0002",
+            100,
+        ))
+        .unwrap();
+        assert!(!second.created_consumer);
+        assert_eq!(second.acked_sequence, Some(1));
+        assert_eq!(second.pending_count, 1);
+        assert_eq!(second.returned, 1);
+        assert_eq!(second.records[0].sequence, 2);
+
+        // Ack the tail; the drain is now empty.
+        ack_local_reference_event_consumer(ack_request(
+            &path,
+            "noetl-events",
+            "materializer",
+            "txn-ack-0002",
+            2,
+        ))
+        .unwrap();
+        let drained = consume_local_reference_event_records(consume_request(
+            &path,
+            "noetl-events",
+            "materializer",
+            "txn-consume-0003",
+            100,
+        ))
+        .unwrap();
+        assert_eq!(drained.acked_sequence, Some(2));
+        assert_eq!(drained.pending_count, 0);
+        assert_eq!(drained.returned, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn consume_missing_stream_reports_absent_without_creating() {
+        let path = temp_log_path("eventstream-missing");
+        let outcome = consume_local_reference_event_records(consume_request(
+            &path,
+            "never-projected",
+            "materializer",
+            "txn-consume-x",
+            10,
+        ))
+        .unwrap();
+        assert!(!outcome.exists);
+        assert!(!outcome.created_consumer);
+        assert_eq!(outcome.pending_count, 0);
+        assert!(outcome.records.is_empty());
+        // A probe over a never-written stream must not create the log file.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn consume_honors_limit_without_advancing_cursor() {
+        let path = temp_log_path("eventstream-limit");
+        for index in 1..=5 {
+            append_local_reference_domain_record(append_request(
+                &path,
+                "ticks",
+                "noetl.tick",
+                &format!("txn-tick-{index:04}"),
+                &format!("payload-{index}"),
+            ))
+            .unwrap();
+        }
+        let outcome = consume_local_reference_event_records(consume_request(
+            &path,
+            "ticks",
+            "reader",
+            "txn-consume-lim",
+            2,
+        ))
+        .unwrap();
+        assert_eq!(outcome.pending_count, 5);
+        assert_eq!(outcome.returned, 2);
+        assert_eq!(outcome.records[0].sequence, 1);
+
+        // A second pull (no ack in between) still sees all five pending — the
+        // cursor did not move.
+        let again = consume_local_reference_event_records(consume_request(
+            &path,
+            "ticks",
+            "reader",
+            "txn-consume-lim2",
+            2,
+        ))
+        .unwrap();
+        assert!(!again.created_consumer);
+        assert_eq!(again.pending_count, 5);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ack_rejects_backwards_cursor() {
+        let path = temp_log_path("eventstream-backwards");
+        for index in 1..=2 {
+            append_local_reference_domain_record(append_request(
+                &path,
+                "orders",
+                "orders.placed",
+                &format!("txn-ord-{index:04}"),
+                "x",
+            ))
+            .unwrap();
+        }
+        consume_local_reference_event_records(consume_request(
+            &path,
+            "orders",
+            "c",
+            "txn-consume-b",
+            100,
+        ))
+        .unwrap();
+        ack_local_reference_event_consumer(ack_request(&path, "orders", "c", "txn-ack-fwd", 2))
+            .unwrap();
+        let error =
+            ack_local_reference_event_consumer(ack_request(&path, "orders", "c", "txn-ack-bwd", 1))
+                .unwrap_err();
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ack_rejects_unknown_sequence() {
+        let path = temp_log_path("eventstream-unknown-seq");
+        append_local_reference_domain_record(append_request(
+            &path,
+            "orders",
+            "orders.placed",
+            "txn-only",
+            "x",
+        ))
+        .unwrap();
+        consume_local_reference_event_records(consume_request(
+            &path,
+            "orders",
+            "c",
+            "txn-consume-u",
+            100,
+        ))
+        .unwrap();
+        let error =
+            ack_local_reference_event_consumer(ack_request(&path, "orders", "c", "txn-ack-u", 9))
+                .unwrap_err();
+        assert!(matches!(error, EhdbError::NotFound(_)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ack_rejects_sequence_zero() {
+        let path = temp_log_path("eventstream-zero-seq");
+        let error =
+            ack_local_reference_event_consumer(ack_request(&path, "orders", "c", "txn-ack-0", 0))
+                .unwrap_err();
+        // StreamSequence::new(0) is rejected before the log is even opened.
+        assert!(matches!(error, EhdbError::InvalidState(_)));
+        assert!(!path.exists());
     }
 }
