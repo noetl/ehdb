@@ -3,6 +3,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -10,11 +11,12 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
-    ColumnSchema, ConsumerName, DataType, EhdbError, NamespaceName, Result, SnapshotId, StreamName,
-    TableName, TableSchema, TenantId, TransactionId,
+    ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EhdbError, NamespaceName, Result,
+    SnapshotId, StreamName, TableName, TableSchema, TenantId, TransactionId,
 };
 use ehdb_retrieval::{
-    InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding,
+    InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding, TextSearch,
+    TextSearchHit,
 };
 use ehdb_storage::{
     table_snapshot_object_path, ImmutableObjectStore, InMemoryObjectReplicaRegistry, ObjectPath,
@@ -975,6 +977,438 @@ pub fn resolve_local_reference_system_module_json(
 ) -> Result<String> {
     serde_json::to_string(&resolve_local_reference_system_module(request)?)
         .map_err(|err| EhdbError::InvalidState(format!("encode resolve outcome: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Bounded RAG retrieval path (EHDB Phase E, noetl/ehdb#234).
+//
+// The system-WASM store slice (publish/bind/resolve above) is one half of the
+// Phase E direction; bounded RAG retrieval is the other.  These helpers let a
+// NoETL worker/playbook/system role ingest bounded retrieval documents into the
+// derived local-reference EHDB fabric and run a bounded, read-only text search
+// over it via the existing `ehdb_retrieval` search under the hood.
+//
+// Boundaries mirror the domain-record / event-stream / system-store helpers:
+//
+// * **Read-only retrieve** — `retrieve_local_reference_context` opens the log,
+//   replays it, searches, and drops the runtime; it NEVER writes the log (and
+//   never touches `noetl.event`, which stays the append-only source of truth —
+//   this is a separate JSONL fabric).
+// * **Bounded** — three caps enforced *inside* the retrieve helper: a top-k cap
+//   (`MAX_RETRIEVAL_TOP_K`), a per-hit result-size cap
+//   (`MAX_RETRIEVAL_MAX_CHUNK_BYTES`, chunk text truncated on a char boundary),
+//   and a wall-clock budget (`MAX_RETRIEVAL_TIME_BUDGET_MS`, surfaced via
+//   `time_capped`).  Over-ceiling caps are `Rejected`; an empty query or a bad
+//   tenant/namespace id is `Invalid` — both classified without searching, so a
+//   CLI can map the outcome to a distinct exit code.
+// * **Secret-free** — the result carries retrieval content (the whole point of
+//   RAG) but no credential/env values; the ingest side stores only what the
+//   caller supplies.
+// ---------------------------------------------------------------------------
+
+/// Default top-k when a retrieve request leaves `top_k` at 0.
+pub const DEFAULT_RETRIEVAL_TOP_K: usize = 8;
+/// Hard ceiling on retrieve top-k; a request above this is `Rejected`.
+pub const MAX_RETRIEVAL_TOP_K: usize = 64;
+/// Default per-hit text byte cap when a retrieve request leaves it at 0.
+pub const DEFAULT_RETRIEVAL_MAX_CHUNK_BYTES: usize = 4_096;
+/// Hard ceiling on the per-hit text byte cap; a request above this is `Rejected`.
+pub const MAX_RETRIEVAL_MAX_CHUNK_BYTES: usize = 65_536;
+/// Default wall-clock budget (ms) when a retrieve request leaves it at 0.
+pub const DEFAULT_RETRIEVAL_TIME_BUDGET_MS: u64 = 5_000;
+/// Hard ceiling on the retrieve wall-clock budget (ms); above this is `Rejected`.
+pub const MAX_RETRIEVAL_TIME_BUDGET_MS: u64 = 60_000;
+/// Hard ceiling on the number of chunks accepted in one ingest commit.
+pub const MAX_RETRIEVAL_INGEST_CHUNKS: usize = 256;
+/// Hard ceiling on a single ingested chunk's UTF-8 byte length.
+pub const MAX_RETRIEVAL_INGEST_CHUNK_BYTES: usize = 65_536;
+
+/// The classified outcome of a bounded retrieval.
+///
+/// `Hit` / `Empty` are the ok cases (a search ran); `Rejected` (an over-ceiling
+/// cap) and `Invalid` (an empty query / bad identifier) are classified without
+/// searching so a caller can map them to distinct exit codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalOutcome {
+    Hit,
+    Empty,
+    Rejected,
+    Invalid,
+}
+
+impl RetrievalOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetrievalOutcome::Hit => "hit",
+            RetrievalOutcome::Empty => "empty",
+            RetrievalOutcome::Rejected => "rejected",
+            RetrievalOutcome::Invalid => "invalid",
+        }
+    }
+
+    /// Whether a search actually ran (a hit or a clean empty result).
+    pub fn ok(&self) -> bool {
+        matches!(self, RetrievalOutcome::Hit | RetrievalOutcome::Empty)
+    }
+}
+
+/// One chunk of a document to ingest into the derived retrieval fabric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestChunkInput {
+    pub chunk_id: String,
+    pub ordinal: u32,
+    pub text: String,
+    pub checksum: String,
+}
+
+/// Bounded request to ingest one document + its chunks into the derived
+/// local-reference retrieval fabric as a single atomic commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestRetrievalDocumentRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub document_id: String,
+    pub source_uri: String,
+    pub content_type: String,
+    pub transaction_id: String,
+    pub chunks: Vec<IngestChunkInput>,
+}
+
+/// Secret-free result of ingesting one retrieval document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestRetrievalDocumentOutcome {
+    pub action: String,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub document_id: String,
+    pub chunk_count: usize,
+    pub document_count: usize,
+    pub retrieval_chunk_count: usize,
+    pub transaction_count: usize,
+}
+
+/// Bounded, read-only retrieval request over the derived retrieval fabric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrieveContextRequest {
+    pub log_path: PathBuf,
+    pub tenant: String,
+    pub namespace: String,
+    pub query: String,
+    /// Max hits to return (0 ⇒ [`DEFAULT_RETRIEVAL_TOP_K`]; over
+    /// [`MAX_RETRIEVAL_TOP_K`] ⇒ `Rejected`).
+    pub top_k: usize,
+    /// Per-hit chunk-text byte cap (0 ⇒ [`DEFAULT_RETRIEVAL_MAX_CHUNK_BYTES`];
+    /// over [`MAX_RETRIEVAL_MAX_CHUNK_BYTES`] ⇒ `Rejected`).
+    pub max_chunk_bytes: usize,
+    /// Wall-clock budget in ms (0 ⇒ [`DEFAULT_RETRIEVAL_TIME_BUDGET_MS`]; over
+    /// [`MAX_RETRIEVAL_TIME_BUDGET_MS`] ⇒ `Rejected`).  Surfaced via
+    /// `time_capped` when the observed elapsed time exceeds it.
+    pub time_budget_ms: u64,
+}
+
+/// One returned retrieval hit (chunk text truncated to the size cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalHitView {
+    pub document_id: String,
+    pub chunk_id: String,
+    pub ordinal: u32,
+    pub match_count: usize,
+    /// Full chunk text byte length, before the size cap truncated it.
+    pub byte_len: usize,
+    /// Whether `text` was truncated to fit the per-hit size cap.
+    pub truncated: bool,
+    pub text: String,
+}
+
+/// Secret-free result of a bounded retrieval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrieveContextOutcome {
+    pub action: String,
+    pub outcome: RetrievalOutcome,
+    pub log_path: String,
+    pub tenant: String,
+    pub namespace: String,
+    pub top_k: usize,
+    pub max_chunk_bytes: usize,
+    pub time_budget_ms: u64,
+    /// Candidate hits found before the top-k cap truncated them (bounded by
+    /// [`MAX_RETRIEVAL_TOP_K`]).
+    pub candidate_count: usize,
+    pub returned: usize,
+    pub truncated_by_top_k: bool,
+    pub elapsed_ms: u64,
+    /// Whether the observed elapsed time exceeded the wall-clock budget.
+    pub time_capped: bool,
+    pub detail: Option<String>,
+    pub hits: Vec<RetrievalHitView>,
+}
+
+/// Ingest one document + its chunks into the derived retrieval fabric as one
+/// atomic transaction-log commit.  Bounded: at most
+/// [`MAX_RETRIEVAL_INGEST_CHUNKS`] chunks, each at most
+/// [`MAX_RETRIEVAL_INGEST_CHUNK_BYTES`] UTF-8 bytes.  Writes only this derived
+/// JSONL fabric — never `noetl.event`.
+pub fn ingest_local_reference_retrieval_document(
+    request: IngestRetrievalDocumentRequest,
+) -> Result<IngestRetrievalDocumentOutcome> {
+    if request.chunks.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "retrieval ingest requires at least one chunk".to_string(),
+        ));
+    }
+    if request.chunks.len() > MAX_RETRIEVAL_INGEST_CHUNKS {
+        return Err(EhdbError::InvalidState(format!(
+            "retrieval ingest {} chunks exceeds bound {MAX_RETRIEVAL_INGEST_CHUNKS}",
+            request.chunks.len()
+        )));
+    }
+    for chunk in &request.chunks {
+        if chunk.text.len() > MAX_RETRIEVAL_INGEST_CHUNK_BYTES {
+            return Err(EhdbError::InvalidState(format!(
+                "retrieval ingest chunk {} is {} bytes, exceeds bound {MAX_RETRIEVAL_INGEST_CHUNK_BYTES}",
+                chunk.chunk_id,
+                chunk.text.len()
+            )));
+        }
+    }
+
+    let tenant = TenantId::new(request.tenant.clone())?;
+    let namespace = NamespaceName::new(request.namespace.clone())?;
+    let document_id = DocumentId::new(request.document_id.clone())?;
+    let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+
+    let mut mutations = Vec::with_capacity(1 + request.chunks.len());
+    mutations.push(Mutation::Retrieval(RetrievalMutation::RegisterDocument {
+        document_id: document_id.clone(),
+        source_uri: request.source_uri.clone(),
+        content_type: request.content_type.clone(),
+    }));
+    for chunk in &request.chunks {
+        let chunk_id = ChunkId::new(chunk.chunk_id.clone())?;
+        mutations.push(Mutation::Retrieval(RetrievalMutation::RegisterChunk {
+            document_id: document_id.clone(),
+            chunk_id,
+            ordinal: chunk.ordinal,
+            text: chunk.text.clone(),
+            checksum: chunk.checksum.clone(),
+        }));
+    }
+
+    let mut runtime = LocalReferenceRuntime::open(&request.log_path)?;
+    runtime.append(CommitTransaction {
+        transaction_id,
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        mutations,
+    })?;
+
+    Ok(IngestRetrievalDocumentOutcome {
+        action: "ingest".to_string(),
+        log_path: runtime.path().display().to_string(),
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        document_id: document_id.to_string(),
+        chunk_count: request.chunks.len(),
+        document_count: runtime.state().retrieval.document_count(),
+        retrieval_chunk_count: runtime.state().retrieval.chunk_count(),
+        transaction_count: runtime.replay().len(),
+    })
+}
+
+/// Truncate `text` to at most `max_bytes` UTF-8 bytes on a char boundary,
+/// returning the (possibly truncated) slice and whether truncation happened.
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}
+
+/// Bounded, read-only retrieval over the derived retrieval fabric.
+///
+/// Runs a tenant/namespace-scoped text search under the hood ([`TextSearch`]),
+/// applying the three caps (top-k / per-hit size / wall-clock budget) inside the
+/// helper.  A missing/empty log yields `Empty` (no docs in scope), not an error.
+/// The runtime is opened read-only and dropped; nothing is ever written.
+pub fn retrieve_local_reference_context(
+    request: RetrieveContextRequest,
+) -> Result<RetrieveContextOutcome> {
+    let started = Instant::now();
+
+    // Classified early-return without searching: same shape, no hits.
+    let classify = |outcome: RetrievalOutcome, detail: Option<String>| RetrieveContextOutcome {
+        action: "retrieve".to_string(),
+        outcome,
+        log_path: request.log_path.display().to_string(),
+        tenant: request.tenant.clone(),
+        namespace: request.namespace.clone(),
+        top_k: request.top_k,
+        max_chunk_bytes: request.max_chunk_bytes,
+        time_budget_ms: request.time_budget_ms,
+        candidate_count: 0,
+        returned: 0,
+        truncated_by_top_k: false,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        time_capped: false,
+        detail,
+        hits: Vec::new(),
+    };
+
+    // Over-ceiling caps ⇒ Rejected (no search).
+    if request.top_k > MAX_RETRIEVAL_TOP_K {
+        return Ok(classify(
+            RetrievalOutcome::Rejected,
+            Some(format!(
+                "top_k {} exceeds bound {MAX_RETRIEVAL_TOP_K}",
+                request.top_k
+            )),
+        ));
+    }
+    if request.max_chunk_bytes > MAX_RETRIEVAL_MAX_CHUNK_BYTES {
+        return Ok(classify(
+            RetrievalOutcome::Rejected,
+            Some(format!(
+                "max_chunk_bytes {} exceeds bound {MAX_RETRIEVAL_MAX_CHUNK_BYTES}",
+                request.max_chunk_bytes
+            )),
+        ));
+    }
+    if request.time_budget_ms > MAX_RETRIEVAL_TIME_BUDGET_MS {
+        return Ok(classify(
+            RetrievalOutcome::Rejected,
+            Some(format!(
+                "time_budget_ms {} exceeds bound {MAX_RETRIEVAL_TIME_BUDGET_MS}",
+                request.time_budget_ms
+            )),
+        ));
+    }
+
+    // Invalid input ⇒ Invalid (no search).
+    if request.query.trim().is_empty() {
+        return Ok(classify(
+            RetrievalOutcome::Invalid,
+            Some("retrieval query must not be empty".to_string()),
+        ));
+    }
+    let tenant = match TenantId::new(request.tenant.clone()) {
+        Ok(t) => t,
+        Err(err) => return Ok(classify(RetrievalOutcome::Invalid, Some(err.to_string()))),
+    };
+    let namespace = match NamespaceName::new(request.namespace.clone()) {
+        Ok(n) => n,
+        Err(err) => return Ok(classify(RetrievalOutcome::Invalid, Some(err.to_string()))),
+    };
+
+    // Resolve 0 ⇒ default for the effective caps.
+    let top_k = if request.top_k == 0 {
+        DEFAULT_RETRIEVAL_TOP_K
+    } else {
+        request.top_k
+    };
+    let max_chunk_bytes = if request.max_chunk_bytes == 0 {
+        DEFAULT_RETRIEVAL_MAX_CHUNK_BYTES
+    } else {
+        request.max_chunk_bytes
+    };
+    let time_budget_ms = if request.time_budget_ms == 0 {
+        DEFAULT_RETRIEVAL_TIME_BUDGET_MS
+    } else {
+        request.time_budget_ms
+    };
+
+    // The log open + replay is the expensive part.  A genuine IO/corruption
+    // error propagates as `Err`; a fresh/missing log opens empty and searches to
+    // an `Empty` result (no docs in scope).
+    let runtime = LocalReferenceRuntime::open(&request.log_path)?;
+    let log_path = runtime.path().display().to_string();
+
+    // Search up to the ceiling to learn the candidate count, then truncate to
+    // the effective top-k so `truncated_by_top_k` is exact.
+    let candidates: Vec<TextSearchHit> = match runtime.state().retrieval.search_text(TextSearch {
+        tenant: tenant.clone(),
+        namespace: namespace.clone(),
+        query: request.query.clone(),
+        limit: MAX_RETRIEVAL_TOP_K,
+    }) {
+        Ok(hits) => hits,
+        // The only in-scope failure is an empty query, already guarded above; any
+        // other validation error is surfaced as Invalid rather than a hard error.
+        Err(err) => {
+            let mut out = classify(RetrievalOutcome::Invalid, Some(err.to_string()));
+            out.log_path = log_path;
+            return Ok(out);
+        }
+    };
+
+    let candidate_count = candidates.len();
+    let truncated_by_top_k = candidate_count > top_k;
+    let hits: Vec<RetrievalHitView> = candidates
+        .into_iter()
+        .take(top_k)
+        .map(|hit| {
+            let byte_len = hit.chunk.text.len();
+            let (text, truncated) = truncate_on_char_boundary(&hit.chunk.text, max_chunk_bytes);
+            RetrievalHitView {
+                document_id: hit.chunk.document_id.to_string(),
+                chunk_id: hit.chunk.id.to_string(),
+                ordinal: hit.chunk.ordinal,
+                match_count: hit.match_count,
+                byte_len,
+                truncated,
+                text,
+            }
+        })
+        .collect();
+
+    let returned = hits.len();
+    let outcome = if returned == 0 {
+        RetrievalOutcome::Empty
+    } else {
+        RetrievalOutcome::Hit
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    Ok(RetrieveContextOutcome {
+        action: "retrieve".to_string(),
+        outcome,
+        log_path,
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        top_k,
+        max_chunk_bytes,
+        time_budget_ms,
+        candidate_count,
+        returned,
+        truncated_by_top_k,
+        elapsed_ms,
+        time_capped: elapsed_ms > time_budget_ms,
+        detail: None,
+        hits,
+    })
+}
+
+/// Ingest one retrieval document and return the outcome as JSON.
+pub fn ingest_local_reference_retrieval_document_json(
+    request: IngestRetrievalDocumentRequest,
+) -> Result<String> {
+    serde_json::to_string(&ingest_local_reference_retrieval_document(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode ingest outcome: {err}")))
+}
+
+/// Run a bounded retrieval and return the outcome as JSON.
+pub fn retrieve_local_reference_context_json(request: RetrieveContextRequest) -> Result<String> {
+    serde_json::to_string(&retrieve_local_reference_context(request)?)
+        .map_err(|err| EhdbError::InvalidState(format!("encode retrieve outcome: {err}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3666,6 +4100,238 @@ mod tests {
             EhdbError::InvalidState(_)
         ));
         assert!(!path.exists(), "no commit on validation failure");
+        let _ = fs::remove_file(&path);
+    }
+
+    // --- bounded RAG retrieval (Phase E, noetl/ehdb#234) --------------------
+
+    fn ingest_chunk(chunk_id: &str, ordinal: u32, text: &str) -> IngestChunkInput {
+        IngestChunkInput {
+            chunk_id: chunk_id.to_string(),
+            ordinal,
+            text: text.to_string(),
+            checksum: format!("len-{}", text.len()),
+        }
+    }
+
+    fn ingest_doc(
+        path: &Path,
+        document_id: &str,
+        transaction_id: &str,
+        chunks: Vec<IngestChunkInput>,
+    ) -> IngestRetrievalDocumentOutcome {
+        ingest_local_reference_retrieval_document(IngestRetrievalDocumentRequest {
+            log_path: path.to_path_buf(),
+            tenant: "noetl".to_string(),
+            namespace: "default".to_string(),
+            document_id: document_id.to_string(),
+            source_uri: format!("artifact://{document_id}/source.md"),
+            content_type: "text/markdown".to_string(),
+            transaction_id: transaction_id.to_string(),
+            chunks,
+        })
+        .unwrap()
+    }
+
+    fn retrieve(
+        path: &Path,
+        query: &str,
+        top_k: usize,
+        max_chunk_bytes: usize,
+    ) -> RetrieveContextOutcome {
+        retrieve_local_reference_context(RetrieveContextRequest {
+            log_path: path.to_path_buf(),
+            tenant: "noetl".to_string(),
+            namespace: "default".to_string(),
+            query: query.to_string(),
+            top_k,
+            max_chunk_bytes,
+            time_budget_ms: 0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn retrieval_ingest_and_bounded_hit() {
+        let path = temp_log_path("rag-hit");
+        let out = ingest_doc(
+            &path,
+            "doc-rag",
+            "txn-rag-1",
+            vec![
+                ingest_chunk("doc-rag-0", 0, "NoETL retrieval lineage lives with EHDB"),
+                ingest_chunk("doc-rag-1", 1, "unrelated content about weather"),
+            ],
+        );
+        assert_eq!(out.chunk_count, 2);
+        assert_eq!(out.document_count, 1);
+        assert_eq!(out.retrieval_chunk_count, 2);
+
+        let r = retrieve(&path, "retrieval", 8, 0);
+        assert_eq!(r.outcome, RetrievalOutcome::Hit);
+        assert_eq!(r.returned, 1);
+        assert_eq!(r.hits[0].chunk_id, "doc-rag-0");
+        assert!(r.hits[0].text.contains("retrieval"));
+        assert!(!r.time_capped);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_top_k_truncates() {
+        let path = temp_log_path("rag-topk");
+        ingest_doc(
+            &path,
+            "doc-topk",
+            "txn-topk-1",
+            vec![
+                ingest_chunk("doc-topk-0", 0, "retrieval retrieval retrieval alpha"),
+                ingest_chunk("doc-topk-1", 1, "retrieval retrieval beta"),
+                ingest_chunk("doc-topk-2", 2, "retrieval gamma"),
+            ],
+        );
+        let r = retrieve(&path, "retrieval", 2, 0);
+        assert_eq!(r.outcome, RetrievalOutcome::Hit);
+        assert_eq!(r.candidate_count, 3);
+        assert_eq!(r.returned, 2);
+        assert!(r.truncated_by_top_k);
+        // Ranked by match_count desc: the 3-match chunk leads.
+        assert_eq!(r.hits[0].chunk_id, "doc-topk-0");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_size_cap_truncates_chunk_text() {
+        let path = temp_log_path("rag-size");
+        let long = format!("retrieval {}", "x".repeat(5_000));
+        ingest_doc(
+            &path,
+            "doc-size",
+            "txn-size-1",
+            vec![ingest_chunk("doc-size-0", 0, &long)],
+        );
+        let r = retrieve(&path, "retrieval", 8, 64);
+        assert_eq!(r.outcome, RetrievalOutcome::Hit);
+        assert_eq!(r.returned, 1);
+        assert!(r.hits[0].truncated);
+        assert!(r.hits[0].text.len() <= 64);
+        assert_eq!(r.hits[0].byte_len, long.len());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_empty_when_no_match() {
+        let path = temp_log_path("rag-empty");
+        ingest_doc(
+            &path,
+            "doc-empty",
+            "txn-empty-1",
+            vec![ingest_chunk("doc-empty-0", 0, "only lineage here")],
+        );
+        let r = retrieve(&path, "nonexistentterm", 8, 0);
+        assert_eq!(r.outcome, RetrievalOutcome::Empty);
+        assert_eq!(r.returned, 0);
+        assert!(r.hits.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_missing_log_is_empty_not_error() {
+        let path = temp_log_path("rag-missing");
+        // No ingest: the log does not exist yet.
+        let r = retrieve(&path, "retrieval", 8, 0);
+        assert_eq!(r.outcome, RetrievalOutcome::Empty);
+        assert_eq!(r.returned, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_over_limit_rejected() {
+        let path = temp_log_path("rag-reject");
+        ingest_doc(
+            &path,
+            "doc-reject",
+            "txn-reject-1",
+            vec![ingest_chunk("doc-reject-0", 0, "retrieval content")],
+        );
+        let over_top_k = retrieve(&path, "retrieval", MAX_RETRIEVAL_TOP_K + 1, 0);
+        assert_eq!(over_top_k.outcome, RetrievalOutcome::Rejected);
+        assert_eq!(over_top_k.returned, 0);
+
+        let over_bytes = retrieve(&path, "retrieval", 8, MAX_RETRIEVAL_MAX_CHUNK_BYTES + 1);
+        assert_eq!(over_bytes.outcome, RetrievalOutcome::Rejected);
+
+        let over_time = retrieve_local_reference_context(RetrieveContextRequest {
+            log_path: path.clone(),
+            tenant: "noetl".to_string(),
+            namespace: "default".to_string(),
+            query: "retrieval".to_string(),
+            top_k: 8,
+            max_chunk_bytes: 0,
+            time_budget_ms: MAX_RETRIEVAL_TIME_BUDGET_MS + 1,
+        })
+        .unwrap();
+        assert_eq!(over_time.outcome, RetrievalOutcome::Rejected);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_empty_query_invalid() {
+        let path = temp_log_path("rag-invalid");
+        let r = retrieve(&path, "   ", 8, 0);
+        assert_eq!(r.outcome, RetrievalOutcome::Invalid);
+        assert_eq!(r.returned, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retrieval_is_read_only() {
+        let path = temp_log_path("rag-readonly");
+        ingest_doc(
+            &path,
+            "doc-ro",
+            "txn-ro-1",
+            vec![ingest_chunk("doc-ro-0", 0, "retrieval read only")],
+        );
+        let before = summarize_local_reference(&path).unwrap().transaction_count;
+        // Several retrievals must not append anything.
+        for _ in 0..3 {
+            let r = retrieve(&path, "retrieval", 8, 0);
+            assert_eq!(r.outcome, RetrievalOutcome::Hit);
+        }
+        let after = summarize_local_reference(&path).unwrap().transaction_count;
+        assert_eq!(before, after, "retrieval must not write the log");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ingest_rejects_empty_and_oversized_chunks() {
+        let path = temp_log_path("rag-ingest-reject");
+        let empty = ingest_local_reference_retrieval_document(IngestRetrievalDocumentRequest {
+            log_path: path.clone(),
+            tenant: "noetl".to_string(),
+            namespace: "default".to_string(),
+            document_id: "doc-none".to_string(),
+            source_uri: "artifact://doc-none/source.md".to_string(),
+            content_type: "text/markdown".to_string(),
+            transaction_id: "txn-none".to_string(),
+            chunks: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(empty, EhdbError::InvalidState(_)));
+
+        let huge = "x".repeat(MAX_RETRIEVAL_INGEST_CHUNK_BYTES + 1);
+        let oversized = ingest_local_reference_retrieval_document(IngestRetrievalDocumentRequest {
+            log_path: path.clone(),
+            tenant: "noetl".to_string(),
+            namespace: "default".to_string(),
+            document_id: "doc-huge".to_string(),
+            source_uri: "artifact://doc-huge/source.md".to_string(),
+            content_type: "text/markdown".to_string(),
+            transaction_id: "txn-huge".to_string(),
+            chunks: vec![ingest_chunk("doc-huge-0", 0, &huge)],
+        })
+        .unwrap_err();
+        assert!(matches!(oversized, EhdbError::InvalidState(_)));
         let _ = fs::remove_file(&path);
     }
 }
