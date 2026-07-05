@@ -450,6 +450,27 @@ impl InMemoryStreamLog {
             .sum()
     }
 
+    /// Read-only lookup of a durable consumer, including its ack cursor.
+    ///
+    /// Returns `NotFound` when either the stream or the consumer is absent.
+    /// This is the read side of the durable-consumer contract: callers that
+    /// need the current ack cursor without mutating it (e.g. reporting the
+    /// cursor position on a bounded pull) use this instead of `ack`.
+    pub fn consumer(
+        &self,
+        tenant: &TenantId,
+        namespace: &NamespaceName,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+    ) -> Result<DurableConsumer> {
+        let state = self.stream(tenant, namespace, stream)?;
+        state
+            .consumers
+            .get(consumer)
+            .cloned()
+            .ok_or_else(|| EhdbError::NotFound(consumer.to_string()))
+    }
+
     fn ensure_stream_absent(&self, config: &StreamConfig) -> Result<()> {
         let key = stream_key(&config.tenant, &config.namespace, &config.name);
         if self.streams.contains_key(&key) {

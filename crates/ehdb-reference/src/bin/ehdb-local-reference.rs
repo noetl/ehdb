@@ -1,9 +1,11 @@
 use std::{collections::HashMap, env, path::PathBuf, process};
 
 use ehdb_reference::{
-    append_local_reference_domain_record_json, read_local_reference_domain_records_json,
-    summarize_local_reference_json, AppendDomainRecordRequest, ReadDomainRecordsRequest,
-    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
+    consume_local_reference_event_records_json, read_local_reference_domain_records_json,
+    summarize_local_reference_json, AckEventConsumerRequest, AppendDomainRecordRequest,
+    ConsumeEventRecordsRequest, ReadDomainRecordsRequest, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 fn main() {
@@ -29,6 +31,8 @@ fn run(args: Vec<String>) -> Result<String, String> {
         Some((command, rest)) if command == "summary" => run_summary(rest),
         Some((command, rest)) if command == "append" => run_append(rest),
         Some((command, rest)) if command == "read" => run_read(rest),
+        Some((command, rest)) if command == "consume" => run_consume(rest),
+        Some((command, rest)) if command == "ack" => run_ack(rest),
         _ => Err(usage().to_string()),
     }
 }
@@ -103,6 +107,68 @@ fn run_read(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())
 }
 
+fn run_consume(args: &[String]) -> Result<String, String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let stream = take_required(&mut flags, "stream")?;
+    let consumer = take_required(&mut flags, "consumer")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    let limit = match flags.remove("limit") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --limit value: {raw}"))?,
+        None => 100,
+    };
+    ensure_no_unknown_flags(&flags)?;
+
+    consume_local_reference_event_records_json(ConsumeEventRecordsRequest {
+        log_path: PathBuf::from(log),
+        tenant,
+        namespace,
+        stream,
+        consumer,
+        transaction_id,
+        limit,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn run_ack(args: &[String]) -> Result<String, String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let stream = take_required(&mut flags, "stream")?;
+    let consumer = take_required(&mut flags, "consumer")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let sequence_raw = take_required(&mut flags, "sequence")?;
+    let sequence = sequence_raw
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --sequence value: {sequence_raw}"))?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    ack_local_reference_event_consumer_json(AckEventConsumerRequest {
+        log_path: PathBuf::from(log),
+        tenant,
+        namespace,
+        stream,
+        consumer,
+        transaction_id,
+        sequence,
+    })
+    .map_err(|err| err.to_string())
+}
+
 /// Parse `--key value` pairs into a map.  Rejects positional args and flags
 /// without a value so a malformed invocation fails loudly rather than being
 /// silently ignored.
@@ -147,5 +213,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]"
 }
