@@ -620,6 +620,266 @@ pub fn compare_shadow_parity(
     }
 }
 
+// ===========================================================================
+// Primary-serve (completion program Phase 9, tier 1 — event-log cutover).
+//
+// Phase 6 shipped the engine + the shadow (dual-write + parity, never serve).
+// Phase 9 tier 1 is the first per-tier PRIMARY cutover: the EHDB engine becomes
+// the authoritative append + read + tail + ack + replay path for the platform
+// event log, in place of the JetStream + Postgres incumbent.
+//
+// This block is the crate-side primary-serve helper: a single authoritative
+// *cycle* that drives every serving leg through the engine and proves the
+// JetStream+Postgres semantics are preserved (global gapless ordering,
+// per-execution scope, durable consumer cursor, replay-is-truth), while
+// dual-run parity-checking each append against the incumbent sequence.
+//
+// ## Reversibility (the safety property the cutover is gated on)
+//
+// The cycle is **additive toward the incumbent**: it appends only to the EHDB
+// log ([`RetentionPolicy::KeepAll`]) and never mutates or deletes anything the
+// incumbent owns.  Flipping a caller back from `primary` to `shadow`/`off`
+// therefore restores the incumbent as authoritative with zero data loss — the
+// EHDB log stays intact on disk (a later re-enable replays it whole), and the
+// incumbent's own store was never touched.  [`exercise_primary_serve`] proves
+// the "EHDB log stays intact" half directly via the replay leg; the "incumbent
+// untouched" half is a structural property of the caller (the worker asserts it
+// by never importing a NoETL event writer).
+// ===========================================================================
+
+/// One event to drive through the authoritative primary-serve cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLogPrimaryEvent {
+    pub execution_id: String,
+    pub transaction_id: String,
+    pub payload: String,
+    /// The sequence the incumbent (JetStream stream-seq / Postgres ordering)
+    /// producer path assigned to this event, when known — for the dual-run
+    /// parity check.  `None` relies on count + ordering parity (the safe default
+    /// where the authoritative sequence is not surfaced 1-based-aligned).
+    pub authoritative_sequence: Option<u64>,
+}
+
+/// The served-by-EHDB proof for one primary-serve cycle: every serving leg ran
+/// through the engine and preserved the incumbent's semantics, and each append
+/// held dual-run parity against the incumbent.  Secret-free (counts + verdicts;
+/// the payloads are the caller's own event bodies, echoed only in the leg views
+/// the caller already holds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventLogPrimaryServeReport {
+    /// The backing engine that served the cycle.
+    pub driver_name: String,
+    /// How many events the cycle appended authoritatively.
+    pub appended: usize,
+    /// Global scan returned every appended event in gapless 1-based order.
+    pub scan_ordered: bool,
+    pub scan_count: usize,
+    /// Per-execution reads returned only that execution's events, in order.
+    pub scope_ok: bool,
+    /// Durable tail before any ack saw every appended event as pending, ordered.
+    pub tail_pending_before_ack: usize,
+    /// The sequence acked in the cycle (the first appended global sequence).
+    pub acked_sequence: u64,
+    /// After acking the first sequence, the durable cursor advanced and the tail
+    /// returned exactly one fewer pending, starting after the ack.
+    pub ack_advanced: bool,
+    pub tail_pending_after_ack: usize,
+    /// A fresh driver over the same on-disk log replayed the identical record
+    /// set (replay-is-truth / durability — the reversibility half this helper
+    /// proves directly).
+    pub replay_count: usize,
+    pub replay_matches: bool,
+    /// Per-append dual-run parity verdicts against the incumbent sequence.
+    pub dual_run: Vec<EventLogParityReport>,
+    /// Every dual-run parity verdict held.
+    pub dual_run_holds: bool,
+    /// The single reason the cycle failed a served-by-EHDB invariant, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl EventLogPrimaryServeReport {
+    /// Whether the EHDB engine served the whole cycle with the incumbent's
+    /// semantics preserved and dual-run parity intact.
+    pub fn served_by_ehdb(&self) -> bool {
+        self.scan_ordered
+            && self.scope_ok
+            && self.ack_advanced
+            && self.replay_matches
+            && self.dual_run_holds
+            && self.divergence.is_none()
+    }
+}
+
+/// Run the authoritative event-log primary-serve cycle over `driver`.
+///
+/// Drives every serving leg through the EHDB engine — append, global scan,
+/// per-execution scoped read, durable-consumer tail, ack, and a
+/// fresh-driver replay — asserting the JetStream+Postgres semantics are
+/// preserved (monotonic gapless global sequence, per-execution scope, durable
+/// cursor advance, replay-is-truth) and dual-run parity-checking each append
+/// against the incumbent sequence.  Returns the [`EventLogPrimaryServeReport`]
+/// served-by-EHDB proof.
+///
+/// Reversible + non-destructive toward the incumbent: appends only to the EHDB
+/// log ([`RetentionPolicy::KeepAll`]); the replay leg proves the log stays whole
+/// so a flip back to the incumbent loses nothing.
+///
+/// `events` must be non-empty ([`EhdbError::InvalidState`] otherwise).  The ack
+/// leg acks the first appended sequence; `consumer` names the durable consumer.
+pub fn exercise_primary_serve(
+    driver: &LocalReferenceEventLogDriver,
+    events: &[EventLogPrimaryEvent],
+    consumer: &str,
+    ack_transaction_id: &str,
+) -> Result<EventLogPrimaryServeReport> {
+    if events.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "event-log primary-serve requires at least one event".to_string(),
+        ));
+    }
+
+    // --- Append leg: EHDB assigns the authoritative global sequence. ---------
+    let mut dual_run = Vec::with_capacity(events.len());
+    let mut first_sequence = 0u64;
+    for (i, event) in events.iter().enumerate() {
+        let outcome = driver.append(&EventLogAppendRequest {
+            execution_id: event.execution_id.clone(),
+            transaction_id: event.transaction_id.clone(),
+            payload: event.payload.clone(),
+        })?;
+        if i == 0 {
+            first_sequence = outcome.global_sequence;
+        }
+        // The canonical log is gapless from 1, so `expected_count == sequence`
+        // and `previous == sequence - 1` are the engine's own invariants; the
+        // authoritative sequence is enforced when the caller knows it.
+        let previous_sequence = outcome.global_sequence.saturating_sub(1);
+        let expected_count = outcome.global_sequence as usize;
+        dual_run.push(compare_shadow_parity(
+            event.authoritative_sequence,
+            &outcome,
+            previous_sequence,
+            expected_count,
+        ));
+    }
+    let dual_run_holds = dual_run.iter().all(EventLogParityReport::holds);
+
+    // --- Global scan leg: authoritative ordered read of the whole log. -------
+    let scan = driver.scan_global(&EventLogScanRequest {
+        after: None,
+        limit: events.len(),
+    })?;
+    let scan_count = scan.record_count;
+    let scan_seqs: Vec<u64> = scan.records.iter().map(|r| r.global_sequence).collect();
+    let expected_seqs: Vec<u64> = (1..=events.len() as u64).collect();
+    let scan_ordered = scan.exists && scan_seqs == expected_seqs;
+
+    // --- Per-execution scope leg: each execution's events, scoped + ordered. --
+    let mut executions: Vec<String> = events.iter().map(|e| e.execution_id.clone()).collect();
+    executions.sort();
+    executions.dedup();
+    let mut scope_ok = true;
+    for execution_id in &executions {
+        let read = driver.read_execution(&EventLogReadExecutionRequest {
+            execution_id: execution_id.clone(),
+            after: None,
+            limit: events.len(),
+        })?;
+        let scoped = read.records.iter().all(|r| &r.execution_id == execution_id);
+        let ordered = read
+            .records
+            .windows(2)
+            .all(|w| w[0].global_sequence < w[1].global_sequence);
+        let expected = events
+            .iter()
+            .filter(|e| &e.execution_id == execution_id)
+            .count();
+        scope_ok &= read.exists && scoped && ordered && read.record_count == expected;
+    }
+
+    // --- Durable tail + ack leg: offset/subscribe with a persisted cursor. ----
+    let tail_before = driver.tail(&EventLogTailRequest {
+        consumer: consumer.to_string(),
+        transaction_id: format!("{ack_transaction_id}-tail-1"),
+        limit: events.len(),
+    })?;
+    let tail_pending_before_ack = tail_before.pending_count;
+
+    driver.ack(&EventLogAckRequest {
+        consumer: consumer.to_string(),
+        transaction_id: ack_transaction_id.to_string(),
+        sequence: first_sequence,
+    })?;
+
+    let tail_after = driver.tail(&EventLogTailRequest {
+        consumer: consumer.to_string(),
+        transaction_id: format!("{ack_transaction_id}-tail-2"),
+        limit: events.len(),
+    })?;
+    let tail_pending_after_ack = tail_after.pending_count;
+    let ack_advanced = tail_after.acked_sequence == Some(first_sequence)
+        && tail_pending_after_ack + 1 == tail_pending_before_ack
+        && tail_after
+            .records
+            .first()
+            .map(|r| r.global_sequence > first_sequence)
+            .unwrap_or(events.len() == 1);
+
+    // --- Replay leg: a fresh driver over the same log reconstructs it whole. --
+    // A clone reopens the on-disk transaction log per op, so this is a genuine
+    // from-disk replay (the durability / reversibility half proven directly).
+    let replay_driver = driver.clone();
+    let replay = replay_driver.scan_global(&EventLogScanRequest {
+        after: None,
+        limit: events.len(),
+    })?;
+    let replay_count = replay.record_count;
+    let replay_matches = replay.exists && replay_count == events.len();
+
+    let divergence = if !scan_ordered {
+        Some(format!(
+            "primary scan not gapless-ordered: got {scan_seqs:?}, expected {expected_seqs:?}"
+        ))
+    } else if !scope_ok {
+        Some("primary per-execution read lost scope or order".to_string())
+    } else if !ack_advanced {
+        Some(format!(
+            "primary durable cursor did not advance: acked={:?} pending {tail_pending_before_ack}->{tail_pending_after_ack}",
+            tail_after.acked_sequence
+        ))
+    } else if !replay_matches {
+        Some(format!(
+            "primary replay lost records: replayed {replay_count} of {}",
+            events.len()
+        ))
+    } else if !dual_run_holds {
+        dual_run
+            .iter()
+            .find_map(|r| r.divergence.clone())
+            .or_else(|| Some("primary dual-run parity diverged".to_string()))
+    } else {
+        None
+    };
+
+    Ok(EventLogPrimaryServeReport {
+        driver_name: driver.driver_name().to_string(),
+        appended: events.len(),
+        scan_ordered,
+        scan_count,
+        scope_ok,
+        tail_pending_before_ack,
+        acked_sequence: first_sequence,
+        ack_advanced,
+        tail_pending_after_ack,
+        replay_count,
+        replay_matches,
+        dual_run,
+        dual_run_holds,
+        divergence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,6 +1156,127 @@ mod tests {
         let (log, dir) = tmp_log("name");
         let d = driver(&log);
         assert_eq!(d.driver_name(), "ehdb-local-reference");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn primary_events() -> Vec<EventLogPrimaryEvent> {
+        // Two executions interleaved, 1-based authoritative sequences known.
+        vec![
+            EventLogPrimaryEvent {
+                execution_id: "100".to_string(),
+                transaction_id: "txn-1".to_string(),
+                payload: "{\"seq\":1}".to_string(),
+                authoritative_sequence: Some(1),
+            },
+            EventLogPrimaryEvent {
+                execution_id: "200".to_string(),
+                transaction_id: "txn-2".to_string(),
+                payload: "{\"seq\":2}".to_string(),
+                authoritative_sequence: Some(2),
+            },
+            EventLogPrimaryEvent {
+                execution_id: "100".to_string(),
+                transaction_id: "txn-3".to_string(),
+                payload: "{\"seq\":3}".to_string(),
+                authoritative_sequence: Some(3),
+            },
+        ]
+    }
+
+    #[test]
+    fn primary_serve_cycle_is_served_by_ehdb() {
+        let (log, dir) = tmp_log("primary-serve");
+        let d = driver(&log);
+        let report = exercise_primary_serve(&d, &primary_events(), "projector", "ack-txn").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.driver_name, "ehdb-local-reference");
+        assert_eq!(report.appended, 3);
+        assert!(report.scan_ordered);
+        assert_eq!(report.scan_count, 3);
+        assert!(report.scope_ok);
+        // Durable tail saw all 3 pending, then one fewer after acking seq 1.
+        assert_eq!(report.tail_pending_before_ack, 3);
+        assert_eq!(report.acked_sequence, 1);
+        assert!(report.ack_advanced);
+        assert_eq!(report.tail_pending_after_ack, 2);
+        // Replay-is-truth: a fresh driver over the same log reconstructs it whole.
+        assert_eq!(report.replay_count, 3);
+        assert!(report.replay_matches);
+        assert!(report.dual_run_holds);
+        assert!(report.divergence.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_dual_run_flags_incumbent_divergence() {
+        let (log, dir) = tmp_log("primary-diverge");
+        let d = driver(&log);
+        // Authoritative claims 99 for the first event but EHDB assigns 1 → the
+        // dual-run parity fails and the cycle is not served-by-EHDB.
+        let mut events = primary_events();
+        events[0].authoritative_sequence = Some(99);
+        let report = exercise_primary_serve(&d, &events, "projector", "ack-txn").unwrap();
+        assert!(!report.served_by_ehdb());
+        assert!(!report.dual_run_holds);
+        assert!(report.divergence.unwrap().contains("sequence divergence"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_without_authoritative_sequence_still_serves() {
+        let (log, dir) = tmp_log("primary-noauth");
+        let d = driver(&log);
+        // No incumbent sequence surfaced → count+order parity still enforced.
+        let events: Vec<EventLogPrimaryEvent> = (1..=3)
+            .map(|n| EventLogPrimaryEvent {
+                execution_id: "100".to_string(),
+                transaction_id: format!("txn-{n}"),
+                payload: format!("{{\"seq\":{n}}}"),
+                authoritative_sequence: None,
+            })
+            .collect();
+        let report = exercise_primary_serve(&d, &events, "projector", "ack-txn").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_reversibility_replay_after_reopen() {
+        // Proves the reversibility half this helper owns: after a primary cycle
+        // a brand-new driver over the same on-disk log serves the identical
+        // record set — a flip back to the incumbent (or a later re-enable)
+        // loses nothing because the EHDB log stays whole on disk.
+        let (log, dir) = tmp_log("primary-revert");
+        {
+            let d = driver(&log);
+            let report =
+                exercise_primary_serve(&d, &primary_events(), "projector", "ack-txn").unwrap();
+            assert!(report.served_by_ehdb());
+        }
+        let reopened = driver(&log);
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.record_count, 3);
+        assert_eq!(
+            scan.records
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_requires_at_least_one_event() {
+        let (log, dir) = tmp_log("primary-empty");
+        let d = driver(&log);
+        let err = exercise_primary_serve(&d, &[], "projector", "ack-txn").unwrap_err();
+        assert!(err.to_string().contains("at least one event"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

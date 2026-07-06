@@ -39,8 +39,9 @@ use serde::{Deserialize, Serialize};
 /// exposed behind a driver interface.  See [`eventlog`].
 pub mod eventlog;
 pub use eventlog::{
-    compare_shadow_parity, EventLogAckOutcome, EventLogAckRequest, EventLogAppendOutcome,
-    EventLogAppendRequest, EventLogDriver, EventLogParityReport, EventLogReadExecutionOutcome,
+    compare_shadow_parity, exercise_primary_serve, EventLogAckOutcome, EventLogAckRequest,
+    EventLogAppendOutcome, EventLogAppendRequest, EventLogDriver, EventLogParityReport,
+    EventLogPrimaryEvent, EventLogPrimaryServeReport, EventLogReadExecutionOutcome,
     EventLogReadExecutionRequest, EventLogRecordView, EventLogScanOutcome, EventLogScanRequest,
     EventLogTailOutcome, EventLogTailRequest, LocalReferenceEventLogDriver, EVENT_LOG_STREAM,
     EVENT_LOG_SUBJECT_PREFIX,
