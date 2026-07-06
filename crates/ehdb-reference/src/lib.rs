@@ -56,8 +56,9 @@ pub use projection::{
     compare_projection_parity, AuthoritativeExecutionState, EventReadModelView, ExecutionStateView,
     LocalReferenceProjectionEngine, ProjectionApplyOutcome, ProjectionApplyRequest,
     ProjectionCheckpoint, ProjectionDriver, ProjectionEventInput, ProjectionListExecutionsOutcome,
-    ProjectionParityReport, ProjectionReadEventOutcome, ProjectionReadExecutionOutcome,
-    PROJECTION_STREAM, PROJECTION_SUBJECT_PREFIX,
+    ProjectionParityReport, ProjectionPrimaryInput, ProjectionPrimaryServeReport,
+    ProjectionReadEventOutcome, ProjectionReadExecutionOutcome, PROJECTION_STREAM,
+    PROJECTION_SUBJECT_PREFIX,
 };
 
 /// EHDB KV / platform-state core engine (completion program Phase 8, slice 1) —

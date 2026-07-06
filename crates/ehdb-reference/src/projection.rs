@@ -753,6 +753,273 @@ pub fn compare_projection_parity(
     }
 }
 
+// ===========================================================================
+// Primary-serve (completion program Phase 9, tier 2 — projection cutover).
+//
+// Phase 7 shipped the engine + the shadow (dual-materialize + parity, never
+// serve).  Phase 9 tier 2 is the second per-tier PRIMARY cutover (the event-log
+// tier is tier 1): the EHDB projection engine becomes the authoritative
+// read-model builder + read-serving path the control plane queries, in place of
+// the PostgreSQL materializer.
+//
+// This block is the crate-side primary-serve helper: a single authoritative
+// *cycle* that drives every serving leg through the engine and proves the
+// PostgreSQL-materializer query contracts are preserved (apply → materialize →
+// serve the read-model queries [`ProjectionDriver::read_execution_state`] /
+// [`ProjectionDriver::read_event`] / [`ProjectionDriver::list_executions`] →
+// durable checkpoint → replay-idempotent on the global sequence), while
+// dual-run parity-checking the served read-models against the incumbent
+// materializer's output.
+//
+// ## Reversibility (the safety property the cutover is gated on)
+//
+// The cycle is **additive toward the incumbent**: it materializes only into the
+// derived EHDB projection store ([`RetentionPolicy::KeepAll`]) by *consuming*
+// the already-authored event log, and never authors an event nor mutates
+// anything the incumbent materializer owns.  Flipping a caller back from
+// `primary` to `shadow`/`off` therefore restores the PostgreSQL materializer as
+// the authoritative read path with zero data loss — the EHDB read-model store
+// stays intact on disk (a later re-enable replays it whole), and the incumbent's
+// own read-models were never touched.  [`exercise_primary_serve`] proves the
+// "EHDB read-model stays intact" half directly via the fresh-engine replay leg;
+// the "incumbent untouched" half is a structural property of the caller (the
+// worker asserts it by never importing a NoETL event writer or the materializer).
+// ===========================================================================
+
+/// The event batch to drive through the authoritative primary-serve cycle, plus
+/// the incumbent (PostgreSQL-materializer) view the served read-models are
+/// dual-run parity-checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionPrimaryInput {
+    /// The already-authored events to materialize authoritatively (an ordered
+    /// event-log tail).
+    pub events: Vec<ProjectionEventInput>,
+    /// The incumbent materializer's execution-state rows for the same events —
+    /// the dual-run parity ground truth.
+    pub authoritative: Vec<AuthoritativeExecutionState>,
+    /// The incumbent's committed offset (highest global sequence materialized),
+    /// when known — for the checkpoint-lag half of the dual-run parity check.
+    /// `None` relies on key + value parity (the safe default where the
+    /// authoritative offset is not surfaced).
+    pub authoritative_offset: Option<u64>,
+}
+
+/// The served-by-EHDB proof for one projection primary-serve cycle: every
+/// serving leg ran through the engine and preserved the PostgreSQL
+/// materializer's query contracts, and the served read-models held dual-run
+/// parity against the incumbent.  Secret-free (counts + verdicts; the read-model
+/// fields are the caller's own projected columns, never the event body).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionPrimaryServeReport {
+    /// The backing engine that served the cycle.
+    pub driver_name: String,
+    /// New read-model rows the cycle materialized authoritatively.
+    pub applied: usize,
+    /// The durable checkpoint (applied-through global sequence) after materialize.
+    pub checkpoint: u64,
+    /// The served `list_executions` returned exactly the materialized execution
+    /// set (the list query contract).
+    pub list_ok: bool,
+    pub list_count: usize,
+    /// Per-execution `read_execution_state` served the folded state, scoped to
+    /// that execution with the right event count (the per-execution read
+    /// contract).
+    pub scope_ok: bool,
+    /// `read_event` served the event read-model for a known `event_id` (the
+    /// event-lookup contract).
+    pub read_event_ok: bool,
+    /// Re-applying the same batch was an idempotent no-op (0 applied, every event
+    /// skipped below checkpoint, checkpoint unchanged) — exactly-once on the
+    /// event-log global sequence.
+    pub replay_idempotent: bool,
+    /// A fresh engine over the same on-disk store served the identical read-model
+    /// set (replay-is-truth / durability — the reversibility half proven
+    /// directly).
+    pub replay_count: usize,
+    pub replay_matches: bool,
+    /// Dual-run parity of the served read-models against the incumbent
+    /// materializer.
+    pub dual_run: ProjectionParityReport,
+    /// The dual-run parity verdict held.
+    pub dual_run_holds: bool,
+    /// The single reason the cycle failed a served-by-EHDB invariant, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl ProjectionPrimaryServeReport {
+    /// Whether the EHDB engine served the whole cycle with the incumbent's query
+    /// contracts preserved and dual-run parity intact.
+    pub fn served_by_ehdb(&self) -> bool {
+        self.list_ok
+            && self.scope_ok
+            && self.read_event_ok
+            && self.replay_idempotent
+            && self.replay_matches
+            && self.dual_run_holds
+            && self.divergence.is_none()
+    }
+}
+
+/// Run the authoritative projection primary-serve cycle over `engine`.
+///
+/// Drives every serving leg through the EHDB engine — apply (materialize), the
+/// three read-model query contracts (`list_executions`, per-execution
+/// `read_execution_state`, `read_event`), the durable `checkpoint`, an
+/// idempotent re-apply (exactly-once on the global sequence), and a fresh-engine
+/// replay — asserting the PostgreSQL materializer's query contracts are
+/// preserved and dual-run parity-checking the served read-models against the
+/// incumbent's output.  Returns the [`ProjectionPrimaryServeReport`]
+/// served-by-EHDB proof.
+///
+/// Reversible + non-destructive toward the incumbent: materializes only into the
+/// derived EHDB projection store ([`RetentionPolicy::KeepAll`]) by consuming the
+/// already-authored events; the replay leg proves the store stays whole so a flip
+/// back to the incumbent materializer loses nothing.
+///
+/// `input.events` must be non-empty ([`EhdbError::InvalidState`] otherwise).
+/// `consumer` names the durable projector checkpoint.
+pub fn exercise_primary_serve(
+    engine: &LocalReferenceProjectionEngine,
+    input: &ProjectionPrimaryInput,
+    consumer: &str,
+    transaction_id: &str,
+) -> Result<ProjectionPrimaryServeReport> {
+    if input.events.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "projection primary-serve requires at least one event".to_string(),
+        ));
+    }
+
+    // --- Apply leg: EHDB materializes the read-models authoritatively. -------
+    let apply = engine.apply(&ProjectionApplyRequest {
+        consumer: consumer.to_string(),
+        transaction_id: transaction_id.to_string(),
+        events: input.events.clone(),
+    })?;
+    let checkpoint = apply.checkpoint.applied_through_sequence;
+
+    // The materialized execution set the read-model queries must serve.
+    let mut expected_execs: Vec<String> = input
+        .events
+        .iter()
+        .map(|e| e.execution_id.clone())
+        .collect();
+    expected_execs.sort();
+    expected_execs.dedup();
+
+    // --- List leg: `list_executions` (the control-plane list query contract). -
+    let list = engine.list_executions(input.events.len().max(1))?;
+    let mut listed_execs: Vec<String> =
+        list.states.iter().map(|s| s.execution_id.clone()).collect();
+    listed_execs.sort();
+    listed_execs.dedup();
+    let list_ok = list.exists && listed_execs == expected_execs;
+    let list_count = list.total;
+
+    // --- Scope leg: per-execution `read_execution_state`, scoped + folded. ----
+    let mut scope_ok = true;
+    for execution_id in &expected_execs {
+        let read = engine.read_execution_state(execution_id)?;
+        let expected_count = input
+            .events
+            .iter()
+            .filter(|e| &e.execution_id == execution_id)
+            .count();
+        match read.state {
+            Some(state) => {
+                scope_ok &= read.exists
+                    && &state.execution_id == execution_id
+                    && state.event_count == expected_count;
+            }
+            None => scope_ok = false,
+        }
+    }
+
+    // --- Event-lookup leg: `read_event` serves the event read-model by id. ----
+    let probe_event_id = input.events.first().map(|e| e.event_id).unwrap_or_default();
+    let read_event = engine.read_event(probe_event_id)?;
+    let read_event_ok = read_event.exists
+        && read_event
+            .event
+            .as_ref()
+            .map(|e| e.event_id == probe_event_id)
+            .unwrap_or(false);
+
+    // --- Replay-idempotent leg: re-apply the same batch → exactly-once no-op. --
+    let replay_apply = engine.apply(&ProjectionApplyRequest {
+        consumer: consumer.to_string(),
+        transaction_id: format!("{transaction_id}-replay"),
+        events: input.events.clone(),
+    })?;
+    let replay_idempotent = replay_apply.applied == 0
+        && replay_apply.skipped_below_checkpoint == input.events.len()
+        && replay_apply.checkpoint.applied_through_sequence == checkpoint;
+
+    // --- Replay-is-truth leg: a fresh engine over the same store reconstructs it.
+    // A clone reopens the on-disk projection store per op, so this is a genuine
+    // from-disk replay (the durability / reversibility half proven directly).
+    let replay_engine = engine.clone();
+    let replay = replay_engine.list_executions(input.events.len().max(1))?;
+    let replay_count = replay.total;
+    let replay_matches = replay.exists && replay.states == list.states;
+
+    // --- Dual-run parity leg: served read-models vs the incumbent materializer.
+    let dual_run = compare_projection_parity(
+        &list.states,
+        &input.authoritative,
+        checkpoint,
+        input.authoritative_offset,
+    );
+    let dual_run_holds = dual_run.holds();
+
+    let divergence = if !list_ok {
+        Some(format!(
+            "primary list served wrong execution set: got {listed_execs:?}, expected {expected_execs:?}"
+        ))
+    } else if !scope_ok {
+        Some("primary per-execution read lost scope or fold".to_string())
+    } else if !read_event_ok {
+        Some(format!(
+            "primary read_event did not serve event {probe_event_id}"
+        ))
+    } else if !replay_idempotent {
+        Some(format!(
+            "primary re-apply not idempotent: applied {} skipped_below_checkpoint {} checkpoint {}",
+            replay_apply.applied,
+            replay_apply.skipped_below_checkpoint,
+            replay_apply.checkpoint.applied_through_sequence
+        ))
+    } else if !replay_matches {
+        Some(format!(
+            "primary replay lost read-models: replayed {replay_count} execution rows"
+        ))
+    } else if !dual_run_holds {
+        dual_run
+            .divergence
+            .clone()
+            .or_else(|| Some("primary dual-run parity diverged".to_string()))
+    } else {
+        None
+    };
+
+    Ok(ProjectionPrimaryServeReport {
+        driver_name: engine.driver_name().to_string(),
+        applied: apply.applied,
+        checkpoint,
+        list_ok,
+        list_count,
+        scope_ok,
+        read_event_ok,
+        replay_idempotent,
+        replay_count,
+        replay_matches,
+        dual_run,
+        dual_run_holds,
+        divergence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,6 +1537,176 @@ mod tests {
         let (log, dir) = tmp_log("name");
         let e = engine(&log);
         assert_eq!(e.driver_name(), "ehdb-local-reference");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two executions interleaved: "100" runs two events to a terminal completed,
+    /// "200" one running event — a scope + fold + parity ground truth.
+    fn primary_input() -> ProjectionPrimaryInput {
+        let events = vec![
+            ev(
+                1,
+                10,
+                "100",
+                "playbook_started",
+                Some("start"),
+                Some("running"),
+            ),
+            ev(
+                2,
+                20,
+                "200",
+                "playbook_started",
+                Some("start"),
+                Some("running"),
+            ),
+            ev(
+                3,
+                11,
+                "100",
+                "playbook.completed",
+                Some("finish"),
+                Some("completed"),
+            ),
+        ];
+        let authoritative = vec![
+            AuthoritativeExecutionState {
+                execution_id: "100".to_string(),
+                status: "completed".to_string(),
+                event_count: 2,
+                terminal: true,
+            },
+            AuthoritativeExecutionState {
+                execution_id: "200".to_string(),
+                status: "running".to_string(),
+                event_count: 1,
+                terminal: false,
+            },
+        ];
+        ProjectionPrimaryInput {
+            events,
+            authoritative,
+            authoritative_offset: Some(3),
+        }
+    }
+
+    #[test]
+    fn primary_serve_cycle_is_served_by_ehdb() {
+        let (log, dir) = tmp_log("primary-serve");
+        let e = engine(&log);
+        let report =
+            exercise_primary_serve(&e, &primary_input(), "projector", "primary-t1").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.driver_name, "ehdb-local-reference");
+        assert_eq!(report.applied, 3);
+        assert_eq!(report.checkpoint, 3);
+        assert!(report.list_ok);
+        assert_eq!(report.list_count, 2);
+        assert!(report.scope_ok);
+        assert!(report.read_event_ok);
+        // Exactly-once: a re-apply of the same batch materializes nothing new.
+        assert!(report.replay_idempotent);
+        // Replay-is-truth: a fresh engine over the same store serves the identical set.
+        assert_eq!(report.replay_count, 2);
+        assert!(report.replay_matches);
+        assert!(report.dual_run_holds);
+        assert!(report.divergence.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_dual_run_flags_incumbent_divergence() {
+        let (log, dir) = tmp_log("primary-diverge");
+        let e = engine(&log);
+        // The incumbent claims exec 100 is still running with 1 event, but EHDB
+        // folds it to completed/2 → the dual-run parity fails and the cycle is
+        // not served-by-EHDB (the read-models still materialized).
+        let mut input = primary_input();
+        input.authoritative[0] = AuthoritativeExecutionState {
+            execution_id: "100".to_string(),
+            status: "running".to_string(),
+            event_count: 1,
+            terminal: false,
+        };
+        let report = exercise_primary_serve(&e, &input, "projector", "primary-t1").unwrap();
+        assert!(!report.served_by_ehdb());
+        assert!(!report.dual_run_holds);
+        assert_eq!(report.applied, 3);
+        assert!(report.divergence.unwrap().contains("value divergence"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_flags_checkpoint_lag() {
+        let (log, dir) = tmp_log("primary-lag");
+        let e = engine(&log);
+        // Incumbent offset claims 9 but EHDB applied through 3 → checkpoint lag.
+        let mut input = primary_input();
+        input.authoritative_offset = Some(9);
+        let report = exercise_primary_serve(&e, &input, "projector", "primary-t1").unwrap();
+        assert!(!report.served_by_ehdb());
+        assert!(!report.dual_run.checkpoint_ok);
+        assert_eq!(report.dual_run.checkpoint_lag, 6);
+        assert!(report.divergence.unwrap().contains("checkpoint lag"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_without_authoritative_offset_still_serves() {
+        let (log, dir) = tmp_log("primary-nooffset");
+        let e = engine(&log);
+        // No incumbent offset surfaced → checkpoint-lag skipped, key+value parity
+        // still enforced, cycle still served-by-EHDB.
+        let mut input = primary_input();
+        input.authoritative_offset = None;
+        let report = exercise_primary_serve(&e, &input, "projector", "primary-t1").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert!(report.dual_run.checkpoint_ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_reversibility_replay_after_reopen() {
+        // Proves the reversibility half this helper owns: after a primary cycle a
+        // brand-new engine over the same on-disk store serves the identical
+        // read-model set — a flip back to the incumbent materializer (or a later
+        // re-enable) loses nothing because the EHDB store stays whole on disk.
+        let (log, dir) = tmp_log("primary-revert");
+        {
+            let e = engine(&log);
+            let report =
+                exercise_primary_serve(&e, &primary_input(), "projector", "primary-t1").unwrap();
+            assert!(report.served_by_ehdb());
+        }
+        let reopened = engine(&log);
+        let list = reopened.list_executions(100).unwrap();
+        assert_eq!(list.total, 2);
+        let s100 = reopened.read_execution_state("100").unwrap().state.unwrap();
+        assert_eq!(s100.status, "completed");
+        assert!(s100.terminal);
+        assert_eq!(s100.event_count, 2);
+        // The durable checkpoint survives the reopen too.
+        assert_eq!(
+            reopened
+                .checkpoint("projector")
+                .unwrap()
+                .applied_through_sequence,
+            3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_requires_at_least_one_event() {
+        let (log, dir) = tmp_log("primary-empty");
+        let e = engine(&log);
+        let input = ProjectionPrimaryInput {
+            events: Vec::new(),
+            authoritative: Vec::new(),
+            authoritative_offset: None,
+        };
+        let err = exercise_primary_serve(&e, &input, "projector", "primary-t1").unwrap_err();
+        assert!(err.to_string().contains("at least one event"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
