@@ -66,8 +66,9 @@ pub use projection::{
 /// state tier, exposed behind a driver interface.  See [`kv`].
 pub mod kv;
 pub use kv::{
-    compare_kv_parity, AuthoritativeKvEntry, KvCasExpectation, KvDeleteOutcome, KvDeleteRequest,
-    KvEntryView, KvGetOutcome, KvGetRequest, KvParityReport, KvPutOutcome, KvPutRequest,
+    compare_kv_parity, exercise_primary_serve as exercise_kv_primary_serve, AuthoritativeKvEntry,
+    KvCasExpectation, KvDeleteOutcome, KvDeleteRequest, KvEntryView, KvGetOutcome, KvGetRequest,
+    KvParityReport, KvPrimaryInput, KvPrimaryServeReport, KvPutOutcome, KvPutRequest,
     KvScanOutcome, KvScanRequest, KvStateDriver, LocalReferenceKvStateDriver, KV_STATE_STREAM,
     KV_SUBJECT_PREFIX, MAX_KV_SCAN_LIMIT, MAX_KV_VALUE_BYTES,
 };

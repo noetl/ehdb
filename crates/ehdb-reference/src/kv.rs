@@ -749,6 +749,367 @@ pub fn compare_kv_parity(
     }
 }
 
+// ===========================================================================
+// Primary-serve (completion program Phase 9, tier 3) — EHDB serves the platform
+// KV/state tier authoritatively in place of the internal NATS-KV bucket.
+//
+// Tiers 1 (event log) and 2 (projection) proved the per-tier cutover pattern: an
+// authoritative serving cycle that drives every capability through the EHDB
+// engine while dual-run parity-checking the served results against the incumbent,
+// plus a fresh-engine replay proving the store stays whole (reversibility).  This
+// is the KV mirror of that pattern — the serving legs are the KV capabilities
+// (put → get → scan → CAS → delete → TTL) instead of the event-log ack cursor or
+// the projection read-models, and the incumbent is the internal NATS-KV bucket.
+//
+// ## Reversibility (the safety property the cutover is gated on)
+//
+// The cycle appends only to the EHDB KV stream ([`RetentionPolicy::KeepAll`]) and
+// never touches the incumbent NATS-KV bucket.  Flipping a caller back from
+// `primary` to `shadow`/`off` therefore restores NATS-KV as the authoritative KV
+// path with zero data loss — the EHDB store stays intact on disk (a later
+// re-enable replays it whole) and NATS-KV was never written.  [`exercise_primary_serve`]
+// proves the "EHDB store stays intact" half directly via the fresh-driver replay
+// leg; the "NATS-KV untouched" half is a structural property of the caller (the
+// worker asserts it by never importing a NATS-KV writer).
+// ===========================================================================
+
+/// The KV drive served authoritatively through one primary-serve cycle: the
+/// bucket, the seed key/value entries, and the caller's clock for the TTL leg.
+///
+/// The cycle puts every entry, serves a `get` of each (dual-run parity-checked
+/// against an in-lockstep NATS-KV mirror), scans the bucket, CAS-swaps the first
+/// key + refuses a create-only conflict on it, deletes the last key, exercises an
+/// absolute-TTL lease, and finally replays a fresh driver over the same store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvPrimaryInput {
+    pub bucket: String,
+    /// Distinct key/value entries seeded into the tier.  At least two are
+    /// required so CAS (on the first) and delete (on the last) act on distinct
+    /// keys ([`EhdbError::InvalidState`] otherwise).
+    pub entries: Vec<(String, String)>,
+    /// The caller's clock for the TTL leg: a lease key is written with expiry
+    /// `now_ms + 1`, read live at `now_ms`, and read expired at `now_ms + 1`.
+    /// The final replay scan runs at `now_ms + 1` so the expired lease is
+    /// filtered out, leaving exactly the durable live set.
+    pub now_ms: u64,
+}
+
+/// The lease key the TTL leg writes + expires.  Never added to the NATS-KV mirror
+/// (it is expired by the replay scan's clock), so it never affects parity.
+const PRIMARY_SERVE_LEASE_KEY: &str = "__ehdb_primary_lease__";
+
+/// The served-by-EHDB proof for one KV primary-serve cycle: every serving leg ran
+/// through the engine and preserved the NATS-KV semantics (last-writer-wins get,
+/// bucket scan, optimistic CAS, tombstone delete, absolute TTL), and each served
+/// read held dual-run parity against the NATS-KV mirror.  Secret-free (counts +
+/// verdicts; the parity reports carry no values).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvPrimaryServeReport {
+    /// The backing engine that served the cycle.
+    pub driver_name: String,
+    /// How many entries the cycle wrote authoritatively.
+    pub put_count: usize,
+    /// Every seed put was written.
+    pub put_ok: bool,
+    /// Every served `get` found the key and held parity vs the NATS-KV mirror.
+    pub get_ok: bool,
+    /// The served bucket scan returned exactly the live NATS-KV mirror.
+    pub scan_ok: bool,
+    pub scan_live: usize,
+    /// A versioned CAS swap was served + a stale create-only write was a conflict
+    /// (no append), and the post-swap read held parity.
+    pub cas_ok: bool,
+    /// A served tombstone made the key read absent (parity vs the mirror's None).
+    pub delete_ok: bool,
+    /// A served absolute-TTL lease read live before expiry and absent after.
+    pub ttl_ok: bool,
+    /// A fresh driver over the same on-disk store served the identical live set
+    /// (replay-is-truth / durability — the reversibility half proven directly).
+    pub replay_live: usize,
+    pub replay_matches: bool,
+    /// Per-served-read dual-run parity verdicts against the NATS-KV mirror.
+    pub dual_run: Vec<KvParityReport>,
+    /// Every dual-run parity verdict held.
+    pub dual_run_holds: bool,
+    /// The single reason the cycle failed a served-by-EHDB invariant, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl KvPrimaryServeReport {
+    /// Whether the EHDB engine served the whole cycle with the NATS-KV semantics
+    /// preserved and dual-run parity intact.
+    pub fn served_by_ehdb(&self) -> bool {
+        self.put_ok
+            && self.get_ok
+            && self.scan_ok
+            && self.cas_ok
+            && self.delete_ok
+            && self.ttl_ok
+            && self.replay_matches
+            && self.dual_run_holds
+            && self.divergence.is_none()
+    }
+}
+
+/// Run the authoritative KV primary-serve cycle over `driver`.
+///
+/// Drives every serving leg through the EHDB engine — put, per-key served `get`,
+/// bucket `scan`, optimistic `CAS` (versioned swap + create-only conflict),
+/// tombstone `delete`, absolute-TTL lease, and a fresh-driver replay — asserting
+/// the NATS-KV semantics are preserved and dual-run parity-checking each served
+/// read against a NATS-KV mirror applied in lockstep with identical
+/// last-writer-wins semantics.  Returns the [`KvPrimaryServeReport`]
+/// served-by-EHDB proof.
+///
+/// Reversible + non-destructive toward the incumbent: appends only to the EHDB KV
+/// stream ([`RetentionPolicy::KeepAll`]); the replay leg proves the store stays
+/// whole so a flip back to NATS-KV loses nothing.
+///
+/// `input.entries` must hold at least two entries whose first and last keys
+/// differ ([`EhdbError::InvalidState`] otherwise).  `transaction_prefix` scopes
+/// the per-write transaction ids.
+pub fn exercise_primary_serve(
+    driver: &LocalReferenceKvStateDriver,
+    input: &KvPrimaryInput,
+    transaction_prefix: &str,
+) -> Result<KvPrimaryServeReport> {
+    if input.entries.len() < 2 {
+        return Err(EhdbError::InvalidState(
+            "kv primary-serve requires at least two entries".to_string(),
+        ));
+    }
+    let first_key = input.entries.first().unwrap().0.clone();
+    let last_key = input.entries.last().unwrap().0.clone();
+    if first_key == last_key {
+        return Err(EhdbError::InvalidState(
+            "kv primary-serve requires the first and last keys to differ".to_string(),
+        ));
+    }
+    let bucket = input.bucket.clone();
+
+    // The authoritative NATS-KV mirror the served reads are dual-run
+    // parity-checked against — applied in lockstep with identical LWW semantics.
+    let mut auth: BTreeMap<String, AuthoritativeKvEntry> = BTreeMap::new();
+    let mut dual_run: Vec<KvParityReport> = Vec::new();
+    let mut txn = 0u64;
+    let mut next_txn = || {
+        txn += 1;
+        format!("{transaction_prefix}-{txn}")
+    };
+
+    // --- Put leg: EHDB serves the authoritative write. -----------------------
+    let mut put_ok = true;
+    for (k, v) in &input.entries {
+        let out = driver.put(&KvPutRequest {
+            bucket: bucket.clone(),
+            key: k.clone(),
+            value: v.clone(),
+            expires_at_ms: None,
+            cas: None,
+            transaction_id: next_txn(),
+        })?;
+        put_ok &= out.written;
+        auth.insert(
+            k.clone(),
+            AuthoritativeKvEntry {
+                value: v.clone(),
+                expires_at_ms: None,
+            },
+        );
+    }
+    let put_count = input.entries.len();
+
+    // --- Get leg: served reads, dual-run parity per key vs the NATS-KV mirror.
+    let mut get_ok = true;
+    for (k, _) in &input.entries {
+        let got = driver.get(&KvGetRequest {
+            bucket: bucket.clone(),
+            key: k.clone(),
+            now_ms: None,
+        })?;
+        let report = compare_kv_parity(auth.get(k), &got);
+        get_ok &= got.found && report.holds();
+        dual_run.push(report);
+    }
+
+    // --- Scan leg: the served bucket scan returns exactly the live mirror. ----
+    let scan = driver.scan(&KvScanRequest {
+        bucket: bucket.clone(),
+        prefix: None,
+        limit: MAX_KV_SCAN_LIMIT,
+        now_ms: None,
+    })?;
+    let scan_live = scan.match_count;
+    let live_pairs = |m: &BTreeMap<String, AuthoritativeKvEntry>| -> BTreeMap<String, String> {
+        m.iter()
+            .map(|(k, e)| (k.clone(), e.value.clone()))
+            .collect()
+    };
+    let scanned: BTreeMap<String, String> = scan
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.value.clone()))
+        .collect();
+    let scan_ok = scan.exists && scanned == live_pairs(&auth);
+
+    // --- CAS leg: served optimistic write — versioned swap succeeds, a stale
+    //     create-only write is a conflict (no append).
+    let current = driver.get(&KvGetRequest {
+        bucket: bucket.clone(),
+        key: first_key.clone(),
+        now_ms: None,
+    })?;
+    let current_version = current.entry.as_ref().map(|e| e.version).unwrap_or(0);
+    let swapped_value = format!(
+        "{}::cas",
+        auth.get(&first_key).map(|e| e.value.as_str()).unwrap_or("")
+    );
+    let swap = driver.put(&KvPutRequest {
+        bucket: bucket.clone(),
+        key: first_key.clone(),
+        value: swapped_value.clone(),
+        expires_at_ms: None,
+        cas: Some(KvCasExpectation::Version(current_version)),
+        transaction_id: next_txn(),
+    })?;
+    if swap.written {
+        auth.insert(
+            first_key.clone(),
+            AuthoritativeKvEntry {
+                value: swapped_value.clone(),
+                expires_at_ms: None,
+            },
+        );
+    }
+    let conflict = driver.put(&KvPutRequest {
+        bucket: bucket.clone(),
+        key: first_key.clone(),
+        value: "conflict".to_string(),
+        expires_at_ms: None,
+        cas: Some(KvCasExpectation::Absent),
+        transaction_id: next_txn(),
+    })?;
+    let after_cas = driver.get(&KvGetRequest {
+        bucket: bucket.clone(),
+        key: first_key.clone(),
+        now_ms: None,
+    })?;
+    let cas_parity = compare_kv_parity(auth.get(&first_key), &after_cas);
+    let cas_ok = swap.written
+        && swap.version == current_version + 1
+        && conflict.cas_conflict
+        && !conflict.written
+        && cas_parity.holds();
+    dual_run.push(cas_parity);
+
+    // --- Delete leg: a served tombstone makes the key read absent. -----------
+    let del = driver.delete(&KvDeleteRequest {
+        bucket: bucket.clone(),
+        key: last_key.clone(),
+        transaction_id: next_txn(),
+    })?;
+    auth.remove(&last_key);
+    let after_del = driver.get(&KvGetRequest {
+        bucket: bucket.clone(),
+        key: last_key.clone(),
+        now_ms: None,
+    })?;
+    let del_parity = compare_kv_parity(auth.get(&last_key), &after_del);
+    let delete_ok = del.existed && !after_del.found && del_parity.holds();
+    dual_run.push(del_parity);
+
+    // --- TTL leg: served absolute-expiry read — live before, absent after. ---
+    driver.put(&KvPutRequest {
+        bucket: bucket.clone(),
+        key: PRIMARY_SERVE_LEASE_KEY.to_string(),
+        value: "lease".to_string(),
+        expires_at_ms: Some(input.now_ms + 1),
+        cas: None,
+        transaction_id: next_txn(),
+    })?;
+    let before = driver.get(&KvGetRequest {
+        bucket: bucket.clone(),
+        key: PRIMARY_SERVE_LEASE_KEY.to_string(),
+        now_ms: Some(input.now_ms),
+    })?;
+    let after = driver.get(&KvGetRequest {
+        bucket: bucket.clone(),
+        key: PRIMARY_SERVE_LEASE_KEY.to_string(),
+        now_ms: Some(input.now_ms + 1),
+    })?;
+    let ttl_ok = before.found && !after.found && after.expired;
+
+    // --- Replay leg: a fresh driver over the same store reconstructs the live
+    // set.  Scanned at `now_ms + 1` so the expired lease is filtered → exactly
+    // the durable live mirror (the durability / reversibility half proven
+    // directly).
+    let replay_driver = driver.clone();
+    let replay = replay_driver.scan(&KvScanRequest {
+        bucket: bucket.clone(),
+        prefix: None,
+        limit: MAX_KV_SCAN_LIMIT,
+        now_ms: Some(input.now_ms + 1),
+    })?;
+    let replay_live = replay.match_count;
+    let replayed: BTreeMap<String, String> = replay
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.value.clone()))
+        .collect();
+    let replay_matches = replay.exists && replayed == live_pairs(&auth);
+
+    let dual_run_holds = dual_run.iter().all(KvParityReport::holds);
+
+    let divergence = if !put_ok {
+        Some("primary put leg did not write every entry".to_string())
+    } else if !get_ok {
+        Some("primary get leg lost a key or diverged from the NATS-KV mirror".to_string())
+    } else if !scan_ok {
+        Some("primary scan served the wrong live set".to_string())
+    } else if !cas_ok {
+        Some(format!(
+            "primary CAS leg failed: swap_written={} swap_version={} expected={} conflict={}",
+            swap.written,
+            swap.version,
+            current_version + 1,
+            conflict.cas_conflict
+        ))
+    } else if !delete_ok {
+        Some("primary delete leg did not tombstone the key".to_string())
+    } else if !ttl_ok {
+        Some("primary TTL leg did not expire the lease".to_string())
+    } else if !replay_matches {
+        Some(format!(
+            "primary replay lost the live set: replayed {replay_live} keys"
+        ))
+    } else if !dual_run_holds {
+        dual_run
+            .iter()
+            .find_map(|r| r.divergence.clone())
+            .or_else(|| Some("primary dual-run parity diverged".to_string()))
+    } else {
+        None
+    };
+
+    Ok(KvPrimaryServeReport {
+        driver_name: driver.driver_name().to_string(),
+        put_count,
+        put_ok,
+        get_ok,
+        scan_ok,
+        scan_live,
+        cas_ok,
+        delete_ok,
+        ttl_ok,
+        replay_live,
+        replay_matches,
+        dual_run,
+        dual_run_holds,
+        divergence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1592,115 @@ mod tests {
         let (log, dir) = tmp_log("name");
         let d = driver(&log);
         assert_eq!(d.driver_name(), "ehdb-local-reference");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn primary_input() -> KvPrimaryInput {
+        KvPrimaryInput {
+            bucket: "noetl_kv_primary".to_string(),
+            entries: vec![
+                (
+                    "circuit.1".to_string(),
+                    "{\"phase\":\"closed\"}".to_string(),
+                ),
+                ("circuit.2".to_string(), "{\"phase\":\"open\"}".to_string()),
+                ("circuit.3".to_string(), "{\"phase\":\"half\"}".to_string()),
+            ],
+            now_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn primary_serve_cycle_is_served_by_ehdb() {
+        let (log, dir) = tmp_log("primary-served");
+        let d = driver(&log);
+        let report = exercise_primary_serve(&d, &primary_input(), "primary-t3").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.put_count, 3);
+        assert!(report.put_ok && report.get_ok && report.scan_ok);
+        assert!(report.cas_ok && report.delete_ok && report.ttl_ok);
+        assert!(report.replay_matches && report.dual_run_holds);
+        assert!(report.divergence.is_none());
+        // Live after the cycle: circuit.1 (CAS-swapped) + circuit.2; circuit.3
+        // deleted, the lease expired at the replay clock.
+        assert_eq!(report.scan_live, 3, "scan runs before CAS/delete");
+        assert_eq!(report.replay_live, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_reversible_restores_nats_kv_path() {
+        // Reversibility half proven directly: after the cycle, a fresh driver over
+        // the SAME log serves the identical durable live set with zero data loss —
+        // a flip back to the NATS-KV path replays the store whole and NATS-KV was
+        // never written by the engine.
+        let (log, dir) = tmp_log("primary-reversible");
+        let d = driver(&log);
+        let report = exercise_primary_serve(&d, &primary_input(), "primary-t3").unwrap();
+        assert!(report.replay_matches);
+        let fresh = driver(&log);
+        let scan = fresh
+            .scan(&KvScanRequest {
+                bucket: "noetl_kv_primary".to_string(),
+                prefix: None,
+                limit: 100,
+                now_ms: Some(2_000),
+            })
+            .unwrap();
+        let keys: Vec<&str> = scan.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["circuit.1", "circuit.2"]);
+        // The CAS-swapped value survives the replay.
+        assert!(scan.entries[0].value.ends_with("::cas"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_dual_run_parity_holds_across_reads() {
+        let (log, dir) = tmp_log("primary-parity");
+        let d = driver(&log);
+        let report = exercise_primary_serve(&d, &primary_input(), "primary-t3").unwrap();
+        // One parity per initial get (3) + post-CAS get (1) + delete get (1).
+        assert_eq!(report.dual_run.len(), 5);
+        assert!(report.dual_run.iter().all(|r| r.holds()), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_requires_two_distinct_keys() {
+        let (log, dir) = tmp_log("primary-badinput");
+        let d = driver(&log);
+        // Fewer than two entries → rejected as invalid state.
+        let one = KvPrimaryInput {
+            bucket: "b".to_string(),
+            entries: vec![("k".to_string(), "v".to_string())],
+            now_ms: 0,
+        };
+        assert!(exercise_primary_serve(&d, &one, "t").is_err());
+        // First == last key → rejected.
+        let same = KvPrimaryInput {
+            bucket: "b".to_string(),
+            entries: vec![
+                ("k".to_string(), "v1".to_string()),
+                ("k".to_string(), "v2".to_string()),
+            ],
+            now_ms: 0,
+        };
+        assert!(exercise_primary_serve(&d, &same, "t").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_scope_isolated_by_bucket() {
+        // A pre-existing key in a DIFFERENT bucket never leaks into the served
+        // scan / replay of the cycle's bucket.
+        let (log, dir) = tmp_log("primary-scope");
+        let d = driver(&log);
+        put(&d, "other_bucket", "circuit.1", "leak", 99);
+        let report = exercise_primary_serve(&d, &primary_input(), "primary-t3").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        // The other bucket's key never affects the cycle's live set.
+        assert_eq!(report.replay_live, 2);
+        assert!(get(&d, "other_bucket", "circuit.1").found);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
