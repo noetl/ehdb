@@ -14,10 +14,10 @@ use ehdb_reference::{
     EventLogPrimaryEvent, EventLogReadExecutionRequest, EventLogScanRequest, EventLogTailRequest,
     IngestChunkInput, IngestRetrievalDocumentRequest, KvPrimaryInput, LocalReferenceEventLogDriver,
     LocalReferenceKvStateDriver, LocalReferenceObjectBlobDriver, LocalReferenceProjectionEngine,
-    ObjectPrimaryInput, ProjectionApplyRequest, ProjectionDriver, ProjectionEventInput,
-    ProjectionPrimaryInput, PublishSystemModuleRequest, ReadDomainRecordsRequest,
-    ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
-    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    LocalReferenceVectorDriver, ObjectPrimaryInput, ProjectionApplyRequest, ProjectionDriver,
+    ProjectionEventInput, ProjectionPrimaryInput, PublishSystemModuleRequest,
+    ReadDomainRecordsRequest, ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
+    VectorPrimaryInput, DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 fn main() {
@@ -83,6 +83,9 @@ fn run(args: Vec<String>) -> Result<(String, i32), String> {
         Some((command, rest)) if command == "kv-primary-serve" => run_kv_primary_serve(rest),
         Some((command, rest)) if command == "object-primary-serve" => {
             run_object_primary_serve(rest)
+        }
+        Some((command, rest)) if command == "vector-primary-serve" => {
+            run_vector_primary_serve(rest)
         }
         _ => Err(usage().to_string()),
     }
@@ -785,6 +788,66 @@ fn run_object_primary_serve(args: &[String]) -> Result<(String, i32), String> {
     }
 }
 
+/// Authoritative vector primary-serve cycle (completion program Phase 9, tier 5 —
+/// the final tier): drive upsert + served cosine top-k query + tombstone delete +
+/// fresh-driver replay through the EHDB vector engine and emit the served-by-EHDB
+/// proof (with per-query dual-run parity — id set + rank order + score
+/// monotonicity — against a Qdrant mirror ranked in lockstep).  Exit 0 only when
+/// [`VectorPrimaryServeReport::served_by_ehdb`] holds.
+fn run_vector_primary_serve(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let log = take_required(&mut flags, "log")?;
+    let tenant = flags
+        .remove("tenant")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = flags
+        .remove("namespace")
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    let driver = LocalReferenceVectorDriver::new(PathBuf::from(log), tenant, namespace);
+
+    // Deterministic drive: three distinct platform-RAG points under one collection
+    // (delete on the last), each a distinct embedding, queried [1,0,0] so the
+    // ranking is a > b > c — a scope + rank + delete ground truth with an
+    // in-lockstep Qdrant mirror so the dual-run top-k parity is exact.
+    let input = VectorPrimaryInput {
+        collection: "playbook-surface".to_string(),
+        model_id: "text-embedding-3-small".to_string(),
+        entries: vec![
+            (
+                "noetl/playbook/weather.example/chunk.0".to_string(),
+                vec![1.0, 0.0, 0.0],
+            ),
+            (
+                "noetl/playbook/weather.example/chunk.1".to_string(),
+                vec![0.9, 0.1, 0.0],
+            ),
+            (
+                "noetl/catalog/embeddings/tool.http".to_string(),
+                vec![0.0, 1.0, 0.0],
+            ),
+        ],
+        query: vec![1.0, 0.0, 0.0],
+        top_k: 10,
+    };
+
+    match ehdb_reference::vector::exercise_primary_serve(&driver, &input, "primary-t5") {
+        Ok(report) => {
+            let served = report.served_by_ehdb();
+            let output = serde_json::to_string(&serde_json::json!({
+                "suite": "ehdb-vector-primary-serve",
+                "driver": report.driver_name,
+                "served_by_ehdb": served,
+                "report": report,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, if served { 0 } else { 1 }))
+        }
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
 fn parse_limit(flags: &mut HashMap<String, String>, default: usize) -> Result<usize, String> {
     match flags.remove("limit") {
         Some(raw) => raw
@@ -1204,5 +1267,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference vector-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
 }

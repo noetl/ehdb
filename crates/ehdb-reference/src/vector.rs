@@ -726,6 +726,290 @@ pub fn compare_vector_parity(
     }
 }
 
+// ===========================================================================
+// Primary-serve (completion program Phase 9, tier 5 — the final tier) — EHDB
+// serves the platform vector tier authoritatively in place of the internal
+// Qdrant retrieval path (the platform RAG collections reached in-process through
+// the Phase-E retrieval helper, [`crate::retrieve_local_reference_context`]).
+//
+// Tiers 1 (event log), 2 (projection), 3 (KV/state), and 4 (object/blob) proved
+// the per-tier cutover pattern: an authoritative serving cycle that drives every
+// capability through the EHDB engine while dual-run parity-checking the served
+// results against the incumbent, plus a fresh-engine replay proving the store
+// stays whole (reversibility).  This is the vector mirror of that pattern — the
+// serving legs are the vector capabilities (upsert → query-topk → delete) instead
+// of the object put/get/list/locate/delete, and the incumbent is the internal
+// Qdrant retrieval path.  Because top-k is a ranking (not a single value), each
+// served query's dual-run parity is an id-set + rank-order + score-monotonicity
+// match ([`compare_vector_parity`]) against an in-lockstep Qdrant mirror computed
+// with the identical cosine ranking.
+//
+// ## Reversibility (the safety property the cutover is gated on)
+//
+// The cycle appends only to the EHDB vector index stream
+// ([`RetentionPolicy::KeepAll`]) and never touches the incumbent Qdrant path.
+// Flipping a caller back from `primary` to `shadow`/`off` therefore restores
+// Qdrant as the authoritative vector path with zero data loss — the EHDB index
+// stays intact on disk (a later re-enable replays it whole) and Qdrant was never
+// written.  [`exercise_primary_serve`] proves the "EHDB index stays intact" half
+// directly via the fresh-driver replay leg; the "Qdrant untouched" half is a
+// structural property of the caller (the worker asserts it by never importing a
+// Qdrant writer).
+// ===========================================================================
+
+/// The vector drive served authoritatively through one primary-serve cycle: the
+/// collection, the shared embedding model, the seed point/embedding entries, and
+/// the query + top_k the served reads rank against.
+///
+/// The cycle upserts every entry, serves a top-k query (dual-run parity-checked
+/// against an in-lockstep Qdrant mirror), deletes the last point (tombstone),
+/// serves the query again (the deleted point now absent), and finally replays a
+/// fresh driver over the same index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPrimaryInput {
+    /// The platform collection served (e.g. `playbook-surface`).
+    pub collection: String,
+    /// The embedding model every seed point + the query share (a query only ranks
+    /// points of its own model, so the whole drive is one model's ranking).
+    pub model_id: String,
+    /// Distinct point/embedding entries seeded into the tier.  At least two are
+    /// required so the delete (on the last) leaves the rest live for the replay
+    /// ([`EhdbError::InvalidState`] otherwise); every embedding must match the
+    /// query's dimensionality to be a ranked candidate.
+    pub entries: Vec<(String, Vec<f32>)>,
+    /// The query embedding the served top-k ranks against.
+    pub query: Vec<f32>,
+    /// How many top hits each served query returns (over [`MAX_VECTOR_QUERY_TOP_K`]
+    /// ⇒ rejected).
+    pub top_k: usize,
+}
+
+/// The served-by-EHDB proof for one vector primary-serve cycle: every serving leg
+/// ran through the engine and preserved the Qdrant retrieval semantics (bounded
+/// cosine top-k ranking, tombstone delete), and each served query held dual-run
+/// parity against the Qdrant mirror.  Secret-free (counts + verdicts; the parity
+/// reports carry point ids + a monotonicity verdict, never vectors or payloads).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorPrimaryServeReport {
+    /// The backing engine that served the cycle.
+    pub driver_name: String,
+    /// How many points the cycle wrote authoritatively.
+    pub upsert_count: usize,
+    /// Every seed upsert was written.
+    pub upsert_ok: bool,
+    /// The served top-k query ranked exactly the live Qdrant mirror (id set + rank
+    /// order) and held score-monotonicity.
+    pub query_ok: bool,
+    pub query_returned: usize,
+    /// A served tombstone dropped the last point out of the served ranking (parity
+    /// vs the mirror with that point removed).
+    pub delete_ok: bool,
+    /// A fresh driver over the same on-disk index served the identical live ranking
+    /// (replay-is-truth / durability — the reversibility half proven directly).
+    pub replay_returned: usize,
+    pub replay_matches: bool,
+    /// Per-served-query dual-run parity verdicts against the Qdrant mirror (query,
+    /// post-delete query, replay query).
+    pub dual_run: Vec<VectorParityReport>,
+    /// Every dual-run parity verdict held.
+    pub dual_run_holds: bool,
+    /// The single reason the cycle failed a served-by-EHDB invariant, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl VectorPrimaryServeReport {
+    /// Whether the EHDB engine served the whole cycle with the Qdrant retrieval
+    /// semantics preserved and dual-run parity intact.
+    pub fn served_by_ehdb(&self) -> bool {
+        self.upsert_ok
+            && self.query_ok
+            && self.delete_ok
+            && self.replay_matches
+            && self.dual_run_holds
+            && self.divergence.is_none()
+    }
+}
+
+/// The in-lockstep Qdrant mirror's top-k for one query — computed with the
+/// identical cosine ranking as the engine, over the mirror's live points, so a
+/// served query's dual-run parity is an exact id-set + rank-order match (the
+/// mirror is an independent computation from the engine's log-backed query, not a
+/// copy of its output).
+fn mirror_top_k(
+    mirror: &BTreeMap<String, Vec<f32>>,
+    query: &[f32],
+    top_k: usize,
+) -> Vec<AuthoritativeVectorHit> {
+    let query_norm = vector_norm(query);
+    let mut hits: Vec<AuthoritativeVectorHit> = mirror
+        .iter()
+        .filter(|(_, vector)| vector.len() == query.len())
+        .map(|(point_id, vector)| AuthoritativeVectorHit {
+            score: cosine_similarity(query, vector, query_norm),
+            point_id: point_id.clone(),
+        })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.point_id.cmp(&right.point_id))
+    });
+    hits.truncate(top_k);
+    hits
+}
+
+/// Run the authoritative vector primary-serve cycle over `driver`.
+///
+/// Drives every serving leg through the EHDB engine — upsert, served top-k
+/// `query`, tombstone `delete`, and a fresh-driver replay — asserting the Qdrant
+/// retrieval semantics are preserved and dual-run parity-checking each served
+/// query against a Qdrant mirror computed in lockstep with the identical cosine
+/// ranking.  Returns the [`VectorPrimaryServeReport`] served-by-EHDB proof.
+///
+/// Reversible + non-destructive toward the incumbent: appends only to the EHDB
+/// vector index stream ([`RetentionPolicy::KeepAll`]); the replay leg proves the
+/// index stays whole so a flip back to Qdrant loses nothing.
+///
+/// `input.entries` must hold at least two entries whose first and last point ids
+/// differ ([`EhdbError::InvalidState`] otherwise).  An over-cap `top_k` is
+/// rejected by the engine ([`EhdbError::InvalidState`] carrying `exceeds bound`).
+/// `transaction_prefix` scopes the per-write transaction ids.
+pub fn exercise_primary_serve(
+    driver: &LocalReferenceVectorDriver,
+    input: &VectorPrimaryInput,
+    transaction_prefix: &str,
+) -> Result<VectorPrimaryServeReport> {
+    if input.entries.len() < 2 {
+        return Err(EhdbError::InvalidState(
+            "vector primary-serve requires at least two entries".to_string(),
+        ));
+    }
+    let first_key = input.entries.first().unwrap().0.clone();
+    let last_key = input.entries.last().unwrap().0.clone();
+    if first_key == last_key {
+        return Err(EhdbError::InvalidState(
+            "vector primary-serve requires the first and last point ids to differ".to_string(),
+        ));
+    }
+
+    // The authoritative Qdrant mirror the served queries are dual-run
+    // parity-checked against — the live point → embedding map, ranked in lockstep
+    // with the identical cosine scoring (an independent computation, not the
+    // engine's own output).
+    let mut mirror: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    let mut dual_run: Vec<VectorParityReport> = Vec::new();
+    let mut txn = 0u64;
+    let mut next_txn = || {
+        txn += 1;
+        format!("{transaction_prefix}-{txn}")
+    };
+
+    // Float slack when checking the EHDB ranking is monotonically non-increasing.
+    // Scores differ across engines in general; here the mirror shares the formula,
+    // so the slack is only defensive.
+    const PARITY_TOLERANCE: f32 = 1e-6;
+
+    // --- Upsert leg: EHDB serves the authoritative index write. ---------------
+    let mut upsert_ok = true;
+    for (point_id, vector) in &input.entries {
+        let out = driver.upsert(&VectorUpsertRequest {
+            collection: input.collection.clone(),
+            point_id: point_id.clone(),
+            model_id: input.model_id.clone(),
+            vector: vector.clone(),
+            payload: None,
+            transaction_id: next_txn(),
+        })?;
+        upsert_ok &= out.written;
+        mirror.insert(point_id.clone(), vector.clone());
+    }
+    let upsert_count = input.entries.len();
+
+    // --- Query leg: served top-k, dual-run parity vs the live mirror. ---------
+    let query1 = driver.query(&VectorQueryRequest {
+        collection: input.collection.clone(),
+        model_id: input.model_id.clone(),
+        query: input.query.clone(),
+        top_k: input.top_k,
+    })?;
+    let mirror1 = mirror_top_k(&mirror, &input.query, input.top_k);
+    let parity1 = compare_vector_parity(&mirror1, &query1, PARITY_TOLERANCE);
+    let query_ok = query1.exists && query1.returned == mirror1.len() && parity1.holds();
+    let query_returned = query1.returned;
+    dual_run.push(parity1);
+
+    // --- Delete leg: a served tombstone drops the last point from the ranking. -
+    let del = driver.delete(&VectorDeleteRequest {
+        collection: input.collection.clone(),
+        point_id: last_key.clone(),
+        transaction_id: next_txn(),
+    })?;
+    mirror.remove(&last_key);
+    let query2 = driver.query(&VectorQueryRequest {
+        collection: input.collection.clone(),
+        model_id: input.model_id.clone(),
+        query: input.query.clone(),
+        top_k: input.top_k,
+    })?;
+    let mirror2 = mirror_top_k(&mirror, &input.query, input.top_k);
+    let parity2 = compare_vector_parity(&mirror2, &query2, PARITY_TOLERANCE);
+    let last_absent = query2.hits.iter().all(|hit| hit.point_id != last_key);
+    let delete_ok = del.existed && last_absent && parity2.holds();
+    dual_run.push(parity2);
+
+    // --- Replay leg: a fresh driver over the same index serves the live ranking.
+    let replay_driver = driver.clone();
+    let replay = replay_driver.query(&VectorQueryRequest {
+        collection: input.collection.clone(),
+        model_id: input.model_id.clone(),
+        query: input.query.clone(),
+        top_k: input.top_k,
+    })?;
+    let mirror_replay = mirror_top_k(&mirror, &input.query, input.top_k);
+    let replay_parity = compare_vector_parity(&mirror_replay, &replay, PARITY_TOLERANCE);
+    let replay_returned = replay.returned;
+    let replay_matches =
+        replay.exists && replay.returned == mirror_replay.len() && replay_parity.holds();
+    dual_run.push(replay_parity);
+
+    let dual_run_holds = dual_run.iter().all(VectorParityReport::holds);
+
+    let divergence = if !upsert_ok {
+        Some("primary upsert leg did not write every point".to_string())
+    } else if !query_ok {
+        Some("primary query leg lost a point or diverged from the vector mirror".to_string())
+    } else if !delete_ok {
+        Some("primary delete leg did not tombstone the point".to_string())
+    } else if !replay_matches {
+        Some(format!(
+            "primary replay lost the live ranking: replayed {replay_returned} hits"
+        ))
+    } else if !dual_run_holds {
+        dual_run
+            .iter()
+            .find_map(|report| report.divergence.clone())
+            .or_else(|| Some("primary dual-run parity diverged".to_string()))
+    } else {
+        None
+    };
+
+    Ok(VectorPrimaryServeReport {
+        driver_name: driver.driver_name().to_string(),
+        upsert_count,
+        upsert_ok,
+        query_ok,
+        query_returned,
+        delete_ok,
+        replay_returned,
+        replay_matches,
+        dual_run,
+        dual_run_holds,
+        divergence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,5 +1435,141 @@ mod tests {
     fn driver_name_is_stable() {
         let f = fixture("name");
         assert_eq!(f.driver.driver_name(), "ehdb-local-reference");
+    }
+
+    // -----------------------------------------------------------------------
+    // Primary-serve (Phase 9, tier 5) tests
+    // -----------------------------------------------------------------------
+
+    /// A three-point drive whose query [1,0,0] ranks a > b > c; the delete drops
+    /// the last-listed point (c).
+    fn primary_input() -> VectorPrimaryInput {
+        VectorPrimaryInput {
+            collection: COLLECTION.to_string(),
+            model_id: MODEL.to_string(),
+            entries: vec![
+                (POINT_A.to_string(), vec![1.0, 0.0, 0.0]),
+                ("point-b".to_string(), vec![0.9, 0.1, 0.0]),
+                ("point-c".to_string(), vec![0.0, 1.0, 0.0]),
+            ],
+            query: vec![1.0, 0.0, 0.0],
+            top_k: 10,
+        }
+    }
+
+    #[test]
+    fn primary_serve_reports_served_by_ehdb() {
+        let f = fixture("primary-served");
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-t5").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.driver_name, "ehdb-local-reference");
+        assert_eq!(report.upsert_count, 3);
+        assert!(report.upsert_ok);
+        assert!(report.query_ok);
+        assert_eq!(report.query_returned, 3);
+        assert!(report.delete_ok);
+        // The last point was tombstoned → the live ranking is the remaining two.
+        assert_eq!(report.replay_returned, 2);
+        assert!(report.replay_matches);
+        assert!(report.dual_run_holds);
+        assert!(report.divergence.is_none());
+        // query + post-delete query + replay query = three dual-run verdicts.
+        assert_eq!(report.dual_run.len(), 3);
+        assert!(report.dual_run.iter().all(VectorParityReport::holds));
+    }
+
+    #[test]
+    fn primary_serve_is_reversible_index_intact() {
+        // The cycle only appends to the EHDB index; a fresh driver over the same
+        // log serves the same live ranking (the deleted point stays absent), so a
+        // flip back to Qdrant loses nothing.
+        let f = fixture("primary-reversible");
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-rev").unwrap();
+        assert!(report.served_by_ehdb());
+        let fresh = LocalReferenceVectorDriver::new(f.driver.log_path.clone(), "noetl", "default");
+        let out = query(&fresh, COLLECTION, &[1.0, 0.0, 0.0], 10);
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.point_id.as_str()).collect();
+        // point-c was tombstoned; a and b survive, ranked a > b.
+        assert_eq!(ids, vec![POINT_A, "point-b"]);
+    }
+
+    #[test]
+    fn primary_serve_top_k_parity_under_truncation() {
+        // A top_k below the candidate count still holds dual-run parity: both the
+        // engine and the mirror truncate the identical ranking.
+        let f = fixture("primary-topk");
+        let mut input = primary_input();
+        input.top_k = 2;
+        let report = exercise_primary_serve(&f.driver, &input, "primary-topk").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.query_returned, 2);
+        // After the delete only two points remain, so the replay returns both.
+        assert_eq!(report.replay_returned, 2);
+    }
+
+    #[test]
+    fn primary_serve_requires_two_entries() {
+        let f = fixture("primary-one");
+        let input = VectorPrimaryInput {
+            collection: COLLECTION.to_string(),
+            model_id: MODEL.to_string(),
+            entries: vec![(POINT_A.to_string(), vec![1.0, 0.0])],
+            query: vec![1.0, 0.0],
+            top_k: 10,
+        };
+        let err = exercise_primary_serve(&f.driver, &input, "primary-one").unwrap_err();
+        assert!(err.to_string().contains("at least two entries"));
+    }
+
+    #[test]
+    fn primary_serve_requires_distinct_first_last() {
+        let f = fixture("primary-dup");
+        let input = VectorPrimaryInput {
+            collection: COLLECTION.to_string(),
+            model_id: MODEL.to_string(),
+            entries: vec![
+                (POINT_A.to_string(), vec![1.0, 0.0]),
+                (POINT_A.to_string(), vec![0.0, 1.0]),
+            ],
+            query: vec![1.0, 0.0],
+            top_k: 10,
+        };
+        let err = exercise_primary_serve(&f.driver, &input, "primary-dup").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("first and last point ids to differ"));
+    }
+
+    #[test]
+    fn primary_serve_over_limit_top_k_rejected() {
+        // An over-cap top_k surfaces from the engine's served query as a rejected
+        // (bound) error, propagated out of the cycle.
+        let f = fixture("primary-reject");
+        let mut input = primary_input();
+        input.top_k = MAX_VECTOR_QUERY_TOP_K + 1;
+        let err = exercise_primary_serve(&f.driver, &input, "primary-reject").unwrap_err();
+        assert!(err.to_string().contains("exceeds bound"));
+        assert!(matches!(err, EhdbError::InvalidState(_)));
+    }
+
+    #[test]
+    fn primary_serve_is_scope_isolated() {
+        // Serving one collection's cycle never leaks into a sibling collection's
+        // ranking (subject scoping holds under the primary path).
+        let f = fixture("primary-scope");
+        // Seed an unrelated collection first.
+        upsert(
+            &f.driver,
+            "other-collection",
+            "other-point",
+            &[1.0, 0.0, 0.0],
+            99,
+        );
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-scope").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        // The sibling collection is untouched by the delete leg.
+        let other = query(&f.driver, "other-collection", &[1.0, 0.0, 0.0], 10);
+        assert_eq!(other.candidate_count, 1);
+        assert_eq!(other.hits[0].point_id, "other-point");
     }
 }
