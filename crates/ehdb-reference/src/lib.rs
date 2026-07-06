@@ -94,10 +94,12 @@ pub use object::{
 /// interface.  See [`vector`].
 pub mod vector;
 pub use vector::{
-    compare_vector_parity, AuthoritativeVectorHit, LocalReferenceVectorDriver, VectorDeleteOutcome,
-    VectorDeleteRequest, VectorDriver, VectorHit, VectorParityReport, VectorQueryOutcome,
-    VectorQueryRequest, VectorUpsertOutcome, VectorUpsertRequest, MAX_VECTOR_DIMENSIONS,
-    MAX_VECTOR_PAYLOAD_BYTES, MAX_VECTOR_QUERY_TOP_K, VECTOR_INDEX_STREAM, VECTOR_SUBJECT_PREFIX,
+    compare_vector_parity, exercise_primary_serve as exercise_vector_primary_serve,
+    AuthoritativeVectorHit, LocalReferenceVectorDriver, VectorDeleteOutcome, VectorDeleteRequest,
+    VectorDriver, VectorHit, VectorParityReport, VectorPrimaryInput, VectorPrimaryServeReport,
+    VectorQueryOutcome, VectorQueryRequest, VectorUpsertOutcome, VectorUpsertRequest,
+    MAX_VECTOR_DIMENSIONS, MAX_VECTOR_PAYLOAD_BYTES, MAX_VECTOR_QUERY_TOP_K, VECTOR_INDEX_STREAM,
+    VECTOR_SUBJECT_PREFIX,
 };
 
 #[derive(Debug, Clone, Default)]
