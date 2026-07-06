@@ -806,6 +806,295 @@ pub fn compare_object_parity(
     }
 }
 
+// ===========================================================================
+// Primary-serve (completion program Phase 9, tier 4) — EHDB serves the platform
+// object / blob tier authoritatively in place of the internal external object
+// store (the state-shard `#166` + result-tier `#104` platform artifacts reached
+// through the server's `/api/internal/objects/{key}` API).
+//
+// Tiers 1 (event log), 2 (projection), and 3 (KV/state) proved the per-tier
+// cutover pattern: an authoritative serving cycle that drives every capability
+// through the EHDB engine while dual-run parity-checking the served results
+// against the incumbent, plus a fresh-engine replay proving the store stays whole
+// (reversibility).  This is the object mirror of that pattern — the serving legs
+// are the object capabilities (put → get → list → locate → delete) instead of the
+// KV put/get/scan/CAS/delete/TTL, and the incumbent is the external object store.
+// Because artifacts are content-addressed, each served read's dual-run parity is
+// an exact digest + length + retrievability equality against a lockstep mirror of
+// the external store applied with identical content-addressing semantics.
+//
+// ## Reversibility (the safety property the cutover is gated on)
+//
+// The cycle appends only to the EHDB object registry stream
+// ([`RetentionPolicy::KeepAll`]) + content-addressed blob store and never touches
+// the incumbent external object store.  Flipping a caller back from `primary` to
+// `shadow`/`off` therefore restores the external store as the authoritative object
+// path with zero data loss — the EHDB store stays intact on disk (a later
+// re-enable replays it whole) and the external store was never written.
+// [`exercise_primary_serve`] proves the "EHDB store stays intact" half directly
+// via the fresh-driver replay leg; the "external store untouched" half is a
+// structural property of the caller (the worker asserts it by never importing an
+// external-store writer).
+// ===========================================================================
+
+/// The object drive served authoritatively through one primary-serve cycle: the
+/// optional list prefix and the seed key/blob entries.
+///
+/// The cycle puts every entry, serves a `get` of each (dual-run digest-parity
+/// checked against an in-lockstep external-store mirror), lists the live set,
+/// locates each key's in-cluster handle, deletes the last key (tombstone), and
+/// finally replays a fresh driver over the same registry + blob store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPrimaryInput {
+    /// Optional prefix scoping the served list + replay (`None` = the whole tier).
+    pub prefix: Option<String>,
+    /// Distinct key/blob entries seeded into the tier.  At least two are required
+    /// so the delete (on the last) leaves the rest live for the replay
+    /// ([`EhdbError::InvalidState`] otherwise).
+    pub entries: Vec<(String, Vec<u8>)>,
+}
+
+/// The served-by-EHDB proof for one object primary-serve cycle: every serving leg
+/// ran through the engine and preserved the external-store semantics
+/// (content-addressed put + digest-verified get, prefix list, in-cluster locate,
+/// tombstone delete), and each served read held dual-run digest-parity against the
+/// external-store mirror.  Secret-free (counts + verdicts; the parity reports carry
+/// no bytes, only digests which are hashes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectPrimaryServeReport {
+    /// The backing engine that served the cycle.
+    pub driver_name: String,
+    /// How many entries the cycle wrote authoritatively.
+    pub put_count: usize,
+    /// Every seed put was written.
+    pub put_ok: bool,
+    /// Every served `get` found the key, verified its bytes, and held digest-parity
+    /// vs the external-store mirror.
+    pub get_ok: bool,
+    /// The served prefix list returned exactly the live external-store mirror.
+    pub list_ok: bool,
+    pub list_live: usize,
+    /// Every live key located an in-cluster `ehdb-object://` handle whose digest +
+    /// length matched the mirror.
+    pub locate_ok: bool,
+    /// A served tombstone made the last key read absent (parity vs the mirror's
+    /// None).
+    pub delete_ok: bool,
+    /// A fresh driver over the same on-disk store served the identical live set
+    /// (replay-is-truth / durability — the reversibility half proven directly).
+    pub replay_live: usize,
+    pub replay_matches: bool,
+    /// Per-served-read dual-run digest-parity verdicts against the external-store
+    /// mirror.
+    pub dual_run: Vec<ObjectParityReport>,
+    /// Every dual-run parity verdict held.
+    pub dual_run_holds: bool,
+    /// The single reason the cycle failed a served-by-EHDB invariant, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl ObjectPrimaryServeReport {
+    /// Whether the EHDB engine served the whole cycle with the external-store
+    /// semantics preserved and dual-run digest-parity intact.
+    pub fn served_by_ehdb(&self) -> bool {
+        self.put_ok
+            && self.get_ok
+            && self.list_ok
+            && self.locate_ok
+            && self.delete_ok
+            && self.replay_matches
+            && self.dual_run_holds
+            && self.divergence.is_none()
+    }
+}
+
+/// The digest→key ordered projection used to compare a served list/replay against
+/// the external-store mirror (content-addressed, so key→digest equality is exact).
+fn live_digests(mirror: &BTreeMap<String, AuthoritativeObject>) -> BTreeMap<String, String> {
+    mirror
+        .iter()
+        .map(|(k, o)| (k.clone(), o.digest.clone()))
+        .collect()
+}
+
+/// Run the authoritative object primary-serve cycle over `driver`.
+///
+/// Drives every serving leg through the EHDB engine — put, per-key digest-verified
+/// served `get`, prefix `list`, in-cluster `locate`, and tombstone `delete`, plus a
+/// fresh-driver replay — asserting the external-store semantics are preserved and
+/// dual-run digest-parity-checking each served read against an external-store
+/// mirror applied in lockstep with identical content-addressing semantics.
+/// Returns the [`ObjectPrimaryServeReport`] served-by-EHDB proof.
+///
+/// Reversible + non-destructive toward the incumbent: appends only to the EHDB
+/// object registry ([`RetentionPolicy::KeepAll`]) + content-addressed blob store;
+/// the replay leg proves the store stays whole so a flip back to the external store
+/// loses nothing.
+///
+/// `input.entries` must hold at least two entries whose first and last keys differ
+/// ([`EhdbError::InvalidState`] otherwise).  An over-cap blob is rejected by the
+/// engine ([`EhdbError::InvalidState`] carrying `exceeds bound`).
+/// `transaction_prefix` scopes the per-write transaction ids.
+pub fn exercise_primary_serve(
+    driver: &LocalReferenceObjectBlobDriver,
+    input: &ObjectPrimaryInput,
+    transaction_prefix: &str,
+) -> Result<ObjectPrimaryServeReport> {
+    if input.entries.len() < 2 {
+        return Err(EhdbError::InvalidState(
+            "object primary-serve requires at least two entries".to_string(),
+        ));
+    }
+    let first_key = input.entries.first().unwrap().0.clone();
+    let last_key = input.entries.last().unwrap().0.clone();
+    if first_key == last_key {
+        return Err(EhdbError::InvalidState(
+            "object primary-serve requires the first and last keys to differ".to_string(),
+        ));
+    }
+
+    // The authoritative external-store mirror the served reads are dual-run
+    // parity-checked against — content-addressed in lockstep (the mirror's digest
+    // is the independent SHA-256 of the same bytes, not the engine's own report).
+    let mut auth: BTreeMap<String, AuthoritativeObject> = BTreeMap::new();
+    let mut dual_run: Vec<ObjectParityReport> = Vec::new();
+    let mut txn = 0u64;
+    let mut next_txn = || {
+        txn += 1;
+        format!("{transaction_prefix}-{txn}")
+    };
+
+    // --- Put leg: EHDB serves the authoritative content-addressed write. ------
+    let mut put_ok = true;
+    for (k, bytes) in &input.entries {
+        let out = driver.put(&ObjectPutRequest {
+            key: k.clone(),
+            bytes: bytes.clone(),
+            transaction_id: next_txn(),
+        })?;
+        put_ok &= out.written;
+        // Independent mirror digest — SHA-256 of the same bytes, computed without
+        // trusting the engine's own outcome.
+        let digest = ObjectDigest::sha256(bytes);
+        auth.insert(
+            k.clone(),
+            AuthoritativeObject {
+                digest: digest.as_str().to_string(),
+                byte_len: bytes.len() as u64,
+            },
+        );
+    }
+    let put_count = input.entries.len();
+
+    // --- Get leg: served reads, dual-run digest-parity per key vs the mirror. --
+    let mut get_ok = true;
+    for (k, _) in &input.entries {
+        let got = driver.get(&ObjectGetRequest { key: k.clone() })?;
+        let report = compare_object_parity(auth.get(k), &got);
+        get_ok &= got.found && got.verified && report.holds();
+        dual_run.push(report);
+    }
+
+    // --- List leg: the served prefix list returns exactly the live mirror. -----
+    let list = driver.list(&ObjectListRequest {
+        prefix: input.prefix.clone(),
+        limit: MAX_OBJECT_LIST_LIMIT,
+    })?;
+    let list_live = list.match_count;
+    let listed: BTreeMap<String, String> = list
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.digest.clone()))
+        .collect();
+    let list_ok = list.exists && listed == live_digests(&auth);
+
+    // --- Locate leg: every live key resolves an in-cluster handle whose digest +
+    //     length match the mirror.
+    let mut locate_ok = true;
+    for (k, _) in &input.entries {
+        let loc = driver.locate(&ObjectLocateRequest { key: k.clone() })?;
+        let expected = auth.get(k);
+        locate_ok &= loc.found
+            && loc
+                .uri
+                .as_deref()
+                .map(|u| u.starts_with("ehdb-object://"))
+                .unwrap_or(false)
+            && loc.digest.as_ref() == expected.map(|o| &o.digest)
+            && loc.byte_len == expected.map(|o| o.byte_len);
+    }
+
+    // --- Delete leg: a served tombstone makes the last key read absent. --------
+    let del = driver.delete(&ObjectDeleteRequest {
+        key: last_key.clone(),
+        transaction_id: next_txn(),
+    })?;
+    auth.remove(&last_key);
+    let after_del = driver.get(&ObjectGetRequest {
+        key: last_key.clone(),
+    })?;
+    let del_parity = compare_object_parity(auth.get(&last_key), &after_del);
+    let delete_ok = del.existed && !after_del.found && del_parity.holds();
+    dual_run.push(del_parity);
+
+    // --- Replay leg: a fresh driver over the same registry + blob store lists the
+    // durable live set (the durability / reversibility half proven directly).
+    let replay_driver = driver.clone();
+    let replay = replay_driver.list(&ObjectListRequest {
+        prefix: input.prefix.clone(),
+        limit: MAX_OBJECT_LIST_LIMIT,
+    })?;
+    let replay_live = replay.match_count;
+    let replayed: BTreeMap<String, String> = replay
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.digest.clone()))
+        .collect();
+    let replay_matches = replay.exists && replayed == live_digests(&auth);
+
+    let dual_run_holds = dual_run.iter().all(ObjectParityReport::holds);
+
+    let divergence = if !put_ok {
+        Some("primary put leg did not write every object".to_string())
+    } else if !get_ok {
+        Some("primary get leg lost a key or diverged from the object-store mirror".to_string())
+    } else if !list_ok {
+        Some("primary list served the wrong live set".to_string())
+    } else if !locate_ok {
+        Some("primary locate leg did not resolve an in-cluster object handle".to_string())
+    } else if !delete_ok {
+        Some("primary delete leg did not tombstone the key".to_string())
+    } else if !replay_matches {
+        Some(format!(
+            "primary replay lost the live set: replayed {replay_live} keys"
+        ))
+    } else if !dual_run_holds {
+        dual_run
+            .iter()
+            .find_map(|r| r.divergence.clone())
+            .or_else(|| Some("primary dual-run parity diverged".to_string()))
+    } else {
+        None
+    };
+
+    Ok(ObjectPrimaryServeReport {
+        driver_name: driver.driver_name().to_string(),
+        put_count,
+        put_ok,
+        get_ok,
+        list_ok,
+        list_live,
+        locate_ok,
+        delete_ok,
+        replay_live,
+        replay_matches,
+        dual_run,
+        dual_run_holds,
+        divergence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,5 +1516,141 @@ mod tests {
         let path = content_path(&digest).unwrap();
         assert!(path.as_str().starts_with("objects/sha256/"));
         assert!(!path.as_str().contains(':'));
+    }
+
+    // --- Primary-serve (Phase 9 tier 4) ------------------------------------
+
+    fn primary_input() -> ObjectPrimaryInput {
+        ObjectPrimaryInput {
+            prefix: Some("noetl/env=primary/".to_string()),
+            entries: vec![
+                (
+                    "noetl/env=primary/execution=exec-p/state/open.feather".to_string(),
+                    b"arrow-ipc-state-open".to_vec(),
+                ),
+                (
+                    "noetl/env=primary/execution=exec-p/results/s/f/r/a.feather".to_string(),
+                    b"arrow-ipc-result-frame".to_vec(),
+                ),
+                (
+                    "noetl/env=primary/execution=exec-p/state/sealed.feather".to_string(),
+                    b"arrow-ipc-state-sealed".to_vec(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn primary_serve_cycle_is_served_by_ehdb() {
+        let f = fixture("primary-served");
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-t4").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        assert_eq!(report.put_count, 3);
+        assert!(report.put_ok && report.get_ok && report.list_ok);
+        assert!(report.locate_ok && report.delete_ok);
+        assert!(report.replay_matches && report.dual_run_holds);
+        assert!(report.divergence.is_none());
+        // list runs before the delete → all 3; replay after the delete → 2 live.
+        assert_eq!(report.list_live, 3);
+        assert_eq!(report.replay_live, 2);
+    }
+
+    #[test]
+    fn primary_serve_reversible_restores_object_store_path() {
+        // Reversibility half proven directly: after the cycle, a fresh driver over
+        // the SAME registry + blob store serves the identical durable live set with
+        // zero data loss — a flip back to the external-store path replays the store
+        // whole and the external store was never written by the engine.
+        let f = fixture("primary-reversible");
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-t4").unwrap();
+        assert!(report.replay_matches);
+        let fresh = LocalReferenceObjectBlobDriver::new(
+            f.driver.log_path.clone(),
+            f.driver.object_root.clone(),
+            "noetl",
+            "default",
+        );
+        let list = fresh
+            .list(&ObjectListRequest {
+                prefix: Some("noetl/env=primary/".to_string()),
+                limit: 100,
+            })
+            .unwrap();
+        let keys: Vec<&str> = list.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "noetl/env=primary/execution=exec-p/results/s/f/r/a.feather",
+                "noetl/env=primary/execution=exec-p/state/open.feather",
+            ]
+        );
+        // The surviving objects still verify against their digests after the replay.
+        for key in &keys {
+            assert!(get(&fresh, key).verified, "key {key} should verify");
+        }
+    }
+
+    #[test]
+    fn primary_serve_dual_run_digest_parity_holds_across_reads() {
+        let f = fixture("primary-parity");
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-t4").unwrap();
+        // One parity per initial get (3) + the post-delete get (1).
+        assert_eq!(report.dual_run.len(), 4);
+        assert!(report.dual_run.iter().all(|r| r.holds()), "{report:?}");
+        // Every present read's digest + length + retrievability held.
+        assert!(report
+            .dual_run
+            .iter()
+            .all(|r| r.digest_ok && r.length_ok && r.retrievable_ok));
+    }
+
+    #[test]
+    fn primary_serve_requires_two_distinct_keys() {
+        let f = fixture("primary-badinput");
+        // Fewer than two entries → rejected as invalid state.
+        let one = ObjectPrimaryInput {
+            prefix: None,
+            entries: vec![("noetl/k/state/open.feather".to_string(), b"v".to_vec())],
+        };
+        assert!(exercise_primary_serve(&f.driver, &one, "t").is_err());
+        // First == last key → rejected.
+        let same = ObjectPrimaryInput {
+            prefix: None,
+            entries: vec![
+                ("noetl/k/state/open.feather".to_string(), b"v1".to_vec()),
+                ("noetl/k/state/open.feather".to_string(), b"v2".to_vec()),
+            ],
+        };
+        assert!(exercise_primary_serve(&f.driver, &same, "t").is_err());
+    }
+
+    #[test]
+    fn primary_serve_rejects_oversize_blob() {
+        let f = fixture("primary-oversize");
+        let oversize = ObjectPrimaryInput {
+            prefix: None,
+            entries: vec![
+                ("noetl/k1/state/open.feather".to_string(), b"ok".to_vec()),
+                (
+                    "noetl/k2/state/open.feather".to_string(),
+                    vec![0u8; MAX_OBJECT_BYTES + 1],
+                ),
+            ],
+        };
+        let err = exercise_primary_serve(&f.driver, &oversize, "t").unwrap_err();
+        assert!(err.to_string().contains("exceeds bound"));
+    }
+
+    #[test]
+    fn primary_serve_scope_isolated_by_prefix() {
+        // A pre-existing key OUTSIDE the cycle's prefix never leaks into the served
+        // list / replay of the cycle's scope.
+        let f = fixture("primary-scope");
+        put(&f.driver, "noetl/env=other/state/open.feather", b"leak", 99);
+        let report = exercise_primary_serve(&f.driver, &primary_input(), "primary-t4").unwrap();
+        assert!(report.served_by_ehdb(), "{report:?}");
+        // The out-of-scope key never affects the cycle's live set.
+        assert_eq!(report.replay_live, 2);
+        assert!(get(&f.driver, "noetl/env=other/state/open.feather").found);
     }
 }

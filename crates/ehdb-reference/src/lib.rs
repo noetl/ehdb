@@ -79,11 +79,13 @@ pub use kv::{
 /// behind a driver interface.  See [`object`].
 pub mod object;
 pub use object::{
-    compare_object_parity, AuthoritativeObject, LocalReferenceObjectBlobDriver, ObjectBlobDriver,
-    ObjectDeleteOutcome, ObjectDeleteRequest, ObjectEntryView, ObjectGetOutcome, ObjectGetRequest,
-    ObjectListOutcome, ObjectListRequest, ObjectLocateOutcome, ObjectLocateRequest,
-    ObjectParityReport, ObjectPutOutcome, ObjectPutRequest, MAX_OBJECT_BYTES,
-    MAX_OBJECT_LIST_LIMIT, OBJECT_CONTENT_PREFIX, OBJECT_STORE_STREAM, OBJECT_SUBJECT_PREFIX,
+    compare_object_parity, exercise_primary_serve as exercise_object_primary_serve,
+    AuthoritativeObject, LocalReferenceObjectBlobDriver, ObjectBlobDriver, ObjectDeleteOutcome,
+    ObjectDeleteRequest, ObjectEntryView, ObjectGetOutcome, ObjectGetRequest, ObjectListOutcome,
+    ObjectListRequest, ObjectLocateOutcome, ObjectLocateRequest, ObjectParityReport,
+    ObjectPrimaryInput, ObjectPrimaryServeReport, ObjectPutOutcome, ObjectPutRequest,
+    MAX_OBJECT_BYTES, MAX_OBJECT_LIST_LIMIT, OBJECT_CONTENT_PREFIX, OBJECT_STORE_STREAM,
+    OBJECT_SUBJECT_PREFIX,
 };
 
 /// EHDB vector core engine (completion program Phase 8, slice 3) — the durable
