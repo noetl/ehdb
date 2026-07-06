@@ -34,6 +34,17 @@ use ehdb_transaction::{
 };
 use serde::{Deserialize, Serialize};
 
+/// EHDB tunable per-tier backend-selection config surface (completion program
+/// Phase 10) — the consolidated schema (platform tiers, modes, backend
+/// derivation, coherence validation, secret-free render) that makes EHDB the
+/// default while every tier stays selectable back to its incumbent.  See
+/// [`backends`].
+pub mod backends;
+pub use backends::{
+    backend_for_mode, Backend, BackendConfigError, BackendMatrix, PlatformTier, TierMode,
+    TierSelection,
+};
+
 /// EHDB event-log core engine (completion program Phase 6) — the durable
 /// persistence + ordering + serving layer for NoETL's append-only event log,
 /// exposed behind a driver interface.  See [`eventlog`].
