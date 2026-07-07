@@ -58,6 +58,18 @@ pub use eventlog::{
     EVENT_LOG_SUBJECT_PREFIX,
 };
 
+/// EHDB durable, segmented event-log backend (completion program Phase 6 →
+/// Phase 9 primary-serve prerequisite) — the production disk format (segmented
+/// append files + CRC framing + offset index + fsync + crash-recovery replay)
+/// underneath the [`EventLogDriver`] contract, the durable/shared substrate the
+/// prod-cutover runbook's §C durability gate requires beyond `local_reference`.
+/// See [`durable_eventlog`].
+pub mod durable_eventlog;
+pub use durable_eventlog::{
+    exercise_durable_recovery, DurableEventLogDriver, DurableRecoveryReport, DurableSegmentStore,
+    EventLogStorageBackend, DEFAULT_SEGMENT_MAX_BYTES,
+};
+
 /// EHDB projection / read-model core engine (completion program Phase 7) — builds
 /// + serves the materialized read-models off the Phase-6 event-log tail, exposed
 /// behind a driver interface, retiring the PostgreSQL materializer.  See

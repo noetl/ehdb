@@ -5,7 +5,7 @@ use ehdb_reference::compare_projection_parity;
 use ehdb_reference::{
     ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
     bind_local_reference_system_channel_json, compare_shadow_parity,
-    consume_local_reference_event_records_json, exercise_primary_serve,
+    consume_local_reference_event_records_json, exercise_durable_recovery, exercise_primary_serve,
     ingest_local_reference_retrieval_document_json, publish_local_reference_system_module_json,
     read_local_reference_domain_records_json, resolve_local_reference_system_module_json,
     retrieve_local_reference_context, summarize_local_reference_json, AckEventConsumerRequest,
@@ -61,6 +61,9 @@ fn run(args: Vec<String>) -> Result<(String, i32), String> {
         Some((command, rest)) if command == "eventlog-suite" => run_eventlog_suite(rest),
         Some((command, rest)) if command == "eventlog-primary-serve" => {
             run_eventlog_primary_serve(rest)
+        }
+        Some((command, rest)) if command == "durable-eventlog-recovery" => {
+            run_durable_eventlog_recovery(rest)
         }
         Some((command, rest)) if command == "projection-apply" => run_projection_apply(rest),
         Some((command, rest)) if command == "projection-read-exec" => {
@@ -330,6 +333,51 @@ fn run_eventlog_primary_serve(args: &[String]) -> Result<(String, i32), String> 
             }))
             .map_err(|err| err.to_string())?;
             Ok((output, if served { 0 } else { 1 }))
+        }
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// Durable, segmented event-log crash-recovery drive (Phase 9 primary-serve
+/// prerequisite): append a deterministic event set + ack a durable-consumer
+/// cursor through the durable segment backend, then **reopen a fresh driver
+/// over the same root** (simulated pod restart) and prove the reopened store
+/// serves the identical record set with zero loss, gapless ordering,
+/// per-execution scope, payload fidelity, and durable-cursor survival —
+/// replay-is-truth from the durable segments the runbook §C durability gate
+/// requires beyond `local_reference`.  `--root` is the store directory (not a
+/// single JSONL file).  Exit 0 only when [`DurableRecoveryReport::recovered`]
+/// holds.
+fn run_durable_eventlog_recovery(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let root = take_required(&mut flags, "root")?;
+    let consumer = flags
+        .remove("consumer")
+        .unwrap_or_else(|| "durable-recovery-projector".to_string());
+    ensure_no_unknown_flags(&flags)?;
+
+    // Deterministic drive: two executions interleaved so the reopened scope +
+    // ordering + cursor checks are exact.
+    let events: Vec<EventLogAppendRequest> = [("100", 1u64), ("200", 2), ("100", 3)]
+        .into_iter()
+        .map(|(exec, seq)| EventLogAppendRequest {
+            execution_id: exec.to_string(),
+            transaction_id: format!("durable-{exec}-{seq}"),
+            payload: format!("{{\"exec\":\"{exec}\",\"seq\":{seq}}}"),
+        })
+        .collect();
+
+    match exercise_durable_recovery(PathBuf::from(root), &events, &consumer) {
+        Ok(report) => {
+            let recovered = report.recovered();
+            let output = serde_json::to_string(&serde_json::json!({
+                "suite": "ehdb-durable-eventlog-recovery",
+                "driver": report.driver_name,
+                "recovered": recovered,
+                "report": report,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, if recovered { 0 } else { 1 }))
         }
         Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
     }
@@ -1267,5 +1315,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference vector-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference durable-eventlog-recovery --root <dir> [--consumer <name>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference vector-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
 }
