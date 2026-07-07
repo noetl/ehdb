@@ -40,11 +40,18 @@
 //!   logical key.  A per-key subject-scoped append to a single canonical stream
 //!   ([`OBJECT_STORE_STREAM`]) records the key → digest mapping, so a `get`/`locate`
 //!   is the latest record of that key's subject-filtered replay and a `list` is a
-//!   prefix-filtered replay folded to the latest record per key.  The logical key
-//!   is hex-encoded into one subject token because the external key carries
-//!   `.` / `/` / `=` which are not valid inside one subject token (and `=` is not
-//!   even a safe [`ehdb_storage::ObjectPath`] character), so the logical key never
-//!   touches the physical object path — only its digest does.
+//!   prefix-filtered replay folded to the latest record per key.  The subject
+//!   token is a **fixed-width SHA-256 digest of the logical key**
+//!   (`noetl.obj.<sha256hex(key)>`), NOT the key's own hex: the external key
+//!   carries `.` / `/` / `=` which are not valid inside one subject token, and —
+//!   the defect this addresses — real platform coordinate keys run ~140-150 bytes,
+//!   whose full hex encoding (2 chars/byte) overflowed the 256-char [`Subject`]
+//!   cap and rejected every real put.  A 64-char digest keeps the subject at a
+//!   constant 74 chars for a key of any length.  The full logical key stays in the
+//!   record payload ([`ObjectEnvelope::key`]), so `get`/`list`/`locate` resolve the
+//!   real key without ever reversing the subject; the subject is purely the
+//!   routing/addressing token.  The logical key never touches the physical object
+//!   path either — only its content digest does.
 //! * **Delete = tombstone** — a delete appends a tombstone registry record; a
 //!   subsequent `get`/`locate` sees the key as absent (the GC twin for the
 //!   GC-managed tiers).  The content-addressed blob is left in place because other
@@ -94,10 +101,14 @@ use crate::LocalReferenceRuntime;
 pub const OBJECT_STORE_STREAM: &str = "noetl_object_store";
 
 /// Subject prefix scoping a registry write to its logical key.  A record's subject
-/// is `noetl.obj.<hex(key)>`, so a per-key read is an exact subject-filtered
+/// is `noetl.obj.<sha256hex(key)>`, so a per-key read is an exact subject-filtered
 /// replay and a prefix list is a `noetl.obj.>` replay folded + filtered.  The key
-/// is hex-encoded into a single subject token because object keys carry `.` / `/`
-/// / `=` which are not valid inside one subject token.
+/// is reduced to a fixed-width SHA-256 digest token (not the key's own hex) so the
+/// subject stays a constant 74 chars — well under the 256-char [`Subject`] cap —
+/// for a key of any length; the raw key carries `.` / `/` / `=` which would split
+/// or invalidate a subject token, and real ~140-150-byte coordinate keys hex-
+/// encode past the cap.  The full key lives in the record payload, so the subject
+/// never needs reversing.
 pub const OBJECT_SUBJECT_PREFIX: &str = "noetl.obj";
 
 /// The content-addressed blob directory under the object store root.  A blob is
@@ -115,24 +126,30 @@ pub const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 /// Hard ceiling on a single list's returned entries.
 pub const MAX_OBJECT_LIST_LIMIT: usize = 4_096;
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+/// The fixed-width SHA-256 digest token addressing a logical key's registry
+/// subject.  Hashing the key (rather than hex-encoding it whole) bounds the
+/// subject to `noetl.obj.` + 64 hex chars = 74 chars regardless of key length,
+/// where the former hex-of-full-key form overflowed the 256-char [`Subject`] cap
+/// for real ~140-150-byte platform coordinate keys.  Deterministic + collision-
+/// safe (SHA-256), and the full key is preserved in the record payload so the
+/// subject never needs decoding back to the key.
+fn key_digest_token(key: &str) -> Result<String> {
+    let digest = ObjectDigest::sha256(key.as_bytes());
+    digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .map(|hex| hex.to_string())
+        .ok_or_else(|| EhdbError::Storage(format!("unexpected digest form: {}", digest.as_str())))
 }
 
-/// Build the exact per-key registry subject `noetl.obj.<hex(key)>`.
+/// Build the exact per-key registry subject `noetl.obj.<sha256hex(key)>`.
 fn key_subject(key: &str) -> Result<Subject> {
     if key.is_empty() {
         return Err(EhdbError::InvalidIdentifier(
             "object key: empty".to_string(),
         ));
     }
-    let token = hex_encode(key.as_bytes());
+    let token = key_digest_token(key)?;
     Subject::new(format!("{OBJECT_SUBJECT_PREFIX}.{token}"))
 }
 
@@ -373,6 +390,7 @@ impl LocalReferenceObjectBlobDriver {
         namespace: &NamespaceName,
         stream: &StreamName,
         subject: &Subject,
+        key: &str,
     ) -> Option<ObjectEnvelope> {
         let filter = SubjectFilter::new(subject.as_str().to_string()).ok()?;
         let records = runtime
@@ -380,7 +398,15 @@ impl LocalReferenceObjectBlobDriver {
             .streams
             .replay_matching(tenant, namespace, stream, &filter, None)
             .ok()?;
-        records.last().and_then(decode_envelope)
+        // The subject is a SHA-256 digest of the key, so a (cryptographically
+        // infeasible) digest collision would co-mingle two keys' records under one
+        // subject.  Filter the replay to this exact key — the full key lives in the
+        // record payload — so `get`/`locate`/`delete` never resolve a colliding
+        // key's envelope.
+        records
+            .iter()
+            .rev()
+            .find_map(|record| decode_envelope(record).filter(|env| env.key == key))
     }
 
     /// Store the bytes under their content-addressed path, deduplicating when the
@@ -423,7 +449,14 @@ impl ObjectBlobDriver for LocalReferenceObjectBlobDriver {
         let (digest, newly_stored) = self.store_content(&request.bytes)?;
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
         // Monotonic per-key version — advances across tombstones too, so a
         // delete → recreate strictly increases the version.
         let next_version = latest.as_ref().map(|env| env.version).unwrap_or(0) + 1;
@@ -468,7 +501,14 @@ impl ObjectBlobDriver for LocalReferenceObjectBlobDriver {
         let subject = key_subject(&request.key)?;
         let runtime = LocalReferenceRuntime::open(&self.log_path)?;
 
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
         let absent = || ObjectGetOutcome {
             action: "object-get".to_string(),
             key: request.key.clone(),
@@ -569,7 +609,14 @@ impl ObjectBlobDriver for LocalReferenceObjectBlobDriver {
         let transaction_id = TransactionId::new(request.transaction_id.clone())?;
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
 
         // Idempotent: an absent key (never written, or already a tombstone) does
         // not append a second tombstone.
@@ -619,7 +666,14 @@ impl ObjectBlobDriver for LocalReferenceObjectBlobDriver {
         let subject = key_subject(&request.key)?;
         let runtime = LocalReferenceRuntime::open(&self.log_path)?;
 
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
         let Some(env) = latest.filter(|env| !env.deleted) else {
             return Ok(ObjectLocateOutcome {
                 action: "object-locate".to_string(),
@@ -1416,7 +1470,7 @@ mod tests {
     fn keys_with_dots_slashes_and_equals_round_trip() {
         let f = fixture("special-keys");
         let d = &f.driver;
-        // Real NoETL object keys carry `.`, `/`, and `=`; the hex subject token
+        // Real NoETL object keys carry `.`, `/`, and `=`; the digest subject token
         // round-trips and the `=` never touches the physical object path.
         for (n, key) in [STATE_KEY, RESULT_KEY, "noetl/env=x/a.b.c/d_e-f.feather"]
             .into_iter()
@@ -1427,6 +1481,78 @@ mod tests {
             assert!(got.found, "key {key} should round-trip");
             assert!(got.verified, "key {key} should verify");
         }
+    }
+
+    // A real platform coordinate key (state-shard `#166` / result-tier `#104`)
+    // runs ~140-150 bytes — long enough that the former hex-of-full-key subject
+    // (2 chars/byte + prefix) overflowed the 256-char [`Subject`] cap and rejected
+    // every real put (the defect the digest token fixes).
+    const LONG_STATE_KEY: &str =
+        "noetl/env=production/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/state/open.feather";
+
+    #[test]
+    fn long_platform_key_subject_is_bounded_and_round_trips() {
+        let f = fixture("long-key");
+        let d = &f.driver;
+        // Long enough that the old hex-of-key subject overflowed the 256-char cap.
+        assert!(
+            LONG_STATE_KEY.len() > 123,
+            "key len {} must exceed the old ~123-byte failure threshold",
+            LONG_STATE_KEY.len()
+        );
+        // The digest subject stays a fixed 74 chars (`noetl.obj.` + 64 hex), well
+        // under the Subject 256-char cap.
+        let subject = key_subject(LONG_STATE_KEY).unwrap();
+        assert!(subject.as_str().len() < 256);
+        assert_eq!(subject.as_str().len(), OBJECT_SUBJECT_PREFIX.len() + 1 + 64);
+        // Full put → get → locate → list → delete round-trip on the long key.
+        let put = put(d, LONG_STATE_KEY, b"arrow-ipc-open-shard", 1);
+        assert!(put.written);
+        assert_eq!(put.version, 1);
+        let got = get(d, LONG_STATE_KEY);
+        assert!(got.found, "long key must be found");
+        assert!(got.verified, "long key must verify");
+        assert_eq!(got.digest.as_deref(), Some(put.digest.as_str()));
+        let loc = d
+            .locate(&ObjectLocateRequest {
+                key: LONG_STATE_KEY.to_string(),
+            })
+            .unwrap();
+        assert!(loc.found);
+        assert_eq!(loc.byte_len, Some(20));
+        assert_eq!(loc.digest.as_deref(), Some(put.digest.as_str()));
+        let list = d
+            .list(&ObjectListRequest {
+                prefix: Some("noetl/env=production/".to_string()),
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.entries[0].key, LONG_STATE_KEY);
+        let del = d
+            .delete(&ObjectDeleteRequest {
+                key: LONG_STATE_KEY.to_string(),
+                transaction_id: "txn-del".to_string(),
+            })
+            .unwrap();
+        assert!(del.existed);
+        assert!(!get(d, LONG_STATE_KEY).found);
+    }
+
+    #[test]
+    fn distinct_keys_get_distinct_bounded_subjects() {
+        // Digest subjects are deterministic (same key ⇒ same subject), unique
+        // across distinct keys, and always bounded regardless of key length.
+        let a = key_subject("noetl/env=x/execution=1/state/open.feather").unwrap();
+        let b = key_subject("noetl/env=x/execution=2/state/open.feather").unwrap();
+        assert_ne!(a.as_str(), b.as_str(), "distinct keys ⇒ distinct subjects");
+        assert!(a.as_str().len() < 256 && b.as_str().len() < 256);
+        let a2 = key_subject("noetl/env=x/execution=1/state/open.feather").unwrap();
+        assert_eq!(a.as_str(), a2.as_str(), "same key ⇒ same subject");
+        // Even a pathologically long key stays under the cap.
+        let long = format!("noetl/{}/state/open.feather", "seg=abcdefgh/".repeat(40));
+        assert!(long.len() > 400);
+        assert!(key_subject(&long).unwrap().as_str().len() < 256);
     }
 
     #[test]

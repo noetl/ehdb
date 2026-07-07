@@ -951,20 +951,23 @@ fn run_object_primary_serve(args: &[String]) -> Result<(String, i32), String> {
     // Deterministic drive: three distinct platform-artifact keys under one
     // execution prefix (delete on the last state shard), each with distinct bytes
     // — a scope + list + locate + delete ground truth with an in-lockstep
-    // external-store mirror so the dual-run digest-parity is exact.
+    // external-store mirror so the dual-run digest-parity is exact.  The keys use
+    // the real ~140-150-byte coordinate form (region / cell / shard / tenant /
+    // execution) so the suite exercises the long-key path that overflowed the old
+    // hex-of-full-key subject — proving the SHA-256 digest subject stays bounded.
     let input = ObjectPrimaryInput {
         prefix: Some("noetl/env=primary/".to_string()),
         entries: vec![
             (
-                "noetl/env=primary/execution=exec-p/state/open.feather".to_string(),
+                "noetl/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/state/open.feather".to_string(),
                 b"arrow-ipc-state-open".to_vec(),
             ),
             (
-                "noetl/env=primary/execution=exec-p/results/s/f/r/a.feather".to_string(),
+                "noetl/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/results/step-materialize/frame-0/row-0/attempt-0.feather".to_string(),
                 b"arrow-ipc-result-frame".to_vec(),
             ),
             (
-                "noetl/env=primary/execution=exec-p/state/sealed.feather".to_string(),
+                "noetl/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/state/sealed.feather".to_string(),
                 b"arrow-ipc-state-sealed".to_vec(),
             ),
         ],
