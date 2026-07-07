@@ -70,6 +70,29 @@ pub use durable_eventlog::{
     EventLogStorageBackend, DEFAULT_SEGMENT_MAX_BYTES,
 };
 
+/// EHDB execution-affinity **shard ownership** (completion program, durable
+/// event-log backend slice 2) — the XxHash64 ownership hash (byte-identical to
+/// `noetl-worker` / `noetl-server` `shard_for`) + [`ShardOwnership`] policy that
+/// pins each event-log shard to exactly one writing replica.  See [`affinity`].
+pub mod affinity;
+pub use affinity::{
+    shard_for_execution, shard_for_i64, ShardOwnership, SHARD_COUNT_ENV, SHARD_HASH_SEED,
+    SHARD_INDEX_ENV,
+};
+
+/// EHDB execution-affinity **single-writer routing** over the durable segment
+/// store (completion program, durable event-log backend slice 2) — partitions
+/// the durable event log into per-shard stores so each shard has one writer;
+/// non-owner writes are refused (route-to-owner), non-owner reads cold-load the
+/// segments read-only.  The single-writer coherence the prod-cutover runbook's
+/// §C durability gate requires beyond `local_reference`.  See
+/// [`durable_eventlog_affinity`].
+pub mod durable_eventlog_affinity;
+pub use durable_eventlog_affinity::{
+    exercise_affinity_single_writer, AffinityRead, AffinityRoutedEventLog,
+    AffinitySingleWriterReport, Routed, ServedBy,
+};
+
 /// EHDB projection / read-model core engine (completion program Phase 7) — builds
 /// + serves the materialized read-models off the Phase-6 event-log tail, exposed
 /// behind a driver interface, retiring the PostgreSQL materializer.  See

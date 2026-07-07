@@ -19,6 +19,7 @@ ehdb-system.workspace = true
 ehdb-transaction.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+twox-hash.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
