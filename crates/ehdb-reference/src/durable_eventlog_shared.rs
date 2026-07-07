@@ -1,0 +1,1343 @@
+//! Shared / object-store **segment tier** over the durable event-log backend
+//! (completion program, durable event-log backend slice 3;
+//! [noetl/ai-meta#254] item 3).
+//!
+//! Slice 1 ([`crate::durable_eventlog`]) shipped the production disk format and
+//! slice 2 ([`crate::durable_eventlog_affinity`]) pinned each shard to a single
+//! writer with a **local** cold-load for a non-owner read. But a non-owner's
+//! cold-load in slice 2 reads the *non-owner's own local disk* — which, on a
+//! different pod with different local storage, is empty. This slice makes the
+//! cold-load pull from a **shared durable medium** instead: the owner publishes
+//! its segments to a shared store, and a non-owner (or a **new owner that
+//! inherited a shard with an empty local disk**) cold-loads those segments from
+//! the shared store. That is the runbook §C durability gate's *"durable/shared
+//! EHDB log backend beyond `local_reference`"* resolution — a shard survives the
+//! loss of the writer's pod-local disk because its segments live on a shared
+//! medium.
+//!
+//! ## Owner publishes; non-owner (and new owner) cold-loads from shared
+//!
+//! ```text
+//!  Replica A (owner shard 0)                 Replica B (owner shard 1)
+//!    local <root-a>/shard-0000/  --publish-->  [ shared store ]  <--cold-load--  read of shard 0
+//!    (fast path, slice 1 writes)               seg objects, keyed             (B has NO local
+//!                                              by (shard, segment_id)          shard-0 bytes)
+//! ```
+//!
+//! * **Owner append** — writes locally (slice-1 fast path, `fsync`'d) *and then*
+//!   publishes the shard's segment bytes to the [`SharedSegmentBackend`]. The
+//!   local write remains the authority for the owner's own reads; the shared
+//!   copy is the durable, cross-replica-readable authority.
+//! * **Non-owner read** — cold-loads the shard's segments **from the shared
+//!   store** into a scratch directory and opens a slice-1
+//!   [`DurableSegmentStore::open_read_only`] over them. Replay is byte-identical
+//!   and sequence-preserving — the full [`crate::eventlog::EventLogDriver`]
+//!   contract holds over the materialized segments because they *are* the
+//!   owner's segments.
+//! * **New owner inheriting a shard** — [`SharedTierEventLog::hydrate_owned_shard`]
+//!   pulls the shard's segments from shared into the owner's *own* local dir
+//!   before it serves/appends, so a pod that never held the shard locally
+//!   recovers it zero-loss from shared and continues the sequence. This is the
+//!   crash-recovery-from-shared path (a pod restart / reschedule onto a fresh
+//!   node).
+//!
+//! ## Digest-addressed, fixed-width segment keys (subject-length-trap-safe)
+//!
+//! A segment is addressed by **position** — `(shard, segment_id)`, both bounded
+//! integers — so [`shared_segment_key`] is a **constant 40-char** key
+//! (`noetl.ehdb.seg.<shard:08x>.<segment_id:016x>`). This deliberately avoids
+//! the trap the object tier hit ([noetl/ai-meta#234]: hex-encoding an arbitrary
+//! platform key into a NATS subject blew the 256-char subject cap) — the key
+//! width here is independent of any payload and can never approach a subject
+//! limit on whatever medium backs the trait. Each published object carries a
+//! byte-length + [`XxHash64`] content digest so a truncated or corrupted shared
+//! object is a **hard error** on read, not a silently-shortened replay.
+//!
+//! Segments are addressed by position rather than by content hash because a
+//! segment is **append-mutable** (the active segment grows on every append); a
+//! pure content-addressed key would change every append and break listing. The
+//! digest is carried as integrity metadata, not as the key.
+//!
+//! ## Pluggable medium — PVC now, EHDB object tier later
+//!
+//! [`SharedSegmentBackend`] is the pluggable seam. [`FilesystemSharedBackend`]
+//! (a shared directory — a `ReadWriteMany`/`ReadWriteOnce` PVC on kind) is the
+//! bootstrapping medium, matching the design note's recommendation. The
+//! self-sufficiency end-state routes the same trait to EHDB's own durable object
+//! tier (Phase 8 object engine) so the segments live on EHDB itself; that is a
+//! later slice and a different backend impl behind this same trait — no change to
+//! the routing/hydrate logic here.
+//!
+//! [noetl/ai-meta#254]: https://github.com/noetl/ehdb/issues/254
+//! [noetl/ai-meta#234]: https://github.com/noetl/ai-meta/issues/234
+
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    hash::Hasher,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use ehdb_core::{EhdbError, Result};
+use serde::{Deserialize, Serialize};
+use twox_hash::XxHash64;
+
+use crate::affinity::ShardOwnership;
+use crate::durable_eventlog::{
+    list_segment_files, segment_file_name, DurableSegmentStore, DEFAULT_SEGMENT_MAX_BYTES,
+};
+use crate::durable_eventlog_affinity::{AffinityRead, AffinityRoutedEventLog, Routed, ServedBy};
+use crate::eventlog::{
+    EventLogAckOutcome, EventLogAckRequest, EventLogAppendOutcome, EventLogAppendRequest,
+    EventLogReadExecutionOutcome, EventLogReadExecutionRequest, EventLogScanOutcome,
+    EventLogScanRequest, EventLogTailOutcome, EventLogTailRequest,
+};
+
+/// Fixed seed for the shared-object content digest (integrity only, not crypto).
+const DIGEST_SEED: u64 = 0;
+
+/// The **fixed-width, bounded, secret-free** shared-store object key for one
+/// segment. A constant 40 chars — `noetl.ehdb.seg.` (15) + `shard` (8 hex) +
+/// `.` (1) + `segment_id` (16 hex) — independent of any payload, so it never
+/// approaches a subject-length cap on whatever medium backs
+/// [`SharedSegmentBackend`]. See the module docs on why this avoids the object
+/// tier's subject-length trap.
+pub fn shared_segment_key(shard: u32, segment_id: u64) -> String {
+    format!("noetl.ehdb.seg.{shard:08x}.{segment_id:016x}")
+}
+
+/// XxHash64 content digest of a segment's bytes, hex-formatted (16 chars). An
+/// integrity check for the shared medium (detects bit-rot / partial upload),
+/// not a cryptographic guarantee.
+pub fn segment_digest(bytes: &[u8]) -> String {
+    let mut h = XxHash64::with_seed(DIGEST_SEED);
+    h.write(bytes);
+    format!("{:016x}", h.finish())
+}
+
+/// Outcome of publishing one segment to the shared store: the fixed-width key it
+/// landed under, its byte length, and its content digest. Secret-free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedSegmentPutOutcome {
+    /// The fixed-width shared-store key ([`shared_segment_key`]).
+    pub key: String,
+    /// Bytes written.
+    pub byte_len: u64,
+    /// Content digest ([`segment_digest`]).
+    pub digest: String,
+    /// Whether the object was newly written vs already present at this
+    /// `(len, digest)` (idempotent re-publish of an unchanged segment).
+    pub newly_written: bool,
+}
+
+/// A pluggable **shared durable medium** the owner publishes segment bytes to
+/// and a non-owner (or a new owner with an empty local disk) cold-loads them
+/// from. Bootstraps on a filesystem-backed shared directory
+/// ([`FilesystemSharedBackend`], a PVC on kind); the same trait plugs to EHDB's
+/// own object tier later (the self-sufficiency end-state) — the routing/hydrate
+/// logic in [`SharedTierEventLog`] is backend-agnostic.
+///
+/// Contract:
+/// * `put_segment` is **idempotent** — re-publishing the same `(shard,
+///   segment_id)` bytes is a no-op write; publishing a grown active segment
+///   overwrites atomically (a reader never sees a partial object).
+/// * `get_segment` returns **integrity-verified** bytes (byte-length + digest
+///   checked) or a hard error on a truncated/corrupt object; `None` for an
+///   object never (fully) published.
+/// * `list_segment_ids` returns only **committed** segment ids for a shard,
+///   ascending.
+pub trait SharedSegmentBackend: Send + Sync {
+    /// A stable, secret-free identifier for the backing medium.
+    fn backend_name(&self) -> &'static str;
+
+    /// Publish (idempotently) one shard segment's bytes under its fixed-width
+    /// key. Overwrites the prior object for the same `(shard, segment_id)` when
+    /// the active segment has grown.
+    fn put_segment(
+        &self,
+        shard: u32,
+        segment_id: u64,
+        bytes: &[u8],
+    ) -> Result<SharedSegmentPutOutcome>;
+
+    /// Fetch one shard segment's integrity-verified bytes, or `None` when the
+    /// object was never (fully) published. A present-but-corrupt/truncated
+    /// object is a hard error.
+    fn get_segment(&self, shard: u32, segment_id: u64) -> Result<Option<Vec<u8>>>;
+
+    /// List a shard's committed segment ids in ascending order (empty for a
+    /// shard never published).
+    fn list_segment_ids(&self, shard: u32) -> Result<Vec<u64>>;
+}
+
+/// On-disk integrity sidecar committed *after* the segment bytes — its presence
+/// marks the object committed (a crash between the bytes rename and the meta
+/// rename leaves an uncommitted object the reader treats as absent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedSegmentMeta {
+    byte_len: u64,
+    digest: String,
+}
+
+/// A [`SharedSegmentBackend`] over a shared filesystem directory — the
+/// bootstrapping medium (a PVC on kind, per the design note). Segment objects
+/// live flat under `<root>/<key>` with a `<key>.meta` integrity sidecar written
+/// last (the commit marker). Publishing is atomic via temp-file + rename so a
+/// concurrent reader never observes a partial object.
+#[derive(Debug, Clone)]
+pub struct FilesystemSharedBackend {
+    root: PathBuf,
+}
+
+impl FilesystemSharedBackend {
+    /// Open (creating the directory) a filesystem-backed shared store rooted at
+    /// `root`.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        fs::create_dir_all(&root).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        Ok(Self { root })
+    }
+
+    /// The directory backing the shared store.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn object_path(&self, shard: u32, segment_id: u64) -> PathBuf {
+        self.root.join(shared_segment_key(shard, segment_id))
+    }
+
+    fn meta_path(&self, shard: u32, segment_id: u64) -> PathBuf {
+        self.root
+            .join(format!("{}.meta", shared_segment_key(shard, segment_id)))
+    }
+
+    /// Write `bytes` to `path` via a sibling temp file + rename (atomic publish).
+    fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.write_all(bytes)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.sync_all()
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        fs::rename(&tmp, path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        Ok(())
+    }
+}
+
+impl SharedSegmentBackend for FilesystemSharedBackend {
+    fn backend_name(&self) -> &'static str {
+        "ehdb-shared-filesystem"
+    }
+
+    fn put_segment(
+        &self,
+        shard: u32,
+        segment_id: u64,
+        bytes: &[u8],
+    ) -> Result<SharedSegmentPutOutcome> {
+        let key = shared_segment_key(shard, segment_id);
+        let byte_len = bytes.len() as u64;
+        let digest = segment_digest(bytes);
+
+        // Idempotent skip: if a committed object at this key already matches this
+        // (len, digest), the segment is unchanged — no rewrite.
+        let meta_path = self.meta_path(shard, segment_id);
+        if let Some(existing) = read_meta(&meta_path)? {
+            if existing.byte_len == byte_len && existing.digest == digest {
+                return Ok(SharedSegmentPutOutcome {
+                    key,
+                    byte_len,
+                    digest,
+                    newly_written: false,
+                });
+            }
+        }
+
+        // Bytes first, meta (the commit marker) last.
+        Self::atomic_write(&self.object_path(shard, segment_id), bytes)?;
+        let meta = serde_json::to_vec(&SharedSegmentMeta {
+            byte_len,
+            digest: digest.clone(),
+        })
+        .map_err(|err| EhdbError::Storage(format!("encode shared segment meta: {err}")))?;
+        Self::atomic_write(&meta_path, &meta)?;
+
+        Ok(SharedSegmentPutOutcome {
+            key,
+            byte_len,
+            digest,
+            newly_written: true,
+        })
+    }
+
+    fn get_segment(&self, shard: u32, segment_id: u64) -> Result<Option<Vec<u8>>> {
+        let meta_path = self.meta_path(shard, segment_id);
+        // No meta == not (fully) committed == absent.
+        let Some(meta) = read_meta(&meta_path)? else {
+            return Ok(None);
+        };
+        let object_path = self.object_path(shard, segment_id);
+        let bytes = match fs::read(&object_path) {
+            Ok(bytes) => bytes,
+            // Meta present but bytes gone is corruption of the shared medium.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(EhdbError::Storage(format!(
+                    "shared segment {}: meta present but object bytes missing",
+                    shared_segment_key(shard, segment_id)
+                )));
+            }
+            Err(err) => return Err(EhdbError::Storage(err.to_string())),
+        };
+        if bytes.len() as u64 != meta.byte_len {
+            return Err(EhdbError::Storage(format!(
+                "shared segment {}: length {} != committed {} (truncated/corrupt)",
+                shared_segment_key(shard, segment_id),
+                bytes.len(),
+                meta.byte_len
+            )));
+        }
+        if segment_digest(&bytes) != meta.digest {
+            return Err(EhdbError::Storage(format!(
+                "shared segment {}: digest mismatch (bit-rot)",
+                shared_segment_key(shard, segment_id)
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn list_segment_ids(&self, shard: u32) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        if !self.root.exists() {
+            return Ok(ids);
+        }
+        let prefix = format!("noetl.ehdb.seg.{shard:08x}.");
+        for entry in fs::read_dir(&self.root).map_err(|err| EhdbError::Storage(err.to_string()))? {
+            let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // A committed segment is the `.meta` sidecar (written last); the bare
+            // object without meta is an in-progress publish, skipped.
+            if let Some(rest) = name.strip_suffix(".meta") {
+                if let Some(hex) = rest.strip_prefix(&prefix) {
+                    if let Ok(id) = u64::from_str_radix(hex, 16) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+}
+
+/// Read + decode a segment's integrity sidecar, or `None` when absent.
+fn read_meta(meta_path: &Path) -> Result<Option<SharedSegmentMeta>> {
+    match fs::read(meta_path) {
+        Ok(bytes) => {
+            let meta: SharedSegmentMeta = serde_json::from_slice(&bytes)
+                .map_err(|err| EhdbError::Storage(format!("decode shared segment meta: {err}")))?;
+            Ok(Some(meta))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(EhdbError::Storage(err.to_string())),
+    }
+}
+
+/// Outcome of publishing an owned shard's segments to the shared store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardPublishOutcome {
+    /// The shard published.
+    pub shard: u32,
+    /// Segments present locally for the shard.
+    pub local_segments: usize,
+    /// Segments actually (re-)written to the shared store this call (unchanged
+    /// sealed segments are skipped).
+    pub published: usize,
+}
+
+/// Outcome of hydrating an owned shard's segments from the shared store into the
+/// owner's local dir (the new-owner crash-recovery-from-shared path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardHydrateOutcome {
+    /// The shard hydrated.
+    pub shard: u32,
+    /// Segments in the shared store for the shard.
+    pub shared_segments: usize,
+    /// Segments materialized into the local dir this call (0 when the local dir
+    /// already held segments — hydrate only fills an empty local shard).
+    pub materialized: usize,
+    /// Whether the local shard dir was empty before hydrate (a genuine
+    /// inherit-from-shared vs a no-op on an already-resident owner).
+    pub was_empty: bool,
+}
+
+/// Execution-affinity single-writer router with a **shared segment tier**: the
+/// owner writes locally (slice-1 fast path via the slice-2
+/// [`AffinityRoutedEventLog`]) *and* publishes its segments to a
+/// [`SharedSegmentBackend`]; a non-owner (or a new owner inheriting a shard)
+/// cold-loads / hydrates the segments **from the shared store**.
+///
+/// One instance models **one replica**. Its [`ShardOwnership`] decides which
+/// shards it writes (and publishes) and which it must cold-load from shared.
+pub struct SharedTierEventLog {
+    /// Local owner fast path (slice 2) — reused verbatim for owned writes/reads.
+    local: AffinityRoutedEventLog,
+    /// The shared durable medium every owner publishes to and non-owners read.
+    shared: Arc<dyn SharedSegmentBackend>,
+    /// Scratch root under which non-owner cold-loads materialize shared
+    /// segments (per-shard subdirs, rebuilt each cold-load).
+    coldload_root: PathBuf,
+    /// Per-shard segment rollover threshold (matches the local stores so replay
+    /// classifies frames identically).
+    segment_max_bytes: u64,
+    /// Published `(shard, segment_id) -> byte_len` to skip re-publishing an
+    /// unchanged sealed segment (the active one grows and is always re-published).
+    published: Mutex<HashMap<(u32, u64), u64>>,
+}
+
+impl SharedTierEventLog {
+    /// Open a shared-tier router for one replica.
+    ///
+    /// * `local_root` — this replica's local per-shard store root (owned-shard
+    ///   fast path + hydrate target).
+    /// * `ownership` — which shards this replica writes.
+    /// * `shared` — the shared durable medium.
+    /// * `coldload_root` — scratch root for materializing non-owner cold-loads
+    ///   (kept separate from `local_root` so a cold-load never pollutes an owned
+    ///   store).
+    pub fn open(
+        local_root: impl Into<PathBuf>,
+        ownership: ShardOwnership,
+        shared: Arc<dyn SharedSegmentBackend>,
+        coldload_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Self::open_with_segment_size(
+            local_root,
+            ownership,
+            shared,
+            coldload_root,
+            DEFAULT_SEGMENT_MAX_BYTES,
+        )
+    }
+
+    /// Open with an explicit per-shard segment rollover threshold (tests force
+    /// small segments to exercise multi-segment publish/cold-load).
+    pub fn open_with_segment_size(
+        local_root: impl Into<PathBuf>,
+        ownership: ShardOwnership,
+        shared: Arc<dyn SharedSegmentBackend>,
+        coldload_root: impl Into<PathBuf>,
+        segment_max_bytes: u64,
+    ) -> Result<Self> {
+        let local = AffinityRoutedEventLog::open_with_segment_size(
+            local_root,
+            ownership,
+            segment_max_bytes,
+        )?;
+        Ok(Self {
+            local,
+            shared,
+            coldload_root: coldload_root.into(),
+            segment_max_bytes,
+            published: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// This replica's ownership.
+    pub fn ownership(&self) -> ShardOwnership {
+        self.local.ownership()
+    }
+
+    /// The shared medium's name.
+    pub fn shared_backend_name(&self) -> &'static str {
+        self.shared.backend_name()
+    }
+
+    /// The shard that owns `execution_id`.
+    pub fn shard_of(&self, execution_id: &str) -> u32 {
+        self.local.shard_of(execution_id)
+    }
+
+    /// Publish an owned shard's local segments to the shared store. Idempotent:
+    /// a sealed segment already published at its current length is skipped; the
+    /// active (growing) segment is always re-published. Caller must own `shard`.
+    pub fn publish_shard(&self, shard: u32) -> Result<ShardPublishOutcome> {
+        let local_dir = self.local.shard_dir(shard);
+        let segments = list_segment_files(&local_dir)?;
+        let local_segments = segments.len();
+        let mut published = 0usize;
+        let mut map = self.published.lock().map_err(|_| {
+            EhdbError::InvalidState("shared-tier published lock poisoned".to_string())
+        })?;
+        for (segment_id, path) in segments {
+            let bytes = fs::read(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            let len = bytes.len() as u64;
+            if map.get(&(shard, segment_id)) == Some(&len) {
+                // Sealed + unchanged since our last publish — skip.
+                continue;
+            }
+            self.shared.put_segment(shard, segment_id, &bytes)?;
+            map.insert((shard, segment_id), len);
+            published += 1;
+        }
+        Ok(ShardPublishOutcome {
+            shard,
+            local_segments,
+            published,
+        })
+    }
+
+    /// Materialize a shard's shared segments into a fresh directory and return a
+    /// read-only [`DurableSegmentStore`] over them — the cold-load-from-shared
+    /// primitive. `dest` is cleared first so a stale prior materialization can
+    /// never leak. A shard with no shared segments yields an empty read-only
+    /// store (the shared-store-miss case — not an error).
+    fn materialize_from_shared(&self, shard: u32, dest: &Path) -> Result<DurableSegmentStore> {
+        // Clear + recreate the destination so we never mix a stale cold-load.
+        if dest.exists() {
+            fs::remove_dir_all(dest).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        let ids = self.shared.list_segment_ids(shard)?;
+        if ids.is_empty() {
+            // Shared-store miss: no segments for this shard. Open read-only over
+            // the (absent) dir → an empty log, not an error.
+            return DurableSegmentStore::open_read_only_with_segment_size(
+                dest.to_path_buf(),
+                self.segment_max_bytes,
+            );
+        }
+        fs::create_dir_all(dest).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        for id in ids {
+            let bytes = self.shared.get_segment(shard, id)?.ok_or_else(|| {
+                EhdbError::Storage(format!(
+                    "shared segment {} listed but absent on fetch",
+                    shared_segment_key(shard, id)
+                ))
+            })?;
+            let path = dest.join(segment_file_name(id));
+            fs::write(&path, &bytes).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        DurableSegmentStore::open_read_only_with_segment_size(
+            dest.to_path_buf(),
+            self.segment_max_bytes,
+        )
+    }
+
+    /// Cold-load a read-only view of a shard from the shared store (a non-owner
+    /// read). Materializes into `<coldload_root>/shard-<NNNN>/`.
+    fn cold_load(&self, shard: u32) -> Result<DurableSegmentStore> {
+        let dest = self.coldload_root.join(format!("shard-{shard:04}"));
+        self.materialize_from_shared(shard, &dest)
+    }
+
+    /// Hydrate an **owned** shard from the shared store into this replica's local
+    /// dir — the new-owner crash-recovery-from-shared path. When the local shard
+    /// dir is empty (a pod that never held the shard), the shared segments are
+    /// materialized into it so the owner opens a fully-recovered writable store
+    /// and continues the sequence. When the local dir already holds segments,
+    /// this is a no-op (the resident owner is authoritative for its own writes;
+    /// full reconciliation of a divergent local vs shared is out of scope for
+    /// this slice — see the module docs / issue #254).
+    ///
+    /// Must be called **before** the first owned read/append for the shard (so
+    /// the lazy owned-store open replays the hydrated segments). Errors if this
+    /// replica does not own `shard`.
+    pub fn hydrate_owned_shard(&self, shard: u32) -> Result<ShardHydrateOutcome> {
+        if !self.ownership().owns_shard(shard) {
+            return Err(EhdbError::InvalidState(format!(
+                "cannot hydrate shard {shard}: not owned by this replica (shard_index {})",
+                self.ownership().shard_index()
+            )));
+        }
+        let local_dir = self.local.shard_dir(shard);
+        let local_segments = list_segment_files(&local_dir)?;
+        let was_empty = local_segments.is_empty();
+        let shared_ids = self.shared.list_segment_ids(shard)?;
+        let mut materialized = 0usize;
+        if was_empty && !shared_ids.is_empty() {
+            fs::create_dir_all(&local_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            for id in &shared_ids {
+                let bytes = self.shared.get_segment(shard, *id)?.ok_or_else(|| {
+                    EhdbError::Storage(format!(
+                        "shared segment {} listed but absent on hydrate",
+                        shared_segment_key(shard, *id)
+                    ))
+                })?;
+                let path = local_dir.join(segment_file_name(*id));
+                fs::write(&path, &bytes).map_err(|err| EhdbError::Storage(err.to_string()))?;
+                // Seed the published map so we don't redundantly re-publish
+                // exactly what we just pulled (idempotent even if we did).
+                self.published
+                    .lock()
+                    .map_err(|_| {
+                        EhdbError::InvalidState("shared-tier published lock poisoned".to_string())
+                    })?
+                    .insert((shard, *id), bytes.len() as u64);
+                materialized += 1;
+            }
+        }
+        Ok(ShardHydrateOutcome {
+            shard,
+            shared_segments: shared_ids.len(),
+            materialized,
+            was_empty,
+        })
+    }
+
+    /// Append one authorized event, routed to its owning shard. The owner writes
+    /// locally then publishes the shard's segments to shared; a non-owner is
+    /// refused with no side effect ([`Routed::NotOwner`]) so the caller
+    /// re-routes to the owner.
+    pub fn append(&self, request: &EventLogAppendRequest) -> Result<Routed<EventLogAppendOutcome>> {
+        match self.local.append(request)? {
+            Routed::Served(outcome) => {
+                let shard = self.shard_of(&request.execution_id);
+                self.publish_shard(shard)?;
+                Ok(Routed::Served(outcome))
+            }
+            Routed::NotOwner { owner_shard } => Ok(Routed::NotOwner { owner_shard }),
+        }
+    }
+
+    /// Ordered per-execution read, routed to the execution's shard. The owner
+    /// serves it resident from local; a non-owner cold-loads the shard's
+    /// segments **from the shared store** read-only.
+    pub fn read_execution(
+        &self,
+        request: &EventLogReadExecutionRequest,
+    ) -> Result<AffinityRead<EventLogReadExecutionOutcome>> {
+        let shard = self.shard_of(&request.execution_id);
+        if self.ownership().owns_shard(shard) {
+            self.local.read_execution(request)
+        } else {
+            let view = self.cold_load(shard)?;
+            Ok(AffinityRead {
+                served_by: ServedBy::NonOwnerColdLoad,
+                outcome: view.read_execution(request)?,
+            })
+        }
+    }
+
+    /// Ordered global scan of one shard's stream. The owner serves it resident;
+    /// a non-owner cold-loads read-only from the shared store.
+    pub fn scan_shard(
+        &self,
+        shard: u32,
+        request: &EventLogScanRequest,
+    ) -> Result<AffinityRead<EventLogScanOutcome>> {
+        if self.ownership().owns_shard(shard) {
+            self.local.scan_shard(shard, request)
+        } else {
+            let view = self.cold_load(shard)?;
+            Ok(AffinityRead {
+                served_by: ServedBy::NonOwnerColdLoad,
+                outcome: view.scan_global(request)?,
+            })
+        }
+    }
+
+    /// Durable-consumer tail pull on one shard's stream. Owner-only writer state
+    /// (create-on-first-pull persists a frame + is published to shared so a new
+    /// owner inherits the cursor); a non-owner is refused.
+    pub fn tail(
+        &self,
+        shard: u32,
+        request: &EventLogTailRequest,
+    ) -> Result<Routed<EventLogTailOutcome>> {
+        match self.local.tail(shard, request)? {
+            Routed::Served(outcome) => {
+                // A first-pull consumer-create wrote a frame — publish so the
+                // durable cursor survives cross-replica.
+                if outcome.created_consumer {
+                    self.publish_shard(shard)?;
+                }
+                Ok(Routed::Served(outcome))
+            }
+            Routed::NotOwner { owner_shard } => Ok(Routed::NotOwner { owner_shard }),
+        }
+    }
+
+    /// Advance a durable consumer's ack cursor on one shard's stream, then
+    /// publish so the persisted cursor survives cross-replica. Owner-only; a
+    /// non-owner is refused.
+    pub fn ack(
+        &self,
+        shard: u32,
+        request: &EventLogAckRequest,
+    ) -> Result<Routed<EventLogAckOutcome>> {
+        match self.local.ack(shard, request)? {
+            Routed::Served(outcome) => {
+                self.publish_shard(shard)?;
+                Ok(Routed::Served(outcome))
+            }
+            Routed::NotOwner { owner_shard } => Ok(Routed::NotOwner { owner_shard }),
+        }
+    }
+}
+
+// ===========================================================================
+// Shared-tier drive — the star of this slice.
+//
+// Spins up a two-replica pool with SEPARATE local disks over ONE shared store,
+// and proves:
+//   * owner append publishes its segments to the shared store,
+//   * a non-owner (separate local disk, no local copy) cold-loads the owner's
+//     exact records FROM THE SHARED STORE (slice-2 local cold-load would be
+//     empty here — this is the shared tier's whole point),
+//   * a NEW owner with an EMPTY local disk hydrates the shard from shared and
+//     replays it zero-loss + gapless (crash-recovery-from-shared), then
+//     continues the sequence,
+//   * a shared-store miss (shard never published) reads as empty, not an error,
+//   * parity: cold-load-from-shared records == the owner's local records.
+// ===========================================================================
+
+/// Secret-free proof of one shared-segment-tier drive. Counts + verdicts only
+/// (payloads are synthetic).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedTierReport {
+    /// Replicas / shards in the simulated pool.
+    pub shard_count: u32,
+    /// Distinct executions driven (each owned by exactly one shard).
+    pub executions: usize,
+    /// Total committed segments across all shards in the shared store after the
+    /// owner appends + publishes.
+    pub shared_segments: usize,
+    /// Every owner append published its shard's segments to the shared store.
+    pub owner_published_ok: bool,
+    /// A non-owner with a separate (empty) local disk cold-loaded the owner's
+    /// exact records from the shared store.
+    pub nonowner_coldload_from_shared_ok: bool,
+    /// A new owner with an empty local disk hydrated the shard from shared and
+    /// replayed it zero-loss + gapless, then appended the next sequence.
+    pub crash_recovery_from_shared_ok: bool,
+    /// A shared-store miss (shard never published) read as empty, not an error.
+    pub shared_miss_ok: bool,
+    /// Cold-load-from-shared records matched the owner's local records
+    /// (sequence + payload).
+    pub parity_ok: bool,
+    /// The single reason a durability/coherence invariant failed, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl SharedTierReport {
+    /// Whether every shared-tier invariant held.
+    pub fn holds(&self) -> bool {
+        self.owner_published_ok
+            && self.nonowner_coldload_from_shared_ok
+            && self.crash_recovery_from_shared_ok
+            && self.shared_miss_ok
+            && self.parity_ok
+            && self.divergence.is_none()
+    }
+}
+
+/// Deterministically pick one execution id per shard `0..count`, searching
+/// decimal snowflake-shaped ids so every shard is covered. Returns
+/// `(execution_id, owning_shard)` pairs, one per shard, ascending by shard.
+fn one_execution_per_shard(count: u32) -> Vec<(String, u32)> {
+    let base = 320_816_801_799_737_344_i64;
+    let mut found: HashMap<u32, String> = HashMap::new();
+    let mut i = 0i64;
+    while (found.len() as u32) < count {
+        let id = (base + i).to_string();
+        let shard = crate::affinity::shard_for_execution(&id, count);
+        found.entry(shard).or_insert(id);
+        i += 1;
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    let mut out: Vec<(String, u32)> = found.into_iter().map(|(s, id)| (id, s)).collect();
+    out.sort_unstable_by_key(|(_, s)| *s);
+    out
+}
+
+/// Record only the first divergence reason (later ones are symptoms).
+fn record_first(slot: &mut Option<String>, reason: String) {
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
+/// Drive a shared-segment-tier cycle under `root` with a `shard_count`-replica
+/// pool sharing one shared store. `shard_count` must be `>= 2` (a single shard
+/// has no owner/non-owner split to prove). See the module docs for the
+/// invariants proven.
+pub fn exercise_shared_tier(
+    root: impl Into<PathBuf>,
+    shard_count: u32,
+) -> Result<SharedTierReport> {
+    if shard_count < 2 {
+        return Err(EhdbError::InvalidState(
+            "shared-tier drive requires shard_count >= 2".to_string(),
+        ));
+    }
+    let root = root.into();
+    let shared: Arc<dyn SharedSegmentBackend> =
+        Arc::new(FilesystemSharedBackend::open(root.join("shared"))?);
+    let executions = one_execution_per_shard(shard_count);
+    let total_execs = executions.len();
+    let mut divergence: Option<String> = None;
+
+    // One replica per shard, each with its OWN local disk, all sharing `shared`.
+    let replicas: Vec<SharedTierEventLog> = (0..shard_count)
+        .map(|idx| {
+            let ownership = ShardOwnership::new(idx, shard_count)?;
+            SharedTierEventLog::open(
+                root.join(format!("local-{idx}")),
+                ownership,
+                Arc::clone(&shared),
+                root.join(format!("coldload-{idx}")),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // --- Owner appends + publishes to shared. ------------------------------
+    let mut owner_published_ok = true;
+    for (execution_id, owner_shard) in &executions {
+        let replica = &replicas[*owner_shard as usize];
+        let served = replica.append(&EventLogAppendRequest {
+            execution_id: execution_id.clone(),
+            transaction_id: format!("shared-{execution_id}"),
+            payload: format!("{{\"exec\":\"{execution_id}\"}}"),
+        })?;
+        if !served.is_served() {
+            owner_published_ok = false;
+            record_first(
+                &mut divergence,
+                format!("owner {owner_shard} did not serve its own exec {execution_id}"),
+            );
+        }
+    }
+    // Every owned shard has at least one committed segment in shared.
+    let mut shared_segments = 0usize;
+    for (_, owner_shard) in &executions {
+        let ids = shared.list_segment_ids(*owner_shard)?;
+        shared_segments += ids.len();
+        if ids.is_empty() {
+            owner_published_ok = false;
+            record_first(
+                &mut divergence,
+                format!("shard {owner_shard} has no segments in the shared store after publish"),
+            );
+        }
+    }
+
+    // --- Non-owner cold-load FROM SHARED + parity. -------------------------
+    // A replica that does NOT own shard 0 reads a shard-0 execution. Its local
+    // disk has no shard-0 bytes, so a correct read proves it came from shared.
+    let mut nonowner_coldload_from_shared_ok = true;
+    let mut parity_ok = true;
+    let exec0 = executions
+        .iter()
+        .find(|(_, s)| *s == 0)
+        .map(|(id, _)| id.clone());
+    if let Some(exec0) = exec0 {
+        // A non-owner of shard 0.
+        let reader = replicas
+            .iter()
+            .find(|r| r.ownership().shard_index() != 0)
+            .expect("shard_count >= 2 guarantees a non-owner of shard 0");
+        let read = reader.read_execution(&EventLogReadExecutionRequest {
+            execution_id: exec0.clone(),
+            after: None,
+            limit: 100,
+        })?;
+        // The owner's local view of the same execution (parity reference).
+        let owner_read = replicas[0].read_execution(&EventLogReadExecutionRequest {
+            execution_id: exec0.clone(),
+            after: None,
+            limit: 100,
+        })?;
+        if read.served_by != ServedBy::NonOwnerColdLoad || read.outcome.returned == 0 {
+            nonowner_coldload_from_shared_ok = false;
+            record_first(
+                &mut divergence,
+                format!(
+                    "non-owner cold-load anomaly: served_by={:?} returned={}",
+                    read.served_by, read.outcome.returned
+                ),
+            );
+        }
+        let same = read.outcome.returned == owner_read.outcome.returned
+            && read
+                .outcome
+                .records
+                .iter()
+                .zip(owner_read.outcome.records.iter())
+                .all(|(a, b)| a.global_sequence == b.global_sequence && a.payload == b.payload);
+        if !same {
+            parity_ok = false;
+            record_first(
+                &mut divergence,
+                "cold-load-from-shared records != owner local records".to_string(),
+            );
+        }
+    } else {
+        nonowner_coldload_from_shared_ok = false;
+        parity_ok = false;
+        record_first(&mut divergence, "no shard-0 execution to test".to_string());
+    }
+
+    // --- Shared-store miss: a shard never published reads empty (not error). --
+    // Use a fresh, empty shared store + a replica reading a shard-0 exec.
+    let mut shared_miss_ok = true;
+    {
+        let empty_shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared-empty"))?);
+        // A replica that owns shard 1 (so shard 0 is a non-owner cold-load) over
+        // the EMPTY shared store.
+        let miss_replica = SharedTierEventLog::open(
+            root.join("local-miss"),
+            ShardOwnership::new(1, shard_count)?,
+            Arc::clone(&empty_shared),
+            root.join("coldload-miss"),
+        )?;
+        let exec0 = executions
+            .iter()
+            .find(|(_, s)| *s == 0)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| "320816801799737344".to_string());
+        let read = miss_replica.read_execution(&EventLogReadExecutionRequest {
+            execution_id: exec0,
+            after: None,
+            limit: 10,
+        })?;
+        // Empty shared → cold-load an empty read-only store → exists=false, no
+        // records, and NOT an error (we got here).
+        if read.served_by != ServedBy::NonOwnerColdLoad
+            || read.outcome.exists
+            || read.outcome.returned != 0
+        {
+            shared_miss_ok = false;
+            record_first(
+                &mut divergence,
+                format!(
+                    "shared-miss anomaly: served_by={:?} exists={} returned={}",
+                    read.served_by, read.outcome.exists, read.outcome.returned
+                ),
+            );
+        }
+        // Backend-level miss probes.
+        if empty_shared.get_segment(0, 0)?.is_some()
+            || !empty_shared.list_segment_ids(0)?.is_empty()
+        {
+            shared_miss_ok = false;
+            record_first(
+                &mut divergence,
+                "empty shared store returned a segment for an unpublished shard".to_string(),
+            );
+        }
+    }
+
+    // --- Crash-recovery-from-shared: NEW owner, EMPTY local disk. ----------
+    // Drop the original pool, then a fresh replica becomes owner of shard 0 with
+    // a brand-new empty local dir. It hydrates shard 0 from shared and must
+    // recover zero-loss + gapless, then continue the sequence.
+    drop(replicas);
+    let mut crash_recovery_from_shared_ok = true;
+    {
+        let expected0 = executions.iter().filter(|(_, s)| *s == 0).count();
+        let new_owner = SharedTierEventLog::open(
+            root.join("local-recover"),
+            ShardOwnership::new(0, shard_count)?,
+            Arc::clone(&shared),
+            root.join("coldload-recover"),
+        )?;
+        let hydrate = new_owner.hydrate_owned_shard(0)?;
+        // The new owner's local disk was empty and shared had segments to pull.
+        if !hydrate.was_empty || hydrate.materialized == 0 {
+            crash_recovery_from_shared_ok = false;
+            record_first(
+                &mut divergence,
+                format!(
+                    "hydrate anomaly: was_empty={} materialized={}",
+                    hydrate.was_empty, hydrate.materialized
+                ),
+            );
+        }
+        // Owner-resident scan after hydrate replays the shard zero-loss + gapless.
+        let scan = new_owner.scan_shard(
+            0,
+            &EventLogScanRequest {
+                after: None,
+                limit: 100_000,
+            },
+        )?;
+        let gapless = scan
+            .outcome
+            .records
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r.global_sequence == i as u64 + 1);
+        if scan.served_by != ServedBy::OwnerResident
+            || scan.outcome.record_count != expected0
+            || !gapless
+        {
+            crash_recovery_from_shared_ok = false;
+            record_first(
+                &mut divergence,
+                format!(
+                    "recover-from-shared anomaly: served_by={:?} recovered {} of {expected0} (gapless={gapless})",
+                    scan.served_by, scan.outcome.record_count
+                ),
+            );
+        }
+        // Continue the sequence: the next append lands at expected0 + 1.
+        let cont = new_owner.append(&EventLogAppendRequest {
+            execution_id: executions
+                .iter()
+                .find(|(_, s)| *s == 0)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default(),
+            transaction_id: "shared-continue".to_string(),
+            payload: "{\"cont\":true}".to_string(),
+        })?;
+        match cont.served() {
+            Some(outcome) if outcome.global_sequence == expected0 as u64 + 1 => {}
+            other => {
+                crash_recovery_from_shared_ok = false;
+                record_first(
+                    &mut divergence,
+                    format!("post-recovery append did not continue sequence: {other:?}"),
+                );
+            }
+        }
+    }
+
+    Ok(SharedTierReport {
+        shard_count,
+        executions: total_execs,
+        shared_segments,
+        owner_published_ok,
+        nonowner_coldload_from_shared_ok,
+        crash_recovery_from_shared_ok,
+        shared_miss_ok,
+        parity_ok,
+        divergence,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ehdb-shared-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn append_req(exec: &str, payload: &str) -> EventLogAppendRequest {
+        EventLogAppendRequest {
+            execution_id: exec.to_string(),
+            transaction_id: format!("txn-{exec}"),
+            payload: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_segment_key_is_fixed_width_and_bounded() {
+        // Constant 40 chars regardless of the shard / segment magnitude, well
+        // under any subject-length cap (the object-tier trap this slice avoids).
+        let small = shared_segment_key(0, 1);
+        let large = shared_segment_key(u32::MAX, u64::MAX);
+        assert_eq!(small.len(), 40);
+        assert_eq!(large.len(), 40);
+        assert!(large.len() < 256);
+        assert_ne!(small, large);
+    }
+
+    #[test]
+    fn filesystem_backend_put_get_list_roundtrip() {
+        let root = tmp_root("fsbackend");
+        let backend = FilesystemSharedBackend::open(&root).unwrap();
+        assert!(backend.get_segment(0, 1).unwrap().is_none());
+        assert!(backend.list_segment_ids(0).unwrap().is_empty());
+
+        let put = backend.put_segment(0, 1, b"hello").unwrap();
+        assert!(put.newly_written);
+        assert_eq!(put.byte_len, 5);
+        // Idempotent re-put of identical bytes is a no-op write.
+        let put2 = backend.put_segment(0, 1, b"hello").unwrap();
+        assert!(!put2.newly_written);
+
+        assert_eq!(backend.get_segment(0, 1).unwrap().unwrap(), b"hello");
+        assert_eq!(backend.list_segment_ids(0).unwrap(), vec![1]);
+        // A different shard is isolated.
+        assert!(backend.list_segment_ids(1).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filesystem_backend_detects_truncation_and_bitrot() {
+        let root = tmp_root("fscorrupt");
+        let backend = FilesystemSharedBackend::open(&root).unwrap();
+        backend.put_segment(3, 7, b"abcdefgh").unwrap();
+        let object = root.join(shared_segment_key(3, 7));
+
+        // Truncate the object → length mismatch → hard error.
+        fs::write(&object, b"abc").unwrap();
+        let err = backend.get_segment(3, 7).unwrap_err();
+        assert!(err.to_string().contains("truncated/corrupt"), "{err}");
+
+        // Bit-flip at the right length → digest mismatch → hard error.
+        fs::write(&object, b"Xbcdefgh").unwrap();
+        let err = backend.get_segment(3, 7).unwrap_err();
+        assert!(err.to_string().contains("bit-rot"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owner_publishes_nonowner_cold_loads_from_shared() {
+        let root = tmp_root("crossreplica");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        // One exec owned by shard 0, one by shard 1.
+        let execs = one_execution_per_shard(2);
+        let exec0 = execs.iter().find(|(_, s)| *s == 0).unwrap().0.clone();
+
+        // Replica A owns shard 0 (its own local disk); replica B owns shard 1
+        // (a SEPARATE local disk). B has no shard-0 bytes locally.
+        let a = SharedTierEventLog::open(
+            root.join("local-a"),
+            ShardOwnership::new(0, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-a"),
+        )
+        .unwrap();
+        let b = SharedTierEventLog::open(
+            root.join("local-b"),
+            ShardOwnership::new(1, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-b"),
+        )
+        .unwrap();
+
+        assert!(a
+            .append(&append_req(&exec0, "owned-by-0"))
+            .unwrap()
+            .is_served());
+
+        // B (non-owner of shard 0, separate empty local disk) reads exec0 →
+        // cold-load FROM SHARED yields A's record.
+        let read = b
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: exec0.clone(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(read.served_by, ServedBy::NonOwnerColdLoad);
+        assert_eq!(read.outcome.returned, 1);
+        assert_eq!(read.outcome.records[0].payload, "owned-by-0");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_owner_hydrates_from_shared_and_continues() {
+        let root = tmp_root("hydrate");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        let execs = one_execution_per_shard(2);
+        let exec0 = execs.iter().find(|(_, s)| *s == 0).unwrap().0.clone();
+
+        // Original owner writes + publishes, then goes away.
+        {
+            let a = SharedTierEventLog::open(
+                root.join("local-a"),
+                ShardOwnership::new(0, 2).unwrap(),
+                Arc::clone(&shared),
+                root.join("coldload-a"),
+            )
+            .unwrap();
+            a.append(&append_req(&exec0, "e1")).unwrap();
+        }
+
+        // New owner of shard 0 with a BRAND-NEW empty local disk.
+        let c = SharedTierEventLog::open(
+            root.join("local-c"),
+            ShardOwnership::new(0, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-c"),
+        )
+        .unwrap();
+        let hy = c.hydrate_owned_shard(0).unwrap();
+        assert!(hy.was_empty);
+        assert!(hy.materialized >= 1);
+
+        // Owner-resident scan recovers the record; next append continues seq.
+        let scan = c
+            .scan_shard(
+                0,
+                &EventLogScanRequest {
+                    after: None,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(scan.served_by, ServedBy::OwnerResident);
+        assert_eq!(scan.outcome.record_count, 1);
+        assert_eq!(scan.outcome.records[0].payload, "e1");
+        let next = c.append(&append_req(&exec0, "e2")).unwrap();
+        assert_eq!(next.served().unwrap().global_sequence, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hydrate_refuses_non_owned_shard() {
+        let root = tmp_root("hydraterefuse");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        let r = SharedTierEventLog::open(
+            root.join("local"),
+            ShardOwnership::new(0, 2).unwrap(),
+            shared,
+            root.join("coldload"),
+        )
+        .unwrap();
+        // Replica owns shard 0, not shard 1 → hydrating shard 1 is an error.
+        let err = r.hydrate_owned_shard(1).unwrap_err();
+        assert!(matches!(err, EhdbError::InvalidState(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_miss_reads_empty_not_error() {
+        let root = tmp_root("miss");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        let execs = one_execution_per_shard(2);
+        let exec0 = execs.iter().find(|(_, s)| *s == 0).unwrap().0.clone();
+        // Replica owns shard 1; nothing ever published → cold-load of shard 0 is
+        // an empty read, not an error.
+        let r = SharedTierEventLog::open(
+            root.join("local"),
+            ShardOwnership::new(1, 2).unwrap(),
+            shared,
+            root.join("coldload"),
+        )
+        .unwrap();
+        let read = r
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: exec0,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(read.served_by, ServedBy::NonOwnerColdLoad);
+        assert!(!read.outcome.exists);
+        assert_eq!(read.outcome.returned, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_segment_publish_and_cold_load_across_rollover() {
+        let root = tmp_root("rollover");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        let execs = one_execution_per_shard(2);
+        let exec0 = execs.iter().find(|(_, s)| *s == 0).unwrap().0.clone();
+
+        // Tiny segment size forces multiple segments for shard 0.
+        let a = SharedTierEventLog::open_with_segment_size(
+            root.join("local-a"),
+            ShardOwnership::new(0, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-a"),
+            128,
+        )
+        .unwrap();
+        for i in 1..=15 {
+            a.append(&append_req(&exec0, &format!("payload-{i:03}")))
+                .unwrap();
+        }
+        // More than one segment published.
+        assert!(
+            shared.list_segment_ids(0).unwrap().len() > 1,
+            "expected multi-segment rollover in the shared store"
+        );
+
+        // Non-owner cold-loads the whole multi-segment stream in order.
+        let b = SharedTierEventLog::open_with_segment_size(
+            root.join("local-b"),
+            ShardOwnership::new(1, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-b"),
+            128,
+        )
+        .unwrap();
+        let read = b
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: exec0,
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(read.served_by, ServedBy::NonOwnerColdLoad);
+        assert_eq!(read.outcome.returned, 15);
+        let seqs: Vec<u64> = read
+            .outcome
+            .records
+            .iter()
+            .map(|r| r.global_sequence)
+            .collect();
+        assert_eq!(seqs, (1..=15).collect::<Vec<_>>());
+        assert_eq!(read.outcome.records[14].payload, "payload-015");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drive_proves_shared_tier_two_shards() {
+        let root = tmp_root("drive2");
+        let report = exercise_shared_tier(&root, 2).unwrap();
+        assert!(report.holds(), "{report:?}");
+        assert_eq!(report.shard_count, 2);
+        assert!(report.owner_published_ok);
+        assert!(report.nonowner_coldload_from_shared_ok);
+        assert!(report.crash_recovery_from_shared_ok);
+        assert!(report.shared_miss_ok);
+        assert!(report.parity_ok);
+        assert!(report.divergence.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drive_proves_shared_tier_four_shards() {
+        let root = tmp_root("drive4");
+        let report = exercise_shared_tier(&root, 4).unwrap();
+        assert!(report.holds(), "{report:?}");
+        assert_eq!(report.shard_count, 4);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drive_requires_at_least_two_shards() {
+        let root = tmp_root("drive1");
+        let err = exercise_shared_tier(&root, 1).unwrap_err();
+        assert!(err.to_string().contains("shard_count >= 2"));
+        let _ = fs::remove_dir_all(&root);
+    }
+}

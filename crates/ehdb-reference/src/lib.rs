@@ -66,8 +66,9 @@ pub use eventlog::{
 /// See [`durable_eventlog`].
 pub mod durable_eventlog;
 pub use durable_eventlog::{
-    exercise_durable_recovery, DurableEventLogDriver, DurableRecoveryReport, DurableSegmentStore,
-    EventLogStorageBackend, DEFAULT_SEGMENT_MAX_BYTES,
+    exercise_durable_recovery, list_segment_files, parse_segment_file_name, segment_file_name,
+    DurableEventLogDriver, DurableRecoveryReport, DurableSegmentStore, EventLogStorageBackend,
+    DEFAULT_SEGMENT_MAX_BYTES,
 };
 
 /// EHDB execution-affinity **shard ownership** (completion program, durable
@@ -91,6 +92,22 @@ pub mod durable_eventlog_affinity;
 pub use durable_eventlog_affinity::{
     exercise_affinity_single_writer, AffinityRead, AffinityRoutedEventLog,
     AffinitySingleWriterReport, Routed, ServedBy,
+};
+
+/// EHDB **shared / object-store segment tier** over the durable event-log backend
+/// (completion program, durable event-log backend slice 3) — the owner publishes
+/// its per-shard segments to a shared durable medium
+/// ([`SharedSegmentBackend`], filesystem/PVC now, EHDB object tier later) and a
+/// non-owner (or a new owner inheriting a shard with an empty local disk)
+/// cold-loads / hydrates them **from the shared store**, so a shard survives the
+/// loss of the writer's pod-local disk.  Segment keys are fixed-width + digest
+/// integrity-checked (avoiding the object-tier subject-length trap).  See
+/// [`durable_eventlog_shared`].
+pub mod durable_eventlog_shared;
+pub use durable_eventlog_shared::{
+    exercise_shared_tier, segment_digest, shared_segment_key, FilesystemSharedBackend,
+    ShardHydrateOutcome, ShardPublishOutcome, SharedSegmentBackend, SharedSegmentPutOutcome,
+    SharedTierEventLog, SharedTierReport,
 };
 
 /// EHDB projection / read-model core engine (completion program Phase 7) — builds

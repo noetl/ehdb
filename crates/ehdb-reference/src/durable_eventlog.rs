@@ -698,6 +698,45 @@ impl DurableSegmentStore {
     }
 }
 
+/// The on-disk file name for segment `id` (`seg-<016>.eslog`).
+///
+/// Exposed so the shared/object-store segment tier
+/// ([`crate::durable_eventlog_shared`]) can enumerate + publish a shard's
+/// segments by id — and materialize cold-loaded segments back — without
+/// re-deriving the naming that the store's own [`DurableSegmentStore::replay`]
+/// depends on.
+pub fn segment_file_name(id: u64) -> String {
+    format!("{SEGMENT_PREFIX}{id:016}{SEGMENT_SUFFIX}")
+}
+
+/// Parse a segment file name back to its id, or `None` when `name` is not a
+/// segment file. Inverse of [`segment_file_name`].
+pub fn parse_segment_file_name(name: &str) -> Option<u64> {
+    name.strip_prefix(SEGMENT_PREFIX)
+        .and_then(|rest| rest.strip_suffix(SEGMENT_SUFFIX))
+        .and_then(|digits| digits.parse::<u64>().ok())
+}
+
+/// List a segment-store directory's segment files in ascending id order as
+/// `(segment_id, path)`. A missing directory is an empty list (not an error) —
+/// a shard never written yet. Used by the shared tier to publish an owner's
+/// segments and to detect which ids a cold-load must fetch.
+pub fn list_segment_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(dir).map_err(|err| EhdbError::Storage(err.to_string()))? {
+        let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+        let name = entry.file_name();
+        if let Some(id) = parse_segment_file_name(&name.to_string_lossy()) {
+            out.push((id, entry.path()));
+        }
+    }
+    out.sort_unstable_by_key(|(id, _)| *id);
+    Ok(out)
+}
+
 /// Truncate a segment file to `len` bytes (drops a recovered torn tail).
 fn truncate_segment(path: &Path, len: u64) -> Result<()> {
     let file = OpenOptions::new()
