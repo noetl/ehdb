@@ -144,6 +144,14 @@ pub struct DurableSegmentStore {
     active_segment_id: u64,
     /// Byte length of the active segment file.
     active_len: u64,
+    /// A **cold-load** view opened by a non-owner replica: reads only, never
+    /// mutates the segment files.  When set, [`write_frame`](Self::write_frame)
+    /// refuses (so `append`/`tail`-create/`ack` cannot write another owner's
+    /// shard) and [`replay`](Self::replay) does **not** truncate a recovered
+    /// torn tail (truncation is a write; only the shard's single owner repairs
+    /// its own tail on its own writable open).  See the execution-affinity
+    /// single-writer routing slice ([noetl/ai-meta#166]).
+    read_only: bool,
 }
 
 impl DurableSegmentStore {
@@ -159,14 +167,42 @@ impl DurableSegmentStore {
         root: impl Into<PathBuf>,
         segment_max_bytes: u64,
     ) -> Result<Self> {
+        Self::open_inner(root, segment_max_bytes, false)
+    }
+
+    /// Open a **read-only cold-load view** of the store — what a non-owner
+    /// replica does to serve a read of a shard it does not own (the
+    /// execution-affinity single-writer routing slice, [noetl/ai-meta#166]).
+    /// The view replays the durable segments to rebuild the index but never
+    /// mutates them: a recovered torn tail is *not* truncated (only the shard's
+    /// single owner repairs its own tail on its own writable open) and every
+    /// mutating op refuses.  A never-written shard (no directory) opens as an
+    /// empty log without creating the directory.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_inner(root, DEFAULT_SEGMENT_MAX_BYTES, true)
+    }
+
+    /// Read-only cold-load view with an explicit segment rollover threshold
+    /// (matches the writable store's size so replay classifies frames the same;
+    /// the threshold is unused for a read-only view since it never appends).
+    pub fn open_read_only_with_segment_size(
+        root: impl Into<PathBuf>,
+        segment_max_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_inner(root, segment_max_bytes, true)
+    }
+
+    fn open_inner(
+        root: impl Into<PathBuf>,
+        segment_max_bytes: u64,
+        read_only: bool,
+    ) -> Result<Self> {
         let root = root.into();
         if segment_max_bytes == 0 {
             return Err(EhdbError::InvalidState(
                 "durable event-log segment_max_bytes must be > 0".to_string(),
             ));
         }
-        fs::create_dir_all(&root).map_err(|err| EhdbError::Storage(err.to_string()))?;
-
         let mut store = Self {
             root,
             segment_max_bytes,
@@ -176,9 +212,25 @@ impl DurableSegmentStore {
             consumer_acks: HashMap::new(),
             active_segment_id: 0,
             active_len: 0,
+            read_only,
         };
+        if read_only {
+            // A cold-load of a never-written shard is an empty log; do not
+            // create the directory (a write) to serve an empty read.
+            if !store.root.exists() {
+                return Ok(store);
+            }
+        } else {
+            fs::create_dir_all(&store.root).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
         store.replay()?;
         Ok(store)
+    }
+
+    /// Whether this is a read-only cold-load view (a non-owner's read of a shard
+    /// it does not own).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The directory backing the store.
@@ -239,7 +291,12 @@ impl DurableSegmentStore {
             // A torn tail leaves `good_len < bytes.len()`.  Truncate the file to
             // the last intact frame so subsequent appends never sit behind
             // garbage (idempotent recovery: a second reopen sees a clean file).
-            if good_len < bytes.len() as u64 {
+            // A read-only cold-load view never truncates — truncation is a
+            // write, and only the shard's single owner repairs its own tail on
+            // its own writable open.  The in-memory index already stops at the
+            // last intact frame, so the read view still serves the exact
+            // recovered prefix.
+            if good_len < bytes.len() as u64 && !self.read_only {
                 truncate_segment(&path, good_len)?;
             }
             self.active_segment_id = *id;
@@ -335,6 +392,15 @@ impl DurableSegmentStore {
     /// exceed the size threshold) and `fsync` it.  Returns the location the
     /// frame was written at.
     fn write_frame(&mut self, frame: &SegmentFrame) -> Result<EventLoc> {
+        // A read-only cold-load view (a non-owner replica) must never mutate
+        // another owner's shard — refuse every write centrally here so append /
+        // tail-create / ack all fail closed rather than corrupting the segment.
+        if self.read_only {
+            return Err(EhdbError::InvalidState(
+                "durable event-log: read-only cold-load view cannot write (not the shard owner)"
+                    .to_string(),
+            ));
+        }
         let body = serde_json::to_vec(frame)
             .map_err(|err| EhdbError::Storage(format!("encode durable frame: {err}")))?;
         if body.len() > MAX_FRAME_BODY_BYTES {
@@ -1502,5 +1568,123 @@ mod tests {
     fn crc32_matches_known_vector() {
         // CRC32/IEEE of "123456789" is 0xCBF43926 (the standard check value).
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn read_only_view_serves_reads_without_mutating() {
+        let root = tmp_root("ro-reads");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "200", 2, "b");
+        }
+        // A read-only cold-load view (what a non-owner replica opens) serves the
+        // same records the owner wrote.
+        let view = DurableSegmentStore::open_read_only(&root).unwrap();
+        assert!(view.is_read_only());
+        let scan = view
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.record_count, 2);
+        assert_eq!(scan.records[0].payload, "a");
+        let ex = view
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "200".to_string(),
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(ex.returned, 1);
+        assert_eq!(ex.records[0].global_sequence, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_view_refuses_writes() {
+        let root = tmp_root("ro-write");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+        }
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+        // append refuses.
+        let err = view
+            .append(&EventLogAppendRequest {
+                execution_id: "100".to_string(),
+                transaction_id: "t".to_string(),
+                payload: "nope".to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EhdbError::InvalidState(_)));
+        assert!(err.to_string().contains("read-only"));
+        // tail (which would create-on-first-pull → a write) also refuses.
+        let err = view
+            .tail(&EventLogTailRequest {
+                consumer: "c".to_string(),
+                transaction_id: "t".to_string(),
+                limit: 10,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EhdbError::InvalidState(_)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_view_does_not_truncate_torn_tail() {
+        let root = tmp_root("ro-torn");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "100", 2, "b");
+        }
+        // Append a torn (partial) frame simulating a crash mid-append.
+        let seg = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(SEGMENT_PREFIX)
+            })
+            .unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
+            let mut torn = [0u8; FRAME_HEADER_LEN];
+            torn[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+            torn[4..8].copy_from_slice(&100u32.to_le_bytes());
+            torn[8..12].copy_from_slice(&0u32.to_le_bytes());
+            f.write_all(&torn).unwrap();
+            f.write_all(b"xyz").unwrap();
+            f.sync_data().unwrap();
+        }
+        let len_with_torn = fs::metadata(&seg).unwrap().len();
+        // A read-only view recovers the two fsync'd events (index stops at the
+        // last intact frame) but leaves the torn bytes on disk untouched.
+        let view = DurableSegmentStore::open_read_only(&root).unwrap();
+        assert_eq!(view.len(), 2);
+        assert_eq!(
+            fs::metadata(&seg).unwrap().len(),
+            len_with_torn,
+            "read-only view must not truncate the torn tail"
+        );
+        // A writable owner open, by contrast, does truncate (idempotent repair).
+        let owner = DurableSegmentStore::open(&root).unwrap();
+        assert_eq!(owner.len(), 2);
+        assert!(fs::metadata(&seg).unwrap().len() < len_with_torn);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_view_of_never_written_shard_is_empty() {
+        let root = tmp_root("ro-absent").join("shard-does-not-exist");
+        let view = DurableSegmentStore::open_read_only(&root).unwrap();
+        assert!(view.is_empty());
+        // Opening a read-only view of a missing shard must not create it.
+        assert!(!root.exists());
     }
 }

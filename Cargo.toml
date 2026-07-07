@@ -40,3 +40,8 @@ sha2 = "0.10"
 tokio = { version = "1.0", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"], default-features = false }
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost"], default-features = false }
 tracing = "0.1"
+# Execution-affinity ownership hash.  Pinned to the SAME major as
+# `noetl-worker`'s `twox-hash = "1.6"` so EHDB's `shard_for_i64` is
+# byte-identical to the worker/server `sharding::shard_for` — the two must
+# agree on which replica owns an execution or single-writer coherence breaks.
+twox-hash = "1.6"

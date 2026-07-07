@@ -5,19 +5,22 @@ use ehdb_reference::compare_projection_parity;
 use ehdb_reference::{
     ack_local_reference_event_consumer_json, append_local_reference_domain_record_json,
     bind_local_reference_system_channel_json, compare_shadow_parity,
-    consume_local_reference_event_records_json, exercise_durable_recovery, exercise_primary_serve,
+    consume_local_reference_event_records_json, exercise_affinity_single_writer,
+    exercise_durable_recovery, exercise_primary_serve,
     ingest_local_reference_retrieval_document_json, publish_local_reference_system_module_json,
     read_local_reference_domain_records_json, resolve_local_reference_system_module_json,
     retrieve_local_reference_context, summarize_local_reference_json, AckEventConsumerRequest,
-    AppendDomainRecordRequest, AuthoritativeExecutionState, BindSystemChannelRequest,
-    ConsumeEventRecordsRequest, EventLogAckRequest, EventLogAppendRequest, EventLogDriver,
-    EventLogPrimaryEvent, EventLogReadExecutionRequest, EventLogScanRequest, EventLogTailRequest,
-    IngestChunkInput, IngestRetrievalDocumentRequest, KvPrimaryInput, LocalReferenceEventLogDriver,
-    LocalReferenceKvStateDriver, LocalReferenceObjectBlobDriver, LocalReferenceProjectionEngine,
-    LocalReferenceVectorDriver, ObjectPrimaryInput, ProjectionApplyRequest, ProjectionDriver,
-    ProjectionEventInput, ProjectionPrimaryInput, PublishSystemModuleRequest,
-    ReadDomainRecordsRequest, ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest,
-    VectorPrimaryInput, DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    AffinityRoutedEventLog, AppendDomainRecordRequest, AuthoritativeExecutionState,
+    BindSystemChannelRequest, ConsumeEventRecordsRequest, EventLogAckRequest,
+    EventLogAppendRequest, EventLogDriver, EventLogPrimaryEvent, EventLogReadExecutionRequest,
+    EventLogScanRequest, EventLogTailRequest, IngestChunkInput, IngestRetrievalDocumentRequest,
+    KvPrimaryInput, LocalReferenceEventLogDriver, LocalReferenceKvStateDriver,
+    LocalReferenceObjectBlobDriver, LocalReferenceProjectionEngine, LocalReferenceVectorDriver,
+    ObjectPrimaryInput, ProjectionApplyRequest, ProjectionDriver, ProjectionEventInput,
+    ProjectionPrimaryInput, PublishSystemModuleRequest, ReadDomainRecordsRequest,
+    ResolveSystemModuleRequest, RetrievalOutcome, RetrieveContextRequest, Routed, ServedBy,
+    ShardOwnership, VectorPrimaryInput, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 fn main() {
@@ -64,6 +67,15 @@ fn run(args: Vec<String>) -> Result<(String, i32), String> {
         }
         Some((command, rest)) if command == "durable-eventlog-recovery" => {
             run_durable_eventlog_recovery(rest)
+        }
+        Some((command, rest)) if command == "durable-eventlog-affinity" => {
+            run_durable_eventlog_affinity(rest)
+        }
+        Some((command, rest)) if command == "durable-eventlog-affinity-append" => {
+            run_durable_eventlog_affinity_append(rest)
+        }
+        Some((command, rest)) if command == "durable-eventlog-affinity-read" => {
+            run_durable_eventlog_affinity_read(rest)
         }
         Some((command, rest)) if command == "projection-apply" => run_projection_apply(rest),
         Some((command, rest)) if command == "projection-read-exec" => {
@@ -378,6 +390,144 @@ fn run_durable_eventlog_recovery(args: &[String]) -> Result<(String, i32), Strin
             }))
             .map_err(|err| err.to_string())?;
             Ok((output, if recovered { 0 } else { 1 }))
+        }
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// Distinct exit code for a routed write refused because this replica does not
+/// own the target shard (route it to the owner). Kept apart from the engine
+/// error codes (3 rejected / 4 invalid / 5 unavailable) so a shell / kind-soak
+/// harness can assert "refused as non-owner" distinctly from a real failure.
+const EXIT_NOT_OWNER: i32 = 6;
+
+/// Build a single replica's affinity-routed durable event log from the shared
+/// `--root` / `--shard-index` / `--shard-count` flags.
+fn affinity_routed_log(
+    flags: &mut HashMap<String, String>,
+) -> Result<AffinityRoutedEventLog, String> {
+    let root = take_required(flags, "root")?;
+    let shard_count = match flags.remove("shard-count") {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --shard-count value: {raw}"))?,
+        None => 1,
+    };
+    let shard_index = match flags.remove("shard-index") {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --shard-index value: {raw}"))?,
+        None => 0,
+    };
+    let ownership = ShardOwnership::new(shard_index, shard_count).map_err(|err| err.to_string())?;
+    AffinityRoutedEventLog::open(PathBuf::from(root), ownership).map_err(|err| err.to_string())
+}
+
+/// Execution-affinity single-writer drive (completion program, durable
+/// event-log backend slice 2): spin up a `--shard-count`-replica pool over one
+/// `--root`, partition a deterministic execution set, and prove owner-writes /
+/// non-owner-refused / single-writer-invariant / non-owner-cold-load-read /
+/// crash-recovery-under-ownership.  Exit 0 only when
+/// [`AffinitySingleWriterReport::holds`] holds.
+fn run_durable_eventlog_affinity(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let root = take_required(&mut flags, "root")?;
+    let shard_count = match flags.remove("shard-count") {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --shard-count value: {raw}"))?,
+        None => 2,
+    };
+    ensure_no_unknown_flags(&flags)?;
+
+    match exercise_affinity_single_writer(PathBuf::from(root), shard_count) {
+        Ok(report) => {
+            let holds = report.holds();
+            let output = serde_json::to_string(&serde_json::json!({
+                "suite": "ehdb-durable-eventlog-affinity",
+                "shard_count": report.shard_count,
+                "single_writer_holds": holds,
+                "report": report,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, if holds { 0 } else { 1 }))
+        }
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// One affinity-routed append: the owner writes (exit 0), a non-owner is refused
+/// with no side effect (exit [`EXIT_NOT_OWNER`], distinct from engine errors) —
+/// the routed decision a shell / kind-soak harness asserts.
+fn run_durable_eventlog_affinity_append(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let log = affinity_routed_log(&mut flags)?;
+    let execution_id = take_required(&mut flags, "execution-id")?;
+    let transaction_id = take_required(&mut flags, "transaction-id")?;
+    let payload = take_required(&mut flags, "payload")?;
+    ensure_no_unknown_flags(&flags)?;
+
+    match log.append(&EventLogAppendRequest {
+        execution_id: execution_id.clone(),
+        transaction_id,
+        payload,
+    }) {
+        Ok(Routed::Served(outcome)) => {
+            let output = serde_json::to_string(&serde_json::json!({
+                "routed": "served",
+                "shard_index": log.ownership().shard_index(),
+                "shard_count": log.ownership().shard_count(),
+                "shard": log.shard_of(&execution_id),
+                "outcome": outcome,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, 0))
+        }
+        Ok(Routed::NotOwner { owner_shard }) => {
+            let output = serde_json::to_string(&serde_json::json!({
+                "routed": "not_owner",
+                "shard_index": log.ownership().shard_index(),
+                "shard_count": log.ownership().shard_count(),
+                "owner_shard": owner_shard,
+                "execution_id": execution_id,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, EXIT_NOT_OWNER))
+        }
+        Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
+    }
+}
+
+/// One affinity-routed per-execution read: the owner serves it resident, a
+/// non-owner cold-loads the durable segments read-only.  Exit 0 (reads always
+/// succeed); the JSON `served_by` shows which path served it.
+fn run_durable_eventlog_affinity_read(args: &[String]) -> Result<(String, i32), String> {
+    let mut flags = parse_flags(args)?;
+    let log = affinity_routed_log(&mut flags)?;
+    let execution_id = take_required(&mut flags, "execution-id")?;
+    let limit = parse_limit(&mut flags, 100)?;
+    let after = parse_after(&mut flags)?;
+    ensure_no_unknown_flags(&flags)?;
+
+    match log.read_execution(&EventLogReadExecutionRequest {
+        execution_id: execution_id.clone(),
+        after,
+        limit,
+    }) {
+        Ok(read) => {
+            let served_by = match read.served_by {
+                ServedBy::OwnerResident => "owner_resident",
+                ServedBy::NonOwnerColdLoad => "non_owner_cold_load",
+            };
+            let output = serde_json::to_string(&serde_json::json!({
+                "served_by": served_by,
+                "shard_index": log.ownership().shard_index(),
+                "shard_count": log.ownership().shard_count(),
+                "shard": log.shard_of(&execution_id),
+                "outcome": read.outcome,
+            }))
+            .map_err(|err| err.to_string())?;
+            Ok((output, 0))
         }
         Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
     }
@@ -1315,5 +1465,5 @@ fn ensure_no_unknown_flags(flags: &HashMap<String, String>) -> Result<(), String
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference durable-eventlog-recovery --root <dir> [--consumer <name>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference vector-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
+    "usage:\n  ehdb-local-reference summary --log <path>\n  ehdb-local-reference append --log <path> --stream <name> --subject <subject> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference read --log <path> --stream <name> [--tenant <t>] [--namespace <n>] [--limit <n>] [--after <sequence>]\n  ehdb-local-reference consume --log <path> --stream <name> --consumer <name> --transaction-id <id> [--tenant <t>] [--namespace <n>] [--limit <n>]\n  ehdb-local-reference ack --log <path> --stream <name> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference publish-system --log <path> --path <lib> --revision <n> --digest <sha256:...> --entry <export> --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <path> --byte-len <n> --capabilities <c1,c2,...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference bind-system --log <path> --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:...> --transaction-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference resolve-system --log <path> --environment <env> --channel <chan> --path <lib> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference ingest-doc --log <path> --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>] [--transaction-id <id>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference retrieve --log <path> --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-append --log <path> --execution-id <id> --transaction-id <id> --payload <text> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-scan --log <path> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-read-exec --log <path> --execution-id <id> [--after <sequence>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-tail --log <path> --consumer <name> --transaction-id <id> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-ack --log <path> --consumer <name> --transaction-id <id> --sequence <sequence> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference eventlog-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference durable-eventlog-recovery --root <dir> [--consumer <name>]\n  ehdb-local-reference durable-eventlog-affinity --root <dir> [--shard-count <n>]\n  ehdb-local-reference durable-eventlog-affinity-append --root <dir> --shard-index <n> --shard-count <n> --execution-id <id> --transaction-id <id> --payload <text>\n  ehdb-local-reference durable-eventlog-affinity-read --root <dir> --shard-index <n> --shard-count <n> --execution-id <id> [--after <sequence>] [--limit <n>]\n  ehdb-local-reference projection-apply --log <path> --transaction-id <id> --events-json <json-array> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-exec --log <path> --execution-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-read-event --log <path> --event-id <id> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-list --log <path> [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-checkpoint --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-from-eventlog --eventlog-log <path> --log <path> [--consumer <name>] [--transaction-id <id>] [--limit <n>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-suite --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference projection-primary-serve --log <path> [--consumer <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference kv-primary-serve --log <path> [--bucket <name>] [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference object-primary-serve --log <path> [--tenant <t>] [--namespace <n>]\n  ehdb-local-reference vector-primary-serve --log <path> [--tenant <t>] [--namespace <n>]"
 }
