@@ -60,6 +60,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ehdb_core::{EhdbError, NamespaceName, Result, StreamName, TenantId, TransactionId};
+use ehdb_storage::ObjectDigest;
 use ehdb_stream::{RetentionPolicy, StreamRecord, Subject, SubjectFilter};
 use ehdb_transaction::{CommitTransaction, Mutation, StreamMutation};
 use serde::{Deserialize, Serialize};
@@ -72,10 +73,15 @@ use crate::LocalReferenceRuntime;
 pub const KV_STATE_STREAM: &str = "noetl_kv_state";
 
 /// Subject prefix scoping a KV write to its bucket + key.  A record's subject is
-/// `noetl.kv.<bucket>.<hex(key)>`, so a per-key read is an exact subject-filtered
-/// replay and a bucket scan is a `noetl.kv.<bucket>.>` replay.  The key is
-/// hex-encoded into a single subject token because NoETL KV keys carry `.` / `/`
-/// (e.g. `circuit.12345`) which are not valid inside one subject token.
+/// `noetl.kv.<bucket>.<sha256hex(key)>`, so a per-key read is an exact
+/// subject-filtered replay and a bucket scan is a `noetl.kv.<bucket>.>` replay.
+/// The key is reduced to a fixed-width SHA-256 digest token (not the key's own
+/// hex) so the subject stays bounded for a key of any length; the raw key carries
+/// `.` / `/` (e.g. `circuit.12345`) which would split it across subject tokens,
+/// and real ~140-150-byte platform keys hex-encode (2 chars/byte) past the
+/// 256-char [`Subject`] cap.  The bucket stays a literal token so the bucket scan
+/// is unchanged, and the full key lives in the record payload so a read never
+/// reverses the subject.
 pub const KV_SUBJECT_PREFIX: &str = "noetl.kv";
 
 /// Upper bound on one stored value (bounded like the rest of the integration).
@@ -87,14 +93,20 @@ pub const MAX_KV_VALUE_BYTES: usize = 1_048_576;
 /// Hard ceiling on a single scan's returned entries.
 pub const MAX_KV_SCAN_LIMIT: usize = 4_096;
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+/// The fixed-width SHA-256 digest token addressing a logical key within its
+/// bucket subject.  Hashing the key (rather than hex-encoding it whole) bounds the
+/// per-key subject token to a constant 64 hex chars regardless of key length; the
+/// former hex-of-full-key form (2 chars/byte) overflowed the 256-char [`Subject`]
+/// cap for real ~140-150-byte platform keys, rejecting every long-key put.
+/// Deterministic + collision-safe (SHA-256), and the full key is preserved in the
+/// record payload ([`KvEnvelope::key`]) so the subject never needs decoding.
+fn key_digest_token(key: &str) -> Result<String> {
+    let digest = ObjectDigest::sha256(key.as_bytes());
+    digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .map(|hex| hex.to_string())
+        .ok_or_else(|| EhdbError::Storage(format!("unexpected digest form: {}", digest.as_str())))
 }
 
 /// Validate a bucket name — a single non-empty subject token of `[A-Za-z0-9_-]`
@@ -115,13 +127,13 @@ fn validated_bucket(bucket: &str) -> Result<String> {
     Ok(b.to_string())
 }
 
-/// Build the exact per-key subject `noetl.kv.<bucket>.<hex(key)>`.
+/// Build the exact per-key subject `noetl.kv.<bucket>.<sha256hex(key)>`.
 fn key_subject(bucket: &str, key: &str) -> Result<Subject> {
     let bucket = validated_bucket(bucket)?;
     if key.is_empty() {
         return Err(EhdbError::InvalidIdentifier("kv key: empty".to_string()));
     }
-    let token = hex_encode(key.as_bytes());
+    let token = key_digest_token(key)?;
     Subject::new(format!("{KV_SUBJECT_PREFIX}.{bucket}.{token}"))
 }
 
@@ -336,6 +348,7 @@ impl LocalReferenceKvStateDriver {
         namespace: &NamespaceName,
         stream: &StreamName,
         subject: &Subject,
+        key: &str,
     ) -> Option<KvEnvelope> {
         let filter = SubjectFilter::new(subject.as_str().to_string()).ok()?;
         let records = runtime
@@ -343,7 +356,15 @@ impl LocalReferenceKvStateDriver {
             .streams
             .replay_matching(tenant, namespace, stream, &filter, None)
             .ok()?;
-        records.last().and_then(decode_envelope)
+        // The subject is a SHA-256 digest of the key, so a (cryptographically
+        // infeasible) digest collision would co-mingle two keys' records under one
+        // subject.  Filter the replay to this exact key — the full key lives in the
+        // record payload — so a per-key read never resolves a colliding key's
+        // envelope.
+        records
+            .iter()
+            .rev()
+            .find_map(|record| decode_envelope(record).filter(|env| env.key == key))
     }
 }
 
@@ -366,7 +387,14 @@ impl KvStateDriver for LocalReferenceKvStateDriver {
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
 
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
         // The current *live* version — a tombstone / absent key reads as no live
         // version, so a CAS `Absent` succeeds after a delete.
         let live_version = latest
@@ -443,7 +471,14 @@ impl KvStateDriver for LocalReferenceKvStateDriver {
         let bucket = validated_bucket(&request.bucket)?;
         let runtime = LocalReferenceRuntime::open(&self.log_path)?;
 
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
         let absent = || KvGetOutcome {
             action: "kv-get".to_string(),
             bucket: bucket.clone(),
@@ -487,7 +522,14 @@ impl KvStateDriver for LocalReferenceKvStateDriver {
         let transaction_id = TransactionId::new(request.transaction_id.clone())?;
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            &request.key,
+        );
 
         // Idempotent: an absent key (never written, or already a tombstone) does
         // not append a second tombstone.
@@ -1705,16 +1747,126 @@ mod tests {
     }
 
     #[test]
-    fn hex_encode_produces_subject_safe_lowercase_tokens() {
+    fn key_digest_token_produces_subject_safe_fixed_width_tokens() {
         for sample in ["circuit.12345", "a/b.c-d_e", "ünïcöde"] {
-            let encoded = hex_encode(sample.as_bytes());
-            // A hex token is always lowercase `[0-9a-f]` — a single, subject-safe
-            // token with no `.` to split a key across subject levels.
-            assert!(!encoded.is_empty());
-            assert!(encoded
+            let token = key_digest_token(sample).unwrap();
+            // A SHA-256 digest token is always a fixed 64 lowercase `[0-9a-f]`
+            // chars — a single, subject-safe token with no `.` to split a key
+            // across subject levels, and constant-width regardless of key length.
+            assert_eq!(token.len(), 64);
+            assert!(token
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-            assert!(Subject::new(format!("{KV_SUBJECT_PREFIX}.b.{encoded}")).is_ok());
+            assert!(Subject::new(format!("{KV_SUBJECT_PREFIX}.b.{token}")).is_ok());
         }
+    }
+
+    // A real platform KV key can be far longer than the incumbent short
+    // `circuit.<id>` — e.g. a #115 program-scale coherence key carrying the full
+    // execution coordinate.  The former hex-of-full-key subject (2 chars/byte)
+    // overflowed the 256-char `Subject` cap at ~123 bytes and rejected every long
+    // key; the digest token keeps the subject bounded for a key of any length.
+    const LONG_KV_KEY: &str =
+        "chainhead/env=production/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/step=materialize/attempt=0";
+
+    #[test]
+    fn long_kv_key_subject_is_bounded_and_round_trips() {
+        let (log, dir) = tmp_log("long-key");
+        let d = driver(&log);
+        let bucket = "noetl_program_coherence";
+        // Long enough that the old hex-of-key subject overflowed the 256-char cap.
+        assert!(
+            LONG_KV_KEY.len() > 123,
+            "key len {} must exceed the old ~123-byte failure threshold",
+            LONG_KV_KEY.len()
+        );
+        // The digest subject stays fixed-width and well under the 256-char cap.
+        let subject = key_subject(bucket, LONG_KV_KEY).unwrap();
+        assert!(subject.as_str().len() < 256);
+        // `noetl.kv.` + bucket + `.` + 64 hex digest chars.
+        assert_eq!(
+            subject.as_str().len(),
+            KV_SUBJECT_PREFIX.len() + 1 + bucket.len() + 1 + 64
+        );
+        // Full put → get → scan → delete round-trip on the long key.
+        let first = put(&d, bucket, LONG_KV_KEY, "{\"head\":1}", 1);
+        assert!(first.written);
+        assert_eq!(first.version, 1);
+        let got = get(&d, bucket, LONG_KV_KEY);
+        assert!(got.found, "long key must be found");
+        assert_eq!(got.entry.unwrap().value, "{\"head\":1}");
+        // A bucket scan reconstructs the real (un-digested) key from the payload.
+        let scan = d
+            .scan(&KvScanRequest {
+                bucket: bucket.to_string(),
+                prefix: Some("chainhead/".to_string()),
+                limit: 100,
+                now_ms: None,
+            })
+            .unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].key, LONG_KV_KEY);
+        // Overwrite advances the version and the get returns the latest value.
+        let second = put(&d, bucket, LONG_KV_KEY, "{\"head\":2}", 2);
+        assert_eq!(second.version, 2);
+        assert_eq!(
+            get(&d, bucket, LONG_KV_KEY).entry.unwrap().value,
+            "{\"head\":2}"
+        );
+        // Delete tombstones the long key.
+        let del = d
+            .delete(&KvDeleteRequest {
+                bucket: bucket.to_string(),
+                key: LONG_KV_KEY.to_string(),
+                transaction_id: "txn-del".to_string(),
+            })
+            .unwrap();
+        assert!(del.existed);
+        assert!(!get(&d, bucket, LONG_KV_KEY).found);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distinct_kv_keys_get_distinct_bounded_subjects() {
+        let bucket = "noetl_subscription_circuit";
+        // Digest subjects are deterministic (same key ⇒ same subject), unique
+        // across distinct keys, and always bounded regardless of key length.
+        let a = key_subject(bucket, "circuit.1").unwrap();
+        let b = key_subject(bucket, "circuit.2").unwrap();
+        assert_ne!(a.as_str(), b.as_str(), "distinct keys ⇒ distinct subjects");
+        assert!(a.as_str().len() < 256 && b.as_str().len() < 256);
+        let a2 = key_subject(bucket, "circuit.1").unwrap();
+        assert_eq!(a.as_str(), a2.as_str(), "same key ⇒ same subject");
+        // Even a pathologically long key stays under the cap.
+        let long = format!("chainhead/{}/head", "seg=abcdefgh/".repeat(40));
+        assert!(long.len() > 400);
+        assert!(key_subject(bucket, &long).unwrap().as_str().len() < 256);
+    }
+
+    #[test]
+    fn old_hex_of_key_subject_overflowed_the_cap_repro() {
+        // Reproduction of the pre-fix defect (the object-tier bug ehdb#256, latent
+        // in KV): the OLD subject scheme hex-encoded the full key (2 chars/byte),
+        // so a real ~150-byte platform key produced a >256-char subject that
+        // `Subject::new` rejects.  The digest token (this fix) bounds it instead.
+        fn old_hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let bucket = "noetl_program_coherence";
+        let old_subject = format!(
+            "{KV_SUBJECT_PREFIX}.{bucket}.{}",
+            old_hex(LONG_KV_KEY.as_bytes())
+        );
+        assert!(
+            old_subject.len() > 256,
+            "old hex-of-key subject len {} must exceed the 256-char cap",
+            old_subject.len()
+        );
+        assert!(
+            Subject::new(old_subject).is_err(),
+            "old hex-of-key subject must be rejected by the Subject cap"
+        );
+        // The fix's digest subject for the SAME key is accepted + bounded.
+        assert!(key_subject(bucket, LONG_KV_KEY).is_ok());
     }
 }

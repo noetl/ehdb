@@ -926,19 +926,28 @@ fn run_kv_primary_serve(args: &[String]) -> Result<(String, i32), String> {
     ensure_no_unknown_flags(&flags)?;
 
     let driver = LocalReferenceKvStateDriver::new(PathBuf::from(log), tenant, namespace);
-    // Deterministic drive: three distinct circuit keys (CAS on the first, delete
-    // on the last), a TTL lease at clock 1000 — a scope + CAS + delete + TTL
-    // ground truth with an in-lockstep NATS-KV mirror so the dual-run parity is
-    // exact.
+    // Deterministic drive: three distinct keys (CAS on the first, delete on the
+    // last), a TTL lease at clock 1000 — a scope + CAS + delete + TTL ground truth
+    // with an in-lockstep NATS-KV mirror so the dual-run parity is exact.  The keys
+    // use the real ~150-byte program-coherence coordinate form (region / cell /
+    // shard / tenant / execution) so the suite exercises the long-key path that
+    // overflowed the old hex-of-full-key subject — proving the SHA-256 digest
+    // subject stays bounded.
     let input = KvPrimaryInput {
         bucket,
         entries: vec![
             (
-                "circuit.1".to_string(),
+                "chainhead/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/step=materialize/attempt=0".to_string(),
                 "{\"phase\":\"closed\"}".to_string(),
             ),
-            ("circuit.2".to_string(), "{\"phase\":\"open\"}".to_string()),
-            ("circuit.3".to_string(), "{\"phase\":\"half\"}".to_string()),
+            (
+                "chainhead/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/step=project/attempt=0".to_string(),
+                "{\"phase\":\"open\"}".to_string(),
+            ),
+            (
+                "chainhead/env=primary/region=us-central1/cell=cell-alpha/shard=s0042/tenant=acme-corporation/execution=332760854506246144/step=finalize/attempt=0".to_string(),
+                "{\"phase\":\"half\"}".to_string(),
+            ),
         ],
         now_ms: 1_000,
     };
@@ -1048,21 +1057,24 @@ fn run_vector_primary_serve(args: &[String]) -> Result<(String, i32), String> {
     // Deterministic drive: three distinct platform-RAG points under one collection
     // (delete on the last), each a distinct embedding, queried [1,0,0] so the
     // ranking is a > b > c — a scope + rank + delete ground truth with an
-    // in-lockstep Qdrant mirror so the dual-run top-k parity is exact.
+    // in-lockstep Qdrant mirror so the dual-run top-k parity is exact.  The
+    // collection + point ids use the real long RAG-coordinate form (a document URI
+    // + chunk + model) so the suite exercises the long-id path that overflowed the
+    // old hex-of-full-id subject — proving the SHA-256 digest subject stays bounded.
     let input = VectorPrimaryInput {
-        collection: "playbook-surface".to_string(),
+        collection: "noetl/rag/tenant=acme-corporation/env=primary/region=us-central1/knowledge-base=support-articles-v3".to_string(),
         model_id: "text-embedding-3-small".to_string(),
         entries: vec![
             (
-                "noetl/playbook/weather.example/chunk.0".to_string(),
+                "noetl/doc=https%3A%2F%2Fdocs.example.com%2Fguides%2Fonboarding%2Fpart-04.html/chunk=0000/model=text-embedding-3-small".to_string(),
                 vec![1.0, 0.0, 0.0],
             ),
             (
-                "noetl/playbook/weather.example/chunk.1".to_string(),
+                "noetl/doc=https%3A%2F%2Fdocs.example.com%2Fguides%2Fonboarding%2Fpart-04.html/chunk=0001/model=text-embedding-3-small".to_string(),
                 vec![0.9, 0.1, 0.0],
             ),
             (
-                "noetl/catalog/embeddings/tool.http".to_string(),
+                "noetl/doc=https%3A%2F%2Fdocs.example.com%2Fguides%2Ftroubleshooting%2Fpart-11.html/chunk=0000/model=text-embedding-3-small".to_string(),
                 vec![0.0, 1.0, 0.0],
             ),
         ],
