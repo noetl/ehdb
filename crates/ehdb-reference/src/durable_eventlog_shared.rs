@@ -25,9 +25,37 @@
 //! ```
 //!
 //! * **Owner append** — writes locally (slice-1 fast path, `fsync`'d) *and then*
-//!   publishes the shard's segment bytes to the [`SharedSegmentBackend`]. The
-//!   local write remains the authority for the owner's own reads; the shared
-//!   copy is the durable, cross-replica-readable authority.
+//!   publishes only the **newly-appended bytes** of the shard's active segment
+//!   to the [`SharedSegmentBackend`] (an append-delta, not a whole-segment
+//!   re-publish). The local write remains the authority for the owner's own
+//!   reads; the shared copy is the durable, cross-replica-readable authority.
+//!
+//! ## Incremental append-delta publish — O(new-frame-bytes), not O(segment)
+//!
+//! Publishing is on the **synchronous append path** (a cross-replica reader must
+//! see a just-appended event, so publish cannot lag the append), so its per-call
+//! cost has to stay flat regardless of how large the active segment has grown.
+//! [`SharedTierEventLog::publish_shard`] therefore tracks, per segment, the byte
+//! length it has already published and sends the backend only the delta
+//! `[published_len .. current_len]` via
+//! [`SharedSegmentBackend::append_segment`]. The backend appends those bytes to
+//! its shared object in place and re-commits the integrity marker — an O(delta)
+//! write, **not** an O(active-segment-size) read-modify-write of the whole
+//! segment on every append. (An earlier revision re-read + re-wrote the entire
+//! active segment per append, which is O(segment) climbing to the 8 MiB rotation
+//! boundary and throttled the durable-backend event path to ~1–2 append/s; see
+//! [noetl/ehdb#264]. The reference-driver fallback in the default
+//! [`SharedSegmentBackend::append_segment`] is still O(size), but
+//! [`FilesystemSharedBackend`] overrides it with the incremental write.)
+//!
+//! Crash-safety across the incremental write is preserved: the segment bytes are
+//! appended + `fsync`'d **before** the integrity marker (byte-length + digest) is
+//! atomically re-committed, so a crash between them leaves an uncommitted tail
+//! that a reader ignores (it reads exactly the committed prefix) and the next
+//! publish drops + re-appends. The running content digest is maintained
+//! incrementally by the backend (seeded once from the committed prefix after a
+//! process restart), so the integrity guarantee over the full committed prefix is
+//! unchanged.
 //! * **Non-owner read** — cold-loads the shard's segments **from the shared
 //!   store** into a scratch directory and opens a slice-1
 //!   [`DurableSegmentStore::open_read_only`] over them. Replay is byte-identical
@@ -70,12 +98,13 @@
 //!
 //! [noetl/ai-meta#254]: https://github.com/noetl/ehdb/issues/254
 //! [noetl/ai-meta#234]: https://github.com/noetl/ai-meta/issues/234
+//! [noetl/ehdb#264]: https://github.com/noetl/ehdb/issues/264
 
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     hash::Hasher,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -171,6 +200,58 @@ pub trait SharedSegmentBackend: Send + Sync {
     /// List a shard's committed segment ids in ascending order (empty for a
     /// shard never published).
     fn list_segment_ids(&self, shard: u32) -> Result<Vec<u64>>;
+
+    /// Publish only the **newly-appended** bytes of a segment — the append-delta
+    /// hot-path publish. `committed_len` is the byte length the caller has
+    /// already published (the shared object's current committed length); `delta`
+    /// is the new bytes `[committed_len .. committed_len + delta.len()]` from the
+    /// owner's local segment. The backend appends `delta` to its shared object
+    /// and re-commits the integrity marker for the full prefix
+    /// `[0 .. committed_len + delta.len()]`.
+    ///
+    /// This is the O(delta) path that keeps append flat regardless of the active
+    /// segment's size (see the module docs on the O(segment) trap this replaces,
+    /// [noetl/ehdb#264]). The default implementation is a **correctness-only,
+    /// O(size) fallback** (read the committed prefix, append the delta, republish
+    /// the whole object via [`SharedSegmentBackend::put_segment`]); an efficient
+    /// backend ([`FilesystemSharedBackend`]) overrides it with an in-place append.
+    ///
+    /// Contract: appending a `delta` whose `committed_len` does not match the
+    /// object's current committed length is a hard error (a lost/torn publish),
+    /// not a silent overwrite.
+    ///
+    /// [noetl/ehdb#264]: https://github.com/noetl/ehdb/issues/264
+    fn append_segment(
+        &self,
+        shard: u32,
+        segment_id: u64,
+        committed_len: u64,
+        delta: &[u8],
+    ) -> Result<SharedSegmentPutOutcome> {
+        // Generic O(size) fallback: reconstruct the whole object, then republish.
+        // Efficient backends override this with an in-place O(delta) append.
+        let mut bytes = self.get_segment(shard, segment_id)?.unwrap_or_default();
+        if bytes.len() as u64 != committed_len {
+            return Err(EhdbError::Storage(format!(
+                "append_segment {}: committed_len {committed_len} != current object length {}",
+                shared_segment_key(shard, segment_id),
+                bytes.len()
+            )));
+        }
+        bytes.extend_from_slice(delta);
+        self.put_segment(shard, segment_id, &bytes)
+    }
+
+    /// The durably-committed byte length of a segment in the shared store, or
+    /// `None` when the segment was never published. The caller uses this to
+    /// reconcile its publish cursor after a restart (its in-memory
+    /// already-published length is lost). The default reads the whole object;
+    /// an efficient backend reads only the committed length from its marker.
+    fn committed_len(&self, shard: u32, segment_id: u64) -> Result<Option<u64>> {
+        Ok(self
+            .get_segment(shard, segment_id)?
+            .map(|bytes| bytes.len() as u64))
+    }
 }
 
 /// On-disk integrity sidecar committed *after* the segment bytes — its presence
@@ -188,9 +269,19 @@ struct SharedSegmentMeta {
 /// live flat under `<root>/<key>` with a `<key>.meta` integrity sidecar written
 /// last (the commit marker). Publishing is atomic via temp-file + rename so a
 /// concurrent reader never observes a partial object.
+/// Per-segment running-digest cache for the incremental append path:
+/// `(shard, segment_id) -> (committed_len, hasher-of-that-committed-prefix)`.
+type SegmentDigestCache = HashMap<(u32, u64), (u64, XxHash64)>;
+
 #[derive(Debug, Clone)]
 pub struct FilesystemSharedBackend {
     root: PathBuf,
+    /// Per-segment running content digest for the **incremental** append path.
+    /// Lets [`FilesystemSharedBackend::append_segment`] fold in only the delta
+    /// bytes (O(delta)) instead of re-hashing the whole object each publish.
+    /// Seeded once from the committed prefix on a cache miss (a process restart
+    /// clears it). Shared across `Clone`s (they back the same store) via `Arc`.
+    hashers: Arc<Mutex<SegmentDigestCache>>,
 }
 
 impl FilesystemSharedBackend {
@@ -199,7 +290,10 @@ impl FilesystemSharedBackend {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|err| EhdbError::Storage(err.to_string()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            hashers: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// The directory backing the shared store.
@@ -233,6 +327,110 @@ impl FilesystemSharedBackend {
         }
         fs::rename(&tmp, path).map_err(|err| EhdbError::Storage(err.to_string()))?;
         Ok(())
+    }
+
+    /// Append only `delta` (the newly-appended bytes) to the shared object for
+    /// `(shard, segment_id)` in place, re-committing the integrity marker for the
+    /// full prefix — the O(delta) incremental publish backing
+    /// [`SharedSegmentBackend::append_segment`]. `committed_len` is the object's
+    /// current committed length (the caller's already-published cursor); an
+    /// uncommitted tail from a prior interrupted append is dropped first.
+    ///
+    /// Crash-safety: the delta bytes are appended + `fsync`'d, then the marker
+    /// (byte-length + digest) is atomically re-committed. A crash between leaves
+    /// an uncommitted tail a reader ignores; the next call drops + re-appends it.
+    fn append_segment_impl(
+        &self,
+        shard: u32,
+        segment_id: u64,
+        committed_len: u64,
+        delta: &[u8],
+    ) -> Result<SharedSegmentPutOutcome> {
+        let key = shared_segment_key(shard, segment_id);
+        let object_path = self.object_path(shard, segment_id);
+        let total_len = committed_len + delta.len() as u64;
+
+        // --- Running content digest over the full committed prefix. -----------
+        // Fold in only `delta` when the cache is warm at `committed_len`; else
+        // re-seed once by hashing the committed prefix (a restart / first touch).
+        let cached = {
+            let map = self.hashers_lock()?;
+            map.get(&(shard, segment_id)).copied()
+        };
+        let mut hasher = match cached {
+            Some((cached_len, hasher)) if cached_len == committed_len => hasher,
+            _ => {
+                let mut h = XxHash64::with_seed(DIGEST_SEED);
+                if committed_len > 0 {
+                    let prefix = read_object_prefix(&object_path, committed_len)?;
+                    h.write(&prefix);
+                }
+                h
+            }
+        };
+
+        // --- Reconcile the object length to `committed_len`, then append. -----
+        let cur_obj_len = object_len(&object_path)?;
+        if committed_len == 0 {
+            // Fresh (or reset): (re)create the object with just the delta bytes.
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&object_path)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.write_all(delta)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.sync_data()
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        } else {
+            if cur_obj_len < committed_len {
+                return Err(EhdbError::Storage(format!(
+                    "append_segment {key}: object length {cur_obj_len} < committed {committed_len} (lost/torn shared object)"
+                )));
+            }
+            if cur_obj_len > committed_len {
+                // Drop an uncommitted tail from a prior interrupted append.
+                truncate_object(&object_path, committed_len)?;
+            }
+            if !delta.is_empty() {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(&object_path)
+                    .map_err(|err| EhdbError::Storage(err.to_string()))?;
+                file.write_all(delta)
+                    .map_err(|err| EhdbError::Storage(err.to_string()))?;
+                file.sync_data()
+                    .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            }
+        }
+
+        // Fold the delta into the digest, then commit the marker last.
+        hasher.write(delta);
+        let digest = format!("{:016x}", hasher.finish());
+        let meta = serde_json::to_vec(&SharedSegmentMeta {
+            byte_len: total_len,
+            digest: digest.clone(),
+        })
+        .map_err(|err| EhdbError::Storage(format!("encode shared segment meta: {err}")))?;
+        Self::atomic_write(&self.meta_path(shard, segment_id), &meta)?;
+
+        self.hashers_lock()?
+            .insert((shard, segment_id), (total_len, hasher));
+
+        Ok(SharedSegmentPutOutcome {
+            key,
+            byte_len: total_len,
+            digest,
+            newly_written: !delta.is_empty(),
+        })
+    }
+
+    /// Lock the running-digest cache, mapping a poisoned lock to a storage error.
+    fn hashers_lock(&self) -> Result<std::sync::MutexGuard<'_, SegmentDigestCache>> {
+        self.hashers.lock().map_err(|_| {
+            EhdbError::InvalidState("shared-segment digest cache poisoned".to_string())
+        })
     }
 }
 
@@ -274,6 +472,11 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
         .map_err(|err| EhdbError::Storage(format!("encode shared segment meta: {err}")))?;
         Self::atomic_write(&meta_path, &meta)?;
 
+        // A whole-object rewrite resets what the incremental append path tracks —
+        // drop any stale running digest so the next `append_segment` re-seeds from
+        // the freshly-committed prefix.
+        self.hashers_lock()?.remove(&(shard, segment_id));
+
         Ok(SharedSegmentPutOutcome {
             key,
             byte_len,
@@ -289,8 +492,13 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
             return Ok(None);
         };
         let object_path = self.object_path(shard, segment_id);
-        let bytes = match fs::read(&object_path) {
-            Ok(bytes) => bytes,
+        // Read exactly the committed prefix `[0 .. meta.byte_len]`. The object may
+        // carry an uncommitted tail (a crash mid-incremental-append wrote delta
+        // bytes but the marker still names the prior length) — that tail is not
+        // yet committed, so a reader ignores it. An object *shorter* than the
+        // committed length is genuine truncation/corruption of the shared medium.
+        let mut file = match File::open(&object_path) {
+            Ok(file) => file,
             // Meta present but bytes gone is corruption of the shared medium.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(EhdbError::Storage(format!(
@@ -300,14 +508,21 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
             }
             Err(err) => return Err(EhdbError::Storage(err.to_string())),
         };
-        if bytes.len() as u64 != meta.byte_len {
+        let obj_len = file
+            .metadata()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?
+            .len();
+        if obj_len < meta.byte_len {
             return Err(EhdbError::Storage(format!(
-                "shared segment {}: length {} != committed {} (truncated/corrupt)",
+                "shared segment {}: length {} < committed {} (truncated/corrupt)",
                 shared_segment_key(shard, segment_id),
-                bytes.len(),
+                obj_len,
                 meta.byte_len
             )));
         }
+        let mut bytes = vec![0u8; meta.byte_len as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
         if segment_digest(&bytes) != meta.digest {
             return Err(EhdbError::Storage(format!(
                 "shared segment {}: digest mismatch (bit-rot)",
@@ -340,6 +555,70 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
         ids.sort_unstable();
         Ok(ids)
     }
+
+    /// Efficient O(delta) override — append only the new bytes in place instead
+    /// of the O(size) reconstruct-and-republish default.
+    fn append_segment(
+        &self,
+        shard: u32,
+        segment_id: u64,
+        committed_len: u64,
+        delta: &[u8],
+    ) -> Result<SharedSegmentPutOutcome> {
+        self.append_segment_impl(shard, segment_id, committed_len, delta)
+    }
+
+    /// Read the committed length straight from the integrity marker (no object
+    /// read), so a caller can reconcile its publish cursor cheaply after restart.
+    fn committed_len(&self, shard: u32, segment_id: u64) -> Result<Option<u64>> {
+        Ok(read_meta(&self.meta_path(shard, segment_id))?.map(|meta| meta.byte_len))
+    }
+}
+
+/// The current on-disk length of a shared object, or `0` when it does not exist.
+fn object_len(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(EhdbError::Storage(err.to_string())),
+    }
+}
+
+/// Read exactly the first `len` bytes of a shared object (the committed prefix),
+/// used to re-seed the running digest after a cache miss.
+fn read_object_prefix(path: &Path, len: u64) -> Result<Vec<u8>> {
+    let mut file = File::open(path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    Ok(buf)
+}
+
+/// Truncate a shared object to `len` bytes (drops an uncommitted tail from a
+/// prior interrupted incremental append) and `fsync`.
+fn truncate_object(path: &Path, len: u64) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    file.set_len(len)
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    file.sync_all()
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    Ok(())
+}
+
+/// Read `len` bytes starting at `from` from a local segment file — the
+/// append-delta the incremental publish sends to the shared store. Reads only
+/// the delta window, never the whole segment (the O(segment) trap this avoids).
+fn read_segment_delta(path: &Path, from: u64, len: u64) -> Result<Vec<u8>> {
+    let mut file = File::open(path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+    file.seek(SeekFrom::Start(from))
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)
+        .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    Ok(buf)
 }
 
 /// Read + decode a segment's integrity sidecar, or `None` when absent.
@@ -404,8 +683,12 @@ pub struct SharedTierEventLog {
     /// Per-shard segment rollover threshold (matches the local stores so replay
     /// classifies frames identically).
     segment_max_bytes: u64,
-    /// Published `(shard, segment_id) -> byte_len` to skip re-publishing an
-    /// unchanged sealed segment (the active one grows and is always re-published).
+    /// Per-segment already-published byte length: `(shard, segment_id) ->
+    /// published_len`. The publish cursor for the **incremental** append-delta
+    /// path — each publish sends the backend only `[published_len .. current_len]`
+    /// and advances the cursor, so an unchanged sealed segment is skipped and the
+    /// growing active segment costs O(delta), not O(segment). Rebuilt from the
+    /// backend's committed length on a cache miss (a restart clears it).
     published: Mutex<HashMap<(u32, u64), u64>>,
 }
 
@@ -472,9 +755,16 @@ impl SharedTierEventLog {
         self.local.shard_of(execution_id)
     }
 
-    /// Publish an owned shard's local segments to the shared store. Idempotent:
-    /// a sealed segment already published at its current length is skipped; the
-    /// active (growing) segment is always re-published. Caller must own `shard`.
+    /// Publish an owned shard's local segments to the shared store
+    /// **incrementally** — each segment sends only the bytes appended since the
+    /// last publish (`[published_len .. current_len]`), not the whole segment. A
+    /// sealed segment already published at its final length is skipped; the
+    /// active (growing) segment costs O(delta), so this stays flat regardless of
+    /// how large the active segment has grown (the fix for [noetl/ehdb#264]).
+    /// Caller must own `shard`.
+    ///
+    /// The per-segment length is compared via a cheap `fs::metadata` — the whole
+    /// segment is never read on the append hot path.
     pub fn publish_shard(&self, shard: u32) -> Result<ShardPublishOutcome> {
         let local_dir = self.local.shard_dir(shard);
         let segments = list_segment_files(&local_dir)?;
@@ -484,14 +774,26 @@ impl SharedTierEventLog {
             EhdbError::InvalidState("shared-tier published lock poisoned".to_string())
         })?;
         for (segment_id, path) in segments {
-            let bytes = fs::read(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-            let len = bytes.len() as u64;
-            if map.get(&(shard, segment_id)) == Some(&len) {
-                // Sealed + unchanged since our last publish — skip.
+            let cur_len = fs::metadata(&path)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?
+                .len();
+            // Where we last left off. On a cache miss (restart) reconcile against
+            // the shared store's own committed length so we never double-write.
+            let published_len = match map.get(&(shard, segment_id)) {
+                Some(&len) => len,
+                None => self.shared.committed_len(shard, segment_id)?.unwrap_or(0),
+            };
+            if cur_len <= published_len {
+                // Sealed + unchanged (or already fully published) — nothing new.
+                map.insert((shard, segment_id), published_len);
                 continue;
             }
-            self.shared.put_segment(shard, segment_id, &bytes)?;
-            map.insert((shard, segment_id), len);
+            // Read only the delta `[published_len .. cur_len]` — O(delta), not
+            // O(segment) — and hand it to the backend's incremental append.
+            let delta = read_segment_delta(&path, published_len, cur_len - published_len)?;
+            self.shared
+                .append_segment(shard, segment_id, published_len, &delta)?;
+            map.insert((shard, segment_id), cur_len);
             published += 1;
         }
         Ok(ShardPublishOutcome {
@@ -599,9 +901,10 @@ impl SharedTierEventLog {
     }
 
     /// Append one authorized event, routed to its owning shard. The owner writes
-    /// locally then publishes the shard's segments to shared; a non-owner is
-    /// refused with no side effect ([`Routed::NotOwner`]) so the caller
-    /// re-routes to the owner.
+    /// locally then publishes the shard's **newly-appended bytes** to shared
+    /// (incremental append-delta, O(delta) — see [`Self::publish_shard`]); a
+    /// non-owner is refused with no side effect ([`Routed::NotOwner`]) so the
+    /// caller re-routes to the owner.
     pub fn append(&self, request: &EventLogAppendRequest) -> Result<Routed<EventLogAppendOutcome>> {
         match self.local.append(request)? {
             Routed::Served(outcome) => {
@@ -1338,6 +1641,236 @@ mod tests {
         let root = tmp_root("drive1");
         let err = exercise_shared_tier(&root, 1).unwrap_err();
         assert!(err.to_string().contains("shard_count >= 2"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Incremental append-delta publish ([noetl/ehdb#264]) — the O(delta) fix.
+    // -----------------------------------------------------------------------
+
+    /// A [`SharedSegmentBackend`] wrapper that tallies the bytes handed to
+    /// `append_segment` (the delta) so a test can prove the publish hot path is
+    /// O(delta), not O(active-segment-size). Delegates everything to an inner
+    /// [`FilesystemSharedBackend`].
+    struct RecordingBackend {
+        inner: FilesystemSharedBackend,
+        append_delta_bytes: Mutex<u64>,
+        append_calls: Mutex<u64>,
+    }
+
+    impl RecordingBackend {
+        fn new(inner: FilesystemSharedBackend) -> Self {
+            Self {
+                inner,
+                append_delta_bytes: Mutex::new(0),
+                append_calls: Mutex::new(0),
+            }
+        }
+    }
+
+    impl SharedSegmentBackend for RecordingBackend {
+        fn backend_name(&self) -> &'static str {
+            "recording"
+        }
+        fn put_segment(
+            &self,
+            shard: u32,
+            segment_id: u64,
+            bytes: &[u8],
+        ) -> Result<SharedSegmentPutOutcome> {
+            self.inner.put_segment(shard, segment_id, bytes)
+        }
+        fn get_segment(&self, shard: u32, segment_id: u64) -> Result<Option<Vec<u8>>> {
+            self.inner.get_segment(shard, segment_id)
+        }
+        fn list_segment_ids(&self, shard: u32) -> Result<Vec<u64>> {
+            self.inner.list_segment_ids(shard)
+        }
+        fn append_segment(
+            &self,
+            shard: u32,
+            segment_id: u64,
+            committed_len: u64,
+            delta: &[u8],
+        ) -> Result<SharedSegmentPutOutcome> {
+            *self.append_delta_bytes.lock().unwrap() += delta.len() as u64;
+            *self.append_calls.lock().unwrap() += 1;
+            self.inner
+                .append_segment(shard, segment_id, committed_len, delta)
+        }
+        fn committed_len(&self, shard: u32, segment_id: u64) -> Result<Option<u64>> {
+            self.inner.committed_len(shard, segment_id)
+        }
+    }
+
+    #[test]
+    fn incremental_publish_sends_each_byte_exactly_once() {
+        // The core regression guard for #264: with a whole-segment re-publish the
+        // total bytes handed to the backend across N appends grows ~O(N^2) (each
+        // append re-sends the whole growing segment). With incremental publish
+        // each byte is sent exactly once, so the delta total equals the final
+        // committed segment length.
+        let root = tmp_root("incremental-once");
+        let recording = Arc::new(RecordingBackend::new(
+            FilesystemSharedBackend::open(root.join("shared")).unwrap(),
+        ));
+        let execs = one_execution_per_shard(2);
+        let exec0 = execs.iter().find(|(_, s)| *s == 0).unwrap().0.clone();
+        // Default 8 MiB segment → all appends stay in one active segment (no
+        // rotation), so this is the exact scenario the O(segment) bug punished.
+        let a = SharedTierEventLog::open(
+            root.join("local-a"),
+            ShardOwnership::new(0, 2).unwrap(),
+            Arc::clone(&recording) as Arc<dyn SharedSegmentBackend>,
+            root.join("coldload-a"),
+        )
+        .unwrap();
+
+        let n = 64u64;
+        let payload = "x".repeat(256);
+        for _ in 0..n {
+            a.append(&append_req(&exec0, &payload)).unwrap();
+        }
+
+        let delta_total = *recording.append_delta_bytes.lock().unwrap();
+        let calls = *recording.append_calls.lock().unwrap();
+        let committed = recording.committed_len(0, 1).unwrap().unwrap();
+
+        // One publish per append, and every published byte is a first-time byte.
+        assert_eq!(calls, n, "one incremental publish per append");
+        assert_eq!(
+            delta_total, committed,
+            "each byte published exactly once (no whole-segment re-publish): \
+             delta_total={delta_total} committed={committed}"
+        );
+        // Sanity: the O(segment) bug would have sent far more than one segment's
+        // worth (~n/2 segments). Assert we are nowhere near that.
+        assert!(
+            delta_total < committed * 2,
+            "publish volume must be O(segment), not O(n*segment)"
+        );
+
+        // Cold-load parity still holds over the incrementally-published bytes.
+        let b = SharedTierEventLog::open(
+            root.join("local-b"),
+            ShardOwnership::new(1, 2).unwrap(),
+            Arc::clone(&recording) as Arc<dyn SharedSegmentBackend>,
+            root.join("coldload-b"),
+        )
+        .unwrap();
+        let read = b
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: exec0,
+                after: None,
+                limit: 1000,
+            })
+            .unwrap();
+        assert_eq!(read.served_by, ServedBy::NonOwnerColdLoad);
+        assert_eq!(read.outcome.returned as u64, n);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_segment_reads_committed_prefix_ignoring_uncommitted_tail() {
+        // Crash-safety of the incremental append: a crash between the delta
+        // fsync and the marker re-commit leaves an uncommitted tail. A reader
+        // must see only the committed prefix, and the next publish drops the tail.
+        let root = tmp_root("uncommitted-tail");
+        let backend = FilesystemSharedBackend::open(&root).unwrap();
+        backend.append_segment(0, 1, 0, b"hello").unwrap();
+        assert_eq!(backend.get_segment(0, 1).unwrap().unwrap(), b"hello");
+
+        // Simulate the interrupted append: extra bytes on the object, marker NOT
+        // advanced (bypass the backend to write straight to the object file).
+        let object = root.join(shared_segment_key(0, 1));
+        {
+            let mut f = OpenOptions::new().append(true).open(&object).unwrap();
+            f.write_all(b"WORLD-uncommitted").unwrap();
+        }
+        // Reader still sees only the committed prefix — the tail is invisible.
+        assert_eq!(backend.get_segment(0, 1).unwrap().unwrap(), b"hello");
+
+        // The next incremental append drops the uncommitted tail and continues.
+        let out = backend.append_segment(0, 1, 5, b" world").unwrap();
+        assert_eq!(out.byte_len, 11);
+        assert_eq!(backend.get_segment(0, 1).unwrap().unwrap(), b"hello world");
+        assert_eq!(out.digest, segment_digest(b"hello world"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_segment_errors_when_object_shorter_than_committed() {
+        // The opposite of an uncommitted tail: an object *shorter* than the
+        // committed length is genuine truncation/corruption → hard error.
+        let root = tmp_root("short-object");
+        let backend = FilesystemSharedBackend::open(&root).unwrap();
+        backend.append_segment(0, 1, 0, b"abcdefgh").unwrap();
+        let object = root.join(shared_segment_key(0, 1));
+        fs::write(&object, b"abc").unwrap();
+        let err = backend.get_segment(0, 1).unwrap_err();
+        assert!(err.to_string().contains("truncated/corrupt"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_segment_reseeds_digest_after_restart() {
+        // On a process restart the running-digest cache is empty. The next
+        // incremental append must re-seed from the committed prefix so the full
+        // digest still matches a whole-object hash.
+        let root = tmp_root("restart-reseed");
+        {
+            let b = FilesystemSharedBackend::open(&root).unwrap();
+            b.append_segment(0, 1, 0, b"aaaabbbb").unwrap();
+        }
+        // A brand-new instance over the same root = a cold digest cache.
+        let b2 = FilesystemSharedBackend::open(&root).unwrap();
+        assert_eq!(b2.committed_len(0, 1).unwrap(), Some(8));
+        let out = b2.append_segment(0, 1, 8, b"cccc").unwrap();
+        assert_eq!(out.byte_len, 12);
+        // Re-seeded digest equals the whole-object hash.
+        assert_eq!(out.digest, segment_digest(b"aaaabbbbcccc"));
+        assert_eq!(b2.get_segment(0, 1).unwrap().unwrap(), b"aaaabbbbcccc");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_append_segment_fallback_matches_incremental() {
+        // The trait's default (O(size)) append_segment must produce byte- and
+        // digest-identical results to the efficient override — a backend that
+        // does not override still stores the same committed prefix.
+        struct DefaultOnly(FilesystemSharedBackend);
+        impl SharedSegmentBackend for DefaultOnly {
+            fn backend_name(&self) -> &'static str {
+                "default-only"
+            }
+            fn put_segment(
+                &self,
+                shard: u32,
+                segment_id: u64,
+                bytes: &[u8],
+            ) -> Result<SharedSegmentPutOutcome> {
+                self.0.put_segment(shard, segment_id, bytes)
+            }
+            fn get_segment(&self, shard: u32, segment_id: u64) -> Result<Option<Vec<u8>>> {
+                self.0.get_segment(shard, segment_id)
+            }
+            fn list_segment_ids(&self, shard: u32) -> Result<Vec<u64>> {
+                self.0.list_segment_ids(shard)
+            }
+            // Deliberately NOT overriding append_segment / committed_len — use the
+            // trait defaults.
+        }
+        let root = tmp_root("default-fallback");
+        let d = DefaultOnly(FilesystemSharedBackend::open(&root).unwrap());
+        d.append_segment(0, 1, 0, b"hello").unwrap();
+        assert_eq!(d.committed_len(0, 1).unwrap(), Some(5));
+        let out = d.append_segment(0, 1, 5, b" world").unwrap();
+        assert_eq!(out.byte_len, 11);
+        assert_eq!(out.digest, segment_digest(b"hello world"));
+        assert_eq!(d.get_segment(0, 1).unwrap().unwrap(), b"hello world");
+        // A mismatched committed_len is a hard error, not a silent overwrite.
+        let err = d.append_segment(0, 1, 999, b"x").unwrap_err();
+        assert!(err.to_string().contains("committed_len"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 }

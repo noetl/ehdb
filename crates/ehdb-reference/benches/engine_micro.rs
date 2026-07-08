@@ -755,9 +755,80 @@ fn bench_vector(c: &mut Criterion) {
     cleanup(&bench_root());
 }
 
+// ---------------------------------------------------------------------------
+// Shared-tier event-log append — the deployed durable path (noetl/ehdb#264).
+//
+// The worker's `durable_segment` backend is always the composed shared tier
+// (`SharedTierEventLog`), which publishes each append to a shared store. This
+// bench measures single-append latency at growing pre-warmed active-segment
+// sizes S: with the O(delta) incremental publish it stays FLAT, where the
+// earlier whole-segment re-publish rose ~linearly with S and throttled the
+// deployed path to ~1-2 append/s in kind.
+// ---------------------------------------------------------------------------
+fn bench_shared_tier_append(c: &mut Criterion) {
+    use std::sync::Arc;
+
+    use ehdb_reference::affinity::ShardOwnership;
+    use ehdb_reference::durable_eventlog_shared::{
+        FilesystemSharedBackend, SharedSegmentBackend, SharedTierEventLog,
+    };
+
+    let mut group = c.benchmark_group("eventlog_shared_tier");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(1));
+
+    // Single-append latency at pre-warmed active-segment sizes S. The #264 fix
+    // makes this flat (publish is O(delta)); flatness across S is the property
+    // under test — a rising curve would be the O(segment) regression returning.
+    for &s in &[100u64, 2_000u64, 10_000u64] {
+        let dir = unique_dir("el-shared-atsize");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(dir.join("shared")).unwrap());
+        let log = SharedTierEventLog::open(
+            dir.join("local"),
+            ShardOwnership::new(0, 1).unwrap(),
+            Arc::clone(&shared),
+            dir.join("coldload"),
+        )
+        .unwrap();
+        let exec = format!("{}", 500_000_000_000u64);
+        for i in 0..s {
+            log.append(&EventLogAppendRequest {
+                execution_id: exec.clone(),
+                transaction_id: format!("seed-{i}"),
+                payload: event_payload(i, "exec-shared"),
+            })
+            .unwrap();
+        }
+        let ctr = AtomicU64::new(s);
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment_shared/append_at_size", s),
+            &s,
+            |b, _| {
+                b.iter(|| {
+                    let i = ctr.fetch_add(1, Ordering::Relaxed);
+                    black_box(
+                        log.append(&EventLogAppendRequest {
+                            execution_id: exec.clone(),
+                            transaction_id: format!("hot-{i}"),
+                            payload: event_payload(i, "exec-shared"),
+                        })
+                        .unwrap(),
+                    );
+                })
+            },
+        );
+        cleanup(&dir);
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eventlog,
+    bench_shared_tier_append,
     bench_projection,
     bench_kv,
     bench_object,
