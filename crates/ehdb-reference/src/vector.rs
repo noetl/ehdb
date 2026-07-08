@@ -31,10 +31,12 @@
 //!
 //! * **Upsert** — a point (`collection`, `point_id`, `model_id`, `vector`, optional
 //!   `payload`) is one append to a single canonical stream ([`VECTOR_INDEX_STREAM`]),
-//!   scoped by a per-point subject `noetl.vec.<hex(collection)>.<hex(point_id)>`.
+//!   scoped by a per-point subject
+//!   `noetl.vec.<sha256hex(collection)>.<sha256hex(point_id)>`.
 //!   Re-upserting the same point advances a monotonic per-point version; the latest
 //!   record wins.  The collection + point id ride in the record envelope **verbatim**
-//!   (hex-encoded into subject tokens only), so ids carrying `.` / `/` round-trip.
+//!   (digested into subject tokens only), so ids carrying `.` / `/` round-trip and
+//!   a long id can never overflow the 256-char subject cap.
 //! * **Query (top-k)** — a bounded cosine-similarity search over the collection's
 //!   live points, filtered to the query's `model_id` + matching dimensionality, then
 //!   ranked descending by score (ties broken by `point_id`) and truncated to `top_k`.
@@ -67,6 +69,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ehdb_core::{EhdbError, NamespaceName, Result, StreamName, TenantId, TransactionId};
+use ehdb_storage::ObjectDigest;
 use ehdb_stream::{RetentionPolicy, StreamRecord, Subject, SubjectFilter};
 use ehdb_transaction::{CommitTransaction, Mutation, StreamMutation};
 use serde::{Deserialize, Serialize};
@@ -80,11 +83,15 @@ use crate::LocalReferenceRuntime;
 pub const VECTOR_INDEX_STREAM: &str = "noetl_vector_index";
 
 /// Subject prefix scoping an upsert to its `(collection, point)`.  A record's
-/// subject is `noetl.vec.<hex(collection)>.<hex(point_id)>`, so a per-point read
-/// is an exact subject-filtered replay and a collection query is a
-/// `noetl.vec.<hex(collection)>.>` replay folded + filtered.  Both the collection
-/// and the point id are hex-encoded into single subject tokens because ids carry
-/// `.` / `/` which are not valid inside one subject token.
+/// subject is `noetl.vec.<sha256hex(collection)>.<sha256hex(point_id)>`, so a
+/// per-point read is an exact subject-filtered replay and a collection query is a
+/// `noetl.vec.<sha256hex(collection)>.>` replay folded + filtered.  Both the
+/// collection and the point id are reduced to fixed-width SHA-256 digest tokens
+/// (not their own hex) because ids carry `.` / `/` that would split a subject
+/// token, and a long id would hex-encode (2 chars/byte) past the 256-char
+/// [`Subject`] cap.  A digest keeps each token a constant 64 chars for an id of
+/// any length; the full collection + point id live in the record payload so a
+/// read never reverses the subject.
 pub const VECTOR_SUBJECT_PREFIX: &str = "noetl.vec";
 
 /// Hard ceiling on the dimensionality of one stored embedding (bounded like the
@@ -101,17 +108,25 @@ pub const MAX_VECTOR_QUERY_TOP_K: usize = 64;
 /// URI or chunk ordinal).  Over-cap ⇒ *rejected*.
 pub const MAX_VECTOR_PAYLOAD_BYTES: usize = 16 * 1024;
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+/// The fixed-width SHA-256 digest token addressing an id (collection or point)
+/// inside a subject.  Hashing the id (rather than hex-encoding it whole) bounds
+/// the token to a constant 64 hex chars regardless of id length; the former
+/// hex-of-full-id form (2 chars/byte) would overflow the 256-char [`Subject`] cap
+/// for a long id.  Deterministic (same id ⇒ same token, so the collection filter
+/// stays consistent with the per-point subject) + collision-safe (SHA-256), and
+/// the full ids are preserved in the record payload so a subject never needs
+/// decoding.
+fn digest_token(value: &str) -> Result<String> {
+    let digest = ObjectDigest::sha256(value.as_bytes());
+    digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .map(|hex| hex.to_string())
+        .ok_or_else(|| EhdbError::Storage(format!("unexpected digest form: {}", digest.as_str())))
 }
 
-/// Build the exact per-point subject `noetl.vec.<hex(collection)>.<hex(point_id)>`.
+/// Build the exact per-point subject
+/// `noetl.vec.<sha256hex(collection)>.<sha256hex(point_id)>`.
 fn point_subject(collection: &str, point_id: &str) -> Result<Subject> {
     if collection.is_empty() {
         return Err(EhdbError::InvalidIdentifier(
@@ -123,19 +138,19 @@ fn point_subject(collection: &str, point_id: &str) -> Result<Subject> {
             "vector point id: empty".to_string(),
         ));
     }
-    let col = hex_encode(collection.as_bytes());
-    let point = hex_encode(point_id.as_bytes());
+    let col = digest_token(collection)?;
+    let point = digest_token(point_id)?;
     Subject::new(format!("{VECTOR_SUBJECT_PREFIX}.{col}.{point}"))
 }
 
-/// Build the collection-scoped query filter `noetl.vec.<hex(collection)>.>`.
+/// Build the collection-scoped query filter `noetl.vec.<sha256hex(collection)>.>`.
 fn collection_filter(collection: &str) -> Result<SubjectFilter> {
     if collection.is_empty() {
         return Err(EhdbError::InvalidIdentifier(
             "vector collection: empty".to_string(),
         ));
     }
-    let col = hex_encode(collection.as_bytes());
+    let col = digest_token(collection)?;
     SubjectFilter::new(format!("{VECTOR_SUBJECT_PREFIX}.{col}.>"))
 }
 
@@ -312,14 +327,24 @@ impl LocalReferenceVectorDriver {
         namespace: &NamespaceName,
         stream: &StreamName,
         subject: &Subject,
+        point: (&str, &str),
     ) -> Option<VectorEnvelope> {
+        let (collection, point_id) = point;
         let filter = SubjectFilter::new(subject.as_str().to_string()).ok()?;
         let records = runtime
             .state()
             .streams
             .replay_matching(tenant, namespace, stream, &filter, None)
             .ok()?;
-        records.last().and_then(decode_envelope)
+        // The subject tokens are SHA-256 digests of the collection + point id, so a
+        // (cryptographically infeasible) digest collision would co-mingle two
+        // points' records under one subject.  Filter the replay to this exact
+        // (collection, point id) — both live in the record payload — so a per-point
+        // read never resolves a colliding id's envelope.
+        records.iter().rev().find_map(|record| {
+            decode_envelope(record)
+                .filter(|env| env.collection == collection && env.point_id == point_id)
+        })
     }
 }
 
@@ -355,7 +380,14 @@ impl VectorDriver for LocalReferenceVectorDriver {
         let transaction_id = TransactionId::new(request.transaction_id.clone())?;
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            (&request.collection, &request.point_id),
+        );
         // Monotonic per-point version — advances across tombstones too.
         let next_version = latest.as_ref().map(|env| env.version).unwrap_or(0) + 1;
 
@@ -435,11 +467,16 @@ impl VectorDriver for LocalReferenceVectorDriver {
         };
 
         // Fold to the latest envelope per point (records replay in sequence order,
-        // so a later record overwrites an earlier one).
+        // so a later record overwrites an earlier one).  The collection filter
+        // matches on the collection's SHA-256 digest, so guard against a
+        // (cryptographically infeasible) digest collision by folding only records
+        // whose payload collection is the exact one queried.
         let mut latest_by_point: BTreeMap<String, VectorEnvelope> = BTreeMap::new();
         for record in records {
             if let Some(env) = decode_envelope(&record) {
-                latest_by_point.insert(env.point_id.clone(), env);
+                if env.collection == request.collection {
+                    latest_by_point.insert(env.point_id.clone(), env);
+                }
             }
         }
 
@@ -486,7 +523,14 @@ impl VectorDriver for LocalReferenceVectorDriver {
         let transaction_id = TransactionId::new(request.transaction_id.clone())?;
 
         let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        let latest = self.latest_envelope(&runtime, &tenant, &namespace, &stream, &subject);
+        let latest = self.latest_envelope(
+            &runtime,
+            &tenant,
+            &namespace,
+            &stream,
+            &subject,
+            (&request.collection, &request.point_id),
+        );
 
         // Idempotent: an absent point (never written, or already a tombstone) does
         // not append a second tombstone.
@@ -1571,5 +1615,136 @@ mod tests {
         let other = query(&f.driver, "other-collection", &[1.0, 0.0, 0.0], 10);
         assert_eq!(other.candidate_count, 1);
         assert_eq!(other.hits[0].point_id, "other-point");
+    }
+
+    #[test]
+    fn digest_token_produces_subject_safe_fixed_width_tokens() {
+        for sample in [
+            "playbook-surface",
+            "noetl/playbook/weather.example/chunk.0",
+            "ünïcöde",
+        ] {
+            let token = digest_token(sample).unwrap();
+            // A SHA-256 digest token is a fixed 64 lowercase `[0-9a-f]` chars —
+            // one subject-safe, constant-width token regardless of id length.
+            assert_eq!(token.len(), 64);
+            assert!(token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            assert!(Subject::new(format!("{VECTOR_SUBJECT_PREFIX}.{token}.{token}")).is_ok());
+        }
+    }
+
+    // A platform RAG collection + point id can be long — a document URI, a chunk
+    // coordinate, a per-execution namespace.  The former hex-of-full-id subject
+    // (2 chars/byte for BOTH tokens) overflowed the 256-char `Subject` cap; the
+    // digest tokens keep the subject bounded for ids of any length.
+    const LONG_COLLECTION: &str =
+        "noetl/rag/tenant=acme-corporation/env=production/region=us-central1/knowledge-base=support-articles-v3";
+    const LONG_POINT: &str =
+        "noetl/doc=https%3A%2F%2Fdocs.example.com%2Fguides%2Fonboarding%2Fpart-04.html/chunk=0042/model=text-embedding-3-small";
+
+    #[test]
+    fn long_vector_ids_subject_is_bounded_and_round_trip() {
+        let f = fixture("long-ids");
+        let d = &f.driver;
+        // Both ids long enough that the old hex-of-id subject (each token 2
+        // chars/byte) overflowed the 256-char cap.
+        assert!(LONG_COLLECTION.len() + LONG_POINT.len() > 123);
+        let subject = point_subject(LONG_COLLECTION, LONG_POINT).unwrap();
+        assert!(subject.as_str().len() < 256);
+        // `noetl.vec.` + 64 + `.` + 64 = a fixed 139 chars.
+        assert_eq!(
+            subject.as_str().len(),
+            VECTOR_SUBJECT_PREFIX.len() + 1 + 64 + 1 + 64
+        );
+        assert!(collection_filter(LONG_COLLECTION).unwrap().as_str().len() < 256);
+        // Upsert → query → delete round-trip surfaces the real long ids from the
+        // record payload (never reversed out of the digest subject).
+        let up = upsert(d, LONG_COLLECTION, LONG_POINT, &[1.0, 0.0, 0.0], 1);
+        assert!(up.written);
+        assert_eq!(up.version, 1);
+        let out = query(d, LONG_COLLECTION, &[1.0, 0.0, 0.0], 10);
+        assert!(out.exists);
+        assert_eq!(out.candidate_count, 1);
+        assert_eq!(out.hits[0].point_id, LONG_POINT);
+        // Overwrite advances the per-point version on the long id.
+        let up2 = upsert(d, LONG_COLLECTION, LONG_POINT, &[0.0, 1.0, 0.0], 2);
+        assert_eq!(up2.version, 2);
+        // Delete tombstones the long point.
+        let del = d
+            .delete(&VectorDeleteRequest {
+                collection: LONG_COLLECTION.to_string(),
+                point_id: LONG_POINT.to_string(),
+                transaction_id: "txn-del-long".to_string(),
+            })
+            .unwrap();
+        assert!(del.existed);
+        let gone = query(d, LONG_COLLECTION, &[0.0, 1.0, 0.0], 10);
+        assert_eq!(gone.candidate_count, 0);
+    }
+
+    #[test]
+    fn distinct_vector_points_get_distinct_bounded_subjects() {
+        // Digest subjects are deterministic, unique across distinct (collection,
+        // point) pairs, and always bounded regardless of id length.
+        let a = point_subject("col-x", "point-1").unwrap();
+        let b = point_subject("col-x", "point-2").unwrap();
+        let c = point_subject("col-y", "point-1").unwrap();
+        assert_ne!(
+            a.as_str(),
+            b.as_str(),
+            "distinct points ⇒ distinct subjects"
+        );
+        assert_ne!(
+            a.as_str(),
+            c.as_str(),
+            "distinct collections ⇒ distinct subjects"
+        );
+        assert!(a.as_str().len() < 256 && b.as_str().len() < 256 && c.as_str().len() < 256);
+        let a2 = point_subject("col-x", "point-1").unwrap();
+        assert_eq!(
+            a.as_str(),
+            a2.as_str(),
+            "same (collection, point) ⇒ same subject"
+        );
+        // Even a pathologically long pair stays under the cap.
+        let long_col = format!("col/{}", "seg=abcdefgh/".repeat(40));
+        let long_point = format!("pt/{}", "seg=ijklmnop/".repeat(40));
+        assert!(long_col.len() > 400 && long_point.len() > 400);
+        assert!(
+            point_subject(&long_col, &long_point)
+                .unwrap()
+                .as_str()
+                .len()
+                < 256
+        );
+    }
+
+    #[test]
+    fn old_hex_of_id_subject_overflowed_the_cap_repro() {
+        // Reproduction of the pre-fix defect (the object-tier bug ehdb#256, latent
+        // in vector): the OLD subject hex-encoded BOTH the collection and the point
+        // id (2 chars/byte each), so long RAG ids produced a >256-char subject that
+        // `Subject::new` rejects.  The digest tokens (this fix) bound it instead.
+        fn old_hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let old_subject = format!(
+            "{VECTOR_SUBJECT_PREFIX}.{}.{}",
+            old_hex(LONG_COLLECTION.as_bytes()),
+            old_hex(LONG_POINT.as_bytes())
+        );
+        assert!(
+            old_subject.len() > 256,
+            "old hex-of-id subject len {} must exceed the 256-char cap",
+            old_subject.len()
+        );
+        assert!(
+            Subject::new(old_subject).is_err(),
+            "old hex-of-id subject must be rejected by the Subject cap"
+        );
+        // The fix's digest subject for the SAME ids is accepted + bounded.
+        assert!(point_subject(LONG_COLLECTION, LONG_POINT).is_ok());
     }
 }
