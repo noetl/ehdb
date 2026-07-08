@@ -27,3 +27,7 @@ criterion.workspace = true
 [[bench]]
 name = "local_runtime"
 harness = false
+
+[[bench]]
+name = "engine_micro"
+harness = false
