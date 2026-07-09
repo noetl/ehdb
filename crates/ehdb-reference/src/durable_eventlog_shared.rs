@@ -48,14 +48,22 @@
 //! [`SharedSegmentBackend::append_segment`] is still O(size), but
 //! [`FilesystemSharedBackend`] overrides it with the incremental write.)
 //!
+//! Because the worker constructs this stack **per op** (a stateless boundary — no
+//! in-memory state survives between appends), the running content digest is
+//! carried on the integrity sidecar itself: each publish persists the resumable
+//! [`XxHash64`] state over the committed prefix, and the next publish resumes it
+//! and folds in only the delta. Without that persisted state the digest would
+//! need an O(committed) re-read of the whole prefix on **every** append — the same
+//! O(segment) cost this fix removes. The prefix is re-read exactly once, for a
+//! segment written before the state existed. The whole-prefix `digest` string is
+//! unchanged, so cold-load verification is identical.
+//!
 //! Crash-safety across the incremental write is preserved: the segment bytes are
-//! appended + `fsync`'d **before** the integrity marker (byte-length + digest) is
-//! atomically re-committed, so a crash between them leaves an uncommitted tail
-//! that a reader ignores (it reads exactly the committed prefix) and the next
-//! publish drops + re-appends. The running content digest is maintained
-//! incrementally by the backend (seeded once from the committed prefix after a
-//! process restart), so the integrity guarantee over the full committed prefix is
-//! unchanged.
+//! appended + `fsync`'d **before** the integrity marker (byte-length + digest +
+//! resumable state) is atomically re-committed, so a crash between them leaves an
+//! uncommitted tail that a reader ignores (it reads exactly the committed prefix)
+//! and the next publish drops + re-appends. The integrity guarantee over the full
+//! committed prefix is unchanged.
 //! * **Non-owner read** — cold-loads the shard's segments **from the shared
 //!   store** into a scratch directory and opens a slice-1
 //!   [`DurableSegmentStore::open_read_only`] over them. Replay is byte-identical
@@ -257,11 +265,24 @@ pub trait SharedSegmentBackend: Send + Sync {
 /// On-disk integrity sidecar committed *after* the segment bytes — its presence
 /// marks the object committed (a crash between the bytes rename and the meta
 /// rename leaves an uncommitted object the reader treats as absent).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SharedSegmentMeta {
     byte_len: u64,
     digest: String,
+    /// The **resumable** running-digest state over the committed prefix
+    /// `[0..byte_len]`. Persisting it is what makes an append-delta publish
+    /// O(delta): the worker constructs the shared-tier stack **per op** (a
+    /// stateless boundary — no in-memory state survives between appends), so an
+    /// [`XxHash64`] carried on the sidecar lets the next publish resume the
+    /// digest from `byte_len` and fold in only the new bytes, instead of
+    /// re-reading + re-hashing the whole committed prefix every append. Absent on
+    /// segments written before this field existed; the first incremental publish
+    /// over such a segment re-seeds from the committed prefix once, then persists
+    /// the state. Not read on the cold-load path ([`get_segment`] verifies the
+    /// whole-prefix `digest` string instead), so it never affects correctness.
+    #[serde(default)]
+    hasher_state: Option<XxHash64>,
 }
 
 /// A [`SharedSegmentBackend`] over a shared filesystem directory — the
@@ -269,19 +290,9 @@ struct SharedSegmentMeta {
 /// live flat under `<root>/<key>` with a `<key>.meta` integrity sidecar written
 /// last (the commit marker). Publishing is atomic via temp-file + rename so a
 /// concurrent reader never observes a partial object.
-/// Per-segment running-digest cache for the incremental append path:
-/// `(shard, segment_id) -> (committed_len, hasher-of-that-committed-prefix)`.
-type SegmentDigestCache = HashMap<(u32, u64), (u64, XxHash64)>;
-
 #[derive(Debug, Clone)]
 pub struct FilesystemSharedBackend {
     root: PathBuf,
-    /// Per-segment running content digest for the **incremental** append path.
-    /// Lets [`FilesystemSharedBackend::append_segment`] fold in only the delta
-    /// bytes (O(delta)) instead of re-hashing the whole object each publish.
-    /// Seeded once from the committed prefix on a cache miss (a process restart
-    /// clears it). Shared across `Clone`s (they back the same store) via `Arc`.
-    hashers: Arc<Mutex<SegmentDigestCache>>,
 }
 
 impl FilesystemSharedBackend {
@@ -290,10 +301,7 @@ impl FilesystemSharedBackend {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|err| EhdbError::Storage(err.to_string()))?;
-        Ok(Self {
-            root,
-            hashers: Arc::new(Mutex::new(HashMap::new())),
-        })
+        Ok(Self { root })
     }
 
     /// The directory backing the shared store.
@@ -336,9 +344,18 @@ impl FilesystemSharedBackend {
     /// current committed length (the caller's already-published cursor); an
     /// uncommitted tail from a prior interrupted append is dropped first.
     ///
+    /// The running digest is **resumed from the persisted sidecar state**
+    /// ([`SharedSegmentMeta::hasher_state`]) — the worker builds this stack per
+    /// op, so nothing survives in memory between appends; without the persisted
+    /// state the digest would need an O(committed) re-read of the whole prefix
+    /// every append (the very cost this fix removes). The prefix is re-read only
+    /// when the state is absent (a segment written before it was persisted) —
+    /// once, after which the state carries forward.
+    ///
     /// Crash-safety: the delta bytes are appended + `fsync`'d, then the marker
-    /// (byte-length + digest) is atomically re-committed. A crash between leaves
-    /// an uncommitted tail a reader ignores; the next call drops + re-appends it.
+    /// (byte-length + digest + state) is atomically re-committed. A crash between
+    /// leaves an uncommitted tail a reader ignores; the next call drops +
+    /// re-appends it.
     fn append_segment_impl(
         &self,
         shard: u32,
@@ -348,18 +365,22 @@ impl FilesystemSharedBackend {
     ) -> Result<SharedSegmentPutOutcome> {
         let key = shared_segment_key(shard, segment_id);
         let object_path = self.object_path(shard, segment_id);
+        let meta_path = self.meta_path(shard, segment_id);
         let total_len = committed_len + delta.len() as u64;
 
-        // --- Running content digest over the full committed prefix. -----------
-        // Fold in only `delta` when the cache is warm at `committed_len`; else
-        // re-seed once by hashing the committed prefix (a restart / first touch).
-        let cached = {
-            let map = self.hashers_lock()?;
-            map.get(&(shard, segment_id)).copied()
-        };
-        let mut hasher = match cached {
-            Some((cached_len, hasher)) if cached_len == committed_len => hasher,
-            _ => {
+        // --- Resume the running digest from the persisted sidecar state. ------
+        // Use the persisted hasher when it matches our publish cursor; otherwise
+        // (absent state on a pre-existing segment, or a cursor mismatch) re-seed
+        // once by hashing the committed prefix — an O(committed) cost paid at
+        // most once per such segment, then carried forward on the sidecar.
+        let prev_meta = read_meta(&meta_path)?;
+        let resumable = prev_meta
+            .as_ref()
+            .filter(|m| m.byte_len == committed_len)
+            .and_then(|m| m.hasher_state);
+        let mut hasher = match resumable {
+            Some(state) => state,
+            None => {
                 let mut h = XxHash64::with_seed(DIGEST_SEED);
                 if committed_len > 0 {
                     let prefix = read_object_prefix(&object_path, committed_len)?;
@@ -405,31 +426,23 @@ impl FilesystemSharedBackend {
             }
         }
 
-        // Fold the delta into the digest, then commit the marker last.
+        // Fold the delta into the digest (`finish` does not consume the hasher,
+        // so it carries forward as the resumable state), then commit last.
         hasher.write(delta);
         let digest = format!("{:016x}", hasher.finish());
         let meta = serde_json::to_vec(&SharedSegmentMeta {
             byte_len: total_len,
             digest: digest.clone(),
+            hasher_state: Some(hasher),
         })
         .map_err(|err| EhdbError::Storage(format!("encode shared segment meta: {err}")))?;
-        Self::atomic_write(&self.meta_path(shard, segment_id), &meta)?;
-
-        self.hashers_lock()?
-            .insert((shard, segment_id), (total_len, hasher));
+        Self::atomic_write(&meta_path, &meta)?;
 
         Ok(SharedSegmentPutOutcome {
             key,
             byte_len: total_len,
             digest,
             newly_written: !delta.is_empty(),
-        })
-    }
-
-    /// Lock the running-digest cache, mapping a poisoned lock to a storage error.
-    fn hashers_lock(&self) -> Result<std::sync::MutexGuard<'_, SegmentDigestCache>> {
-        self.hashers.lock().map_err(|_| {
-            EhdbError::InvalidState("shared-segment digest cache poisoned".to_string())
         })
     }
 }
@@ -447,7 +460,11 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
     ) -> Result<SharedSegmentPutOutcome> {
         let key = shared_segment_key(shard, segment_id);
         let byte_len = bytes.len() as u64;
-        let digest = segment_digest(bytes);
+        // Compute the digest via the running hasher so the resumable state can be
+        // persisted alongside it (a later incremental append resumes from here).
+        let mut hasher = XxHash64::with_seed(DIGEST_SEED);
+        hasher.write(bytes);
+        let digest = format!("{:016x}", hasher.finish());
 
         // Idempotent skip: if a committed object at this key already matches this
         // (len, digest), the segment is unchanged — no rewrite.
@@ -468,14 +485,10 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
         let meta = serde_json::to_vec(&SharedSegmentMeta {
             byte_len,
             digest: digest.clone(),
+            hasher_state: Some(hasher),
         })
         .map_err(|err| EhdbError::Storage(format!("encode shared segment meta: {err}")))?;
         Self::atomic_write(&meta_path, &meta)?;
-
-        // A whole-object rewrite resets what the incremental append path tracks —
-        // drop any stale running digest so the next `append_segment` re-seeds from
-        // the freshly-committed prefix.
-        self.hashers_lock()?.remove(&(shard, segment_id));
 
         Ok(SharedSegmentPutOutcome {
             key,
@@ -1813,23 +1826,83 @@ mod tests {
     }
 
     #[test]
-    fn append_segment_reseeds_digest_after_restart() {
-        // On a process restart the running-digest cache is empty. The next
-        // incremental append must re-seed from the committed prefix so the full
-        // digest still matches a whole-object hash.
-        let root = tmp_root("restart-reseed");
+    fn append_segment_resumes_digest_from_sidecar_across_instances() {
+        // A brand-new backend instance (the worker's per-op boundary) carries no
+        // in-memory state — it must resume the running digest from the persisted
+        // sidecar state so the full digest still matches a whole-object hash,
+        // WITHOUT re-reading the committed prefix.
+        let root = tmp_root("resume-sidecar");
         {
             let b = FilesystemSharedBackend::open(&root).unwrap();
             b.append_segment(0, 1, 0, b"aaaabbbb").unwrap();
         }
-        // A brand-new instance over the same root = a cold digest cache.
+        // A brand-new instance over the same root = no in-memory carry-over.
         let b2 = FilesystemSharedBackend::open(&root).unwrap();
         assert_eq!(b2.committed_len(0, 1).unwrap(), Some(8));
         let out = b2.append_segment(0, 1, 8, b"cccc").unwrap();
         assert_eq!(out.byte_len, 12);
-        // Re-seeded digest equals the whole-object hash.
+        // Resumed digest equals the whole-object hash.
         assert_eq!(out.digest, segment_digest(b"aaaabbbbcccc"));
         assert_eq!(b2.get_segment(0, 1).unwrap().unwrap(), b"aaaabbbbcccc");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn per_op_construction_resumes_digest_from_sidecar() {
+        // The real deployment shape: the worker builds a FRESH shared-tier stack
+        // for every append (stateless boundary). A fresh backend per append over
+        // a growing segment must produce a correct, integrity-verifiable object —
+        // proving the resumable digest state on the sidecar carries the hash
+        // across constructions with no in-memory state and no whole-prefix re-read.
+        let root = tmp_root("perop");
+        let mut committed = 0u64;
+        let mut expected = Vec::new();
+        for i in 0..40u64 {
+            let backend = FilesystemSharedBackend::open(root.join("shared")).unwrap();
+            let frame = format!("frame-{i:04}|").into_bytes();
+            backend.append_segment(0, 1, committed, &frame).unwrap();
+            committed += frame.len() as u64;
+            expected.extend_from_slice(&frame);
+        }
+        // A final fresh backend cold-reads the whole object, integrity-verified
+        // against the digest that was extended incrementally across 40 instances.
+        let reader = FilesystemSharedBackend::open(root.join("shared")).unwrap();
+        assert_eq!(reader.committed_len(0, 1).unwrap(), Some(committed));
+        assert_eq!(reader.get_segment(0, 1).unwrap().unwrap(), expected);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_segment_reseeds_from_prefix_when_state_absent() {
+        // Backward-compat: a segment whose sidecar predates the persisted state
+        // (no `hasher_state`) must re-seed the digest from the committed prefix
+        // exactly once, producing the correct whole-object digest, then carry the
+        // state forward.
+        let root = tmp_root("legacy-meta");
+        let backend = FilesystemSharedBackend::open(&root).unwrap();
+        // Write an object + a legacy sidecar (byte_len + digest, NO hasher_state).
+        let object = root.join(shared_segment_key(0, 1));
+        fs::write(&object, b"legacy-prefix").unwrap();
+        let legacy = format!(
+            "{{\"byte_len\":13,\"digest\":\"{}\"}}",
+            segment_digest(b"legacy-prefix")
+        );
+        fs::write(
+            root.join(format!("{}.meta", shared_segment_key(0, 1))),
+            legacy,
+        )
+        .unwrap();
+        // Incremental append over the legacy segment re-seeds from the prefix.
+        let out = backend.append_segment(0, 1, 13, b"-more").unwrap();
+        assert_eq!(out.byte_len, 18);
+        assert_eq!(out.digest, segment_digest(b"legacy-prefix-more"));
+        assert_eq!(
+            backend.get_segment(0, 1).unwrap().unwrap(),
+            b"legacy-prefix-more"
+        );
+        // And the state now carries forward (a further append resumes, no re-seed).
+        let out2 = backend.append_segment(0, 1, 18, b"!").unwrap();
+        assert_eq!(out2.digest, segment_digest(b"legacy-prefix-more!"));
         let _ = fs::remove_dir_all(&root);
     }
 
