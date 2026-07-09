@@ -44,4 +44,7 @@ tracing = "0.1"
 # `noetl-worker`'s `twox-hash = "1.6"` so EHDB's `shard_for_i64` is
 # byte-identical to the worker/server `sharding::shard_for` — the two must
 # agree on which replica owns an execution or single-writer coherence breaks.
-twox-hash = "1.6"
+# `serialize` persists the shared-tier segment's resumable running-digest state
+# on its integrity sidecar so an append-delta publish resumes the XxHash in
+# O(delta) across the worker's per-op stack construction (noetl/ehdb#264).
+twox-hash = { version = "1.6", features = ["serialize"] }
