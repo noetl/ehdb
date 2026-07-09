@@ -940,7 +940,7 @@ impl SharedTierEventLog {
         if self.ownership().owns_shard(shard) {
             self.local.read_execution(request)
         } else {
-            let view = self.cold_load(shard)?;
+            let mut view = self.cold_load(shard)?;
             Ok(AffinityRead {
                 served_by: ServedBy::NonOwnerColdLoad,
                 outcome: view.read_execution(request)?,
@@ -958,7 +958,7 @@ impl SharedTierEventLog {
         if self.ownership().owns_shard(shard) {
             self.local.scan_shard(shard, request)
         } else {
-            let view = self.cold_load(shard)?;
+            let mut view = self.cold_load(shard)?;
             Ok(AffinityRead {
                 served_by: ServedBy::NonOwnerColdLoad,
                 outcome: view.scan_global(request)?,

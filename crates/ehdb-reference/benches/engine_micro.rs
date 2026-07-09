@@ -328,6 +328,55 @@ fn bench_eventlog(c: &mut Criterion) {
     );
     cleanup(&replay_dir);
 
+    // --- Per-op-open append latency at a pre-warmed store size S — the
+    // noetl/ehdb#267 signal. The worker rebuilds the durable stack PER OP (a
+    // stateless boundary), so every mirrored append pays a fresh `open`. Before
+    // the checkpoint sidecar, `open` replayed every segment (O(segment)) and this
+    // curve rose with S (the deployed ~1.3 append/s cap); with the checkpoint,
+    // open-for-append is O(1) and the curve is FLAT across S — a rising curve
+    // here would be the O(segment) regression returning. Each iteration opens a
+    // fresh driver over the pre-warmed dir and appends one event (no read, so the
+    // offset index is never materialized — the O(1) append path). ---
+    group.throughput(Throughput::Elements(1));
+    for &s in &[100u64, 2_000u64, 10_000u64] {
+        let dir = unique_dir("el-dur-peropopen");
+        {
+            let driver = DurableEventLogDriver::open(&dir).unwrap();
+            for i in 0..s {
+                driver
+                    .append(&EventLogAppendRequest {
+                        execution_id: format!("{}", 400_000_000_000u64 + i),
+                        transaction_id: format!("seed-{i}"),
+                        payload: event_payload(i, "exec-seed"),
+                    })
+                    .unwrap();
+            }
+        }
+        let ctr = AtomicU64::new(s);
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment/per_op_open_append_at_size", s),
+            &s,
+            |b, _| {
+                b.iter(|| {
+                    let i = ctr.fetch_add(1, Ordering::Relaxed);
+                    // Reconstruct the driver per op (the worker's stateless
+                    // boundary): a fresh open must be O(1) via the checkpoint.
+                    let driver = DurableEventLogDriver::open(&dir).unwrap();
+                    black_box(
+                        driver
+                            .append(&EventLogAppendRequest {
+                                execution_id: format!("{}", 400_000_000_000u64 + i),
+                                transaction_id: format!("hot-{i}"),
+                                payload: event_payload(i, "exec-seed"),
+                            })
+                            .unwrap(),
+                    );
+                })
+            },
+        );
+        cleanup(&dir);
+    }
+
     group.finish();
     cleanup(&bench_root());
 }
@@ -809,6 +858,69 @@ fn bench_shared_tier_append(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| {
                     let i = ctr.fetch_add(1, Ordering::Relaxed);
+                    black_box(
+                        log.append(&EventLogAppendRequest {
+                            execution_id: exec.clone(),
+                            transaction_id: format!("hot-{i}"),
+                            payload: event_payload(i, "exec-shared"),
+                        })
+                        .unwrap(),
+                    );
+                })
+            },
+        );
+        cleanup(&dir);
+    }
+
+    // Per-op-open variant — the exact deployed worker shape (noetl/ehdb#267): the
+    // worker rebuilds the WHOLE `SharedTierEventLog` stack per append, so each op
+    // pays a fresh local `open` (now O(1) via the checkpoint, #267) plus the
+    // O(delta) shared publish (#266). Held-open `append_at_size` above never
+    // re-opened the local store, hiding the O(segment) replay; this reconstructs
+    // the stack every iteration so flatness across S proves the deployed per-op
+    // cost is now flat, not just the engine primitive.
+    for &s in &[100u64, 2_000u64, 10_000u64] {
+        let dir = unique_dir("el-shared-peropopen");
+        let local_root = dir.join("local");
+        let shared_root = dir.join("shared");
+        let coldload_root = dir.join("coldload");
+        let exec = format!("{}", 500_000_000_000u64);
+        {
+            let shared: Arc<dyn SharedSegmentBackend> =
+                Arc::new(FilesystemSharedBackend::open(&shared_root).unwrap());
+            let log = SharedTierEventLog::open(
+                &local_root,
+                ShardOwnership::new(0, 1).unwrap(),
+                Arc::clone(&shared),
+                &coldload_root,
+            )
+            .unwrap();
+            for i in 0..s {
+                log.append(&EventLogAppendRequest {
+                    execution_id: exec.clone(),
+                    transaction_id: format!("seed-{i}"),
+                    payload: event_payload(i, "exec-shared"),
+                })
+                .unwrap();
+            }
+        }
+        let ctr = AtomicU64::new(s);
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment_shared/per_op_open_append_at_size", s),
+            &s,
+            |b, _| {
+                b.iter(|| {
+                    let i = ctr.fetch_add(1, Ordering::Relaxed);
+                    // Rebuild the full stack per op, as `build_durable_stack` does.
+                    let shared: Arc<dyn SharedSegmentBackend> =
+                        Arc::new(FilesystemSharedBackend::open(&shared_root).unwrap());
+                    let log = SharedTierEventLog::open(
+                        &local_root,
+                        ShardOwnership::new(0, 1).unwrap(),
+                        Arc::clone(&shared),
+                        &coldload_root,
+                    )
+                    .unwrap();
                     black_box(
                         log.append(&EventLogAppendRequest {
                             execution_id: exec.clone(),

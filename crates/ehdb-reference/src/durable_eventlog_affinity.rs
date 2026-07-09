@@ -282,7 +282,7 @@ impl AffinityRoutedEventLog {
             let driver = self.owned_store(shard)?;
             Ok(AffinityRead::owner(driver.read_execution(request)?))
         } else {
-            let view = self.cold_load(shard)?;
+            let mut view = self.cold_load(shard)?;
             Ok(AffinityRead::cold_load(view.read_execution(request)?))
         }
     }
@@ -299,7 +299,7 @@ impl AffinityRoutedEventLog {
             let driver = self.owned_store(shard)?;
             Ok(AffinityRead::owner(driver.scan_global(request)?))
         } else {
-            let view = self.cold_load(shard)?;
+            let mut view = self.cold_load(shard)?;
             Ok(AffinityRead::cold_load(view.scan_global(request)?))
         }
     }
@@ -546,7 +546,7 @@ pub fn exercise_affinity_single_writer(
     let mut single_writer_invariant = true;
     let mut total_on_disk = 0usize;
     for shard in 0..shard_count {
-        let view = DurableSegmentStore::open_read_only(replicas[0].shard_dir(shard))?;
+        let mut view = DurableSegmentStore::open_read_only(replicas[0].shard_dir(shard))?;
         let scan = view.scan_global(&EventLogScanRequest {
             after: None,
             limit: 100_000,
@@ -587,7 +587,7 @@ pub fn exercise_affinity_single_writer(
             limit: 100,
         })?;
         let after = shard_dir_sizes(&root)?;
-        let owner_view = DurableSegmentStore::open_read_only(reader.shard_dir(0))?;
+        let mut owner_view = DurableSegmentStore::open_read_only(reader.shard_dir(0))?;
         let owner_read = owner_view.read_execution(&EventLogReadExecutionRequest {
             execution_id: exec0.clone(),
             after: None,

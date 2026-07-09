@@ -33,6 +33,20 @@
 //! * **`fsync` durability + explicit crash recovery.** Every append `fsync`s
 //!   the segment before returning; reopening the store replays the segment
 //!   files to rebuild the in-memory index — replay-is-truth, from disk alone.
+//! * **O(1) open-for-append via a checkpoint sidecar.** The worker constructs
+//!   this stack **per op** (a stateless boundary), so every mirrored append pays
+//!   a fresh [`open`](DurableSegmentStore::open) — and a full replay is
+//!   O(segment), which dominated the deployed durable append rate
+//!   ([noetl/ehdb#267]). A small [`StoreCheckpoint`] sidecar (`event_count`,
+//!   active-segment id + length, durable-consumer cursors) is rewritten after
+//!   each mutating op so open-for-append loads it in O(1) and skips the replay;
+//!   the offset index is materialized lazily on the first *read*
+//!   ([`ensure_index_loaded`](DurableSegmentStore::ensure_index_loaded)). It is
+//!   an optimization only — a missing / stale / inconsistent checkpoint falls
+//!   back to a full replay (replay-is-truth), and the checkpoint can never name
+//!   more durable data than the segments hold (it is rewritten strictly *after*
+//!   the frame `fsync`), so recovery is never wrong. This mirrors the shared
+//!   tier's resumable-digest sidecar ([noetl/ehdb#266]).
 //!
 //! ## Single-writer-per-shard (execution-affinity — a later slice)
 //!
@@ -56,6 +70,8 @@
 //!
 //! [Design-Event-Log-Core-Engine]: https://github.com/noetl/ehdb/wiki/Design-Event-Log-Core-Engine
 //! [noetl/ai-meta#166]: https://github.com/noetl/ai-meta/issues/166
+//! [noetl/ehdb#266]: https://github.com/noetl/ehdb/issues/266
+//! [noetl/ehdb#267]: https://github.com/noetl/ehdb/issues/267
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -90,6 +106,12 @@ const MAX_FRAME_BODY_BYTES: usize = 64 * 1024 * 1024;
 const SEGMENT_PREFIX: &str = "seg-";
 /// Segment file name suffix.
 const SEGMENT_SUFFIX: &str = ".eslog";
+/// Sidecar checkpoint file name — a small per-store snapshot (`event_count`,
+/// active-segment id + length, durable-consumer cursors) rewritten after each
+/// mutating op so a subsequent open-for-append loads it in O(1) instead of
+/// replaying every segment to rebuild the offset index. Not a segment file, so
+/// [`DurableSegmentStore::segment_ids`] ignores it.
+const CHECKPOINT_FILE: &str = "checkpoint.json";
 
 /// One durable frame as serialized into a segment file.  Events and consumer
 /// state (create + ack) share the segment stream so a single replay rebuilds
@@ -122,6 +144,35 @@ struct EventLoc {
     offset: u64,
 }
 
+/// The per-store checkpoint sidecar ([`CHECKPOINT_FILE`]) that lets
+/// open-for-append skip the O(segment) replay (the [noetl/ehdb#267] fix).
+///
+/// It carries exactly the O(1) state the append / ack hot path needs — the
+/// event count (for the next global sequence), the active-segment position (for
+/// where to write), and the durable-consumer cursors — but **not** the offset
+/// index (materialized lazily on the first read). It is written strictly
+/// *after* the frame it describes is `fsync`'d, so it can never name more
+/// durable data than the segments hold; a crash between the frame `fsync` and
+/// the checkpoint rewrite leaves a segment *longer* than `active_len`, detected
+/// as inconsistent on the next open → full replay recovers the extra frame(s).
+/// Replay-is-truth remains the authoritative recovery path; this is a cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreCheckpoint {
+    /// Total events durably appended (the highest global sequence).
+    event_count: u64,
+    /// The active (appended-to) segment id at the time of the snapshot.
+    active_segment_id: u64,
+    /// The active segment file's byte length at the time of the snapshot — the
+    /// consistency anchor: a trusted checkpoint requires the on-disk active
+    /// segment to be exactly this long.
+    active_len: u64,
+    /// Durable consumers ever created (for accurate `created_consumer`).
+    consumers_seen: Vec<String>,
+    /// Durable-consumer ack cursors (`consumer → highest acked global seq`).
+    consumer_acks: HashMap<String, u64>,
+}
+
 /// A durable, append-only, segmented event-log store: the production disk
 /// format underneath the [`EventLogDriver`] contract.
 ///
@@ -152,6 +203,16 @@ pub struct DurableSegmentStore {
     /// its own tail on its own writable open).  See the execution-affinity
     /// single-writer routing slice ([noetl/ai-meta#166]).
     read_only: bool,
+    /// Total events durably appended (the highest global sequence). Tracked
+    /// explicitly so the append hot path stays O(1) even when the offset index
+    /// is not materialized — a checkpoint-trust open ([noetl/ehdb#267]) leaves
+    /// `events` empty but still knows the count from the checkpoint.
+    event_count: u64,
+    /// Whether the full offset index (`events` + `by_execution`) is
+    /// materialized. A checkpoint-trust open leaves it `false` and lazily
+    /// replays on the first read ([`ensure_index_loaded`](Self::ensure_index_loaded));
+    /// a full-replay open (fallback) or a read-only cold-load sets it `true`.
+    index_loaded: bool,
 }
 
 impl DurableSegmentStore {
@@ -213,17 +274,38 @@ impl DurableSegmentStore {
             active_segment_id: 0,
             active_len: 0,
             read_only,
+            event_count: 0,
+            index_loaded: false,
         };
         if read_only {
             // A cold-load of a never-written shard is an empty log; do not
-            // create the directory (a write) to serve an empty read.
+            // create the directory (a write) to serve an empty read. Read views
+            // need the full offset index for reads (the checkpoint carries no
+            // payload index), so they always replay — replay-is-truth.
             if !store.root.exists() {
+                store.index_loaded = true;
                 return Ok(store);
             }
-        } else {
-            fs::create_dir_all(&store.root).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            store.replay()?;
+            store.index_loaded = true;
+            return Ok(store);
+        }
+        fs::create_dir_all(&store.root).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // Fast path ([noetl/ehdb#267]): a consistent checkpoint lets
+        // open-for-append skip the O(segment) replay — load counts + active
+        // position + consumer cursors in O(1); the offset index is materialized
+        // lazily on the first read. A missing / stale / inconsistent checkpoint
+        // falls back to a full replay (replay-is-truth) and rewrites it.
+        if let Some(checkpoint) = store.load_checkpoint()? {
+            if store.checkpoint_consistent(&checkpoint)? {
+                store.apply_checkpoint(checkpoint);
+                store.index_loaded = false;
+                return Ok(store);
+            }
         }
         store.replay()?;
+        store.index_loaded = true;
+        store.persist_checkpoint()?;
         Ok(store)
     }
 
@@ -238,14 +320,129 @@ impl DurableSegmentStore {
         &self.root
     }
 
-    /// Total events durably appended (== the highest global sequence).
+    /// Total events durably appended (== the highest global sequence). Reads the
+    /// explicit counter, which is authoritative even when a checkpoint-trust open
+    /// has left the offset index (`events`) unmaterialized.
     pub fn len(&self) -> usize {
-        self.events.len()
+        self.event_count as usize
     }
 
     /// Whether the log is empty (no event ever appended).
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.event_count == 0
+    }
+
+    /// The checkpoint sidecar path under the store root.
+    fn checkpoint_path(&self) -> PathBuf {
+        self.root.join(CHECKPOINT_FILE)
+    }
+
+    /// Load the checkpoint sidecar if present + decodable. A decode error is
+    /// treated as *absent* (fall back to replay) rather than failing the open —
+    /// the checkpoint is an optimization, never the source of truth.
+    fn load_checkpoint(&self) -> Result<Option<StoreCheckpoint>> {
+        match fs::read(self.checkpoint_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(EhdbError::Storage(err.to_string())),
+        }
+    }
+
+    /// Whether a checkpoint faithfully describes the segments on disk, so
+    /// open-for-append can trust it and skip the replay. Deliberately strict: the
+    /// active segment must be the highest id present and its on-disk length must
+    /// equal `active_len` exactly. Because a frame is counted in the checkpoint
+    /// only *after* it is `fsync`'d (append fsyncs the frame, bumps counts, then
+    /// rewrites the checkpoint), a crash between the frame `fsync` and the
+    /// checkpoint rewrite leaves the segment *longer* than `active_len` — caught
+    /// here as inconsistent → full replay recovers the extra fsync'd frame(s).
+    /// The checkpoint can never name *more* durable data than the segments hold,
+    /// so a length match guarantees the counts are exact.
+    fn checkpoint_consistent(&self, checkpoint: &StoreCheckpoint) -> Result<bool> {
+        let ids = self.segment_ids()?;
+        if checkpoint.event_count == 0 {
+            // An empty log never writes a frame (tail/ack refuse on an empty
+            // log, append is the only first writer), so a zero-count checkpoint
+            // must correspond to no segments at all.
+            return Ok(ids.is_empty()
+                && checkpoint.active_segment_id == 0
+                && checkpoint.active_len == 0);
+        }
+        match ids.last().copied() {
+            Some(highest) if highest == checkpoint.active_segment_id => {
+                let actual_len = fs::metadata(self.segment_path(highest))
+                    .map_err(|err| EhdbError::Storage(err.to_string()))?
+                    .len();
+                Ok(actual_len == checkpoint.active_len)
+            }
+            // No segments, or a segment newer than the checkpoint knows about
+            // (a crash after rotation but before the checkpoint rewrite): stale.
+            _ => Ok(false),
+        }
+    }
+
+    /// Adopt a trusted checkpoint's counts / active position / cursors without
+    /// materializing the offset index (left empty; the first read replays to
+    /// build it). The append + ack hot paths need only these O(1) fields.
+    fn apply_checkpoint(&mut self, checkpoint: StoreCheckpoint) {
+        self.event_count = checkpoint.event_count;
+        self.active_segment_id = checkpoint.active_segment_id;
+        self.active_len = checkpoint.active_len;
+        self.consumers_seen = checkpoint.consumers_seen.into_iter().collect();
+        self.consumer_acks = checkpoint.consumer_acks;
+        self.events.clear();
+        self.by_execution.clear();
+    }
+
+    /// Persist the checkpoint sidecar (atomic temp-file + rename) after a
+    /// mutating op. **No `fsync`**: the checkpoint is an optimization, so a crash
+    /// that loses the latest rewrite simply falls back to a one-time replay on
+    /// the next open (replay-is-truth). Correctness never depends on the
+    /// checkpoint being durable — only on it never describing *more* than the
+    /// fsync'd segments, guaranteed by the caller writing it strictly after the
+    /// frame `fsync`. A read-only cold-load view never writes one.
+    fn persist_checkpoint(&self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        let checkpoint = StoreCheckpoint {
+            event_count: self.event_count,
+            active_segment_id: self.active_segment_id,
+            active_len: self.active_len,
+            consumers_seen: self.consumers_seen.iter().cloned().collect(),
+            consumer_acks: self.consumer_acks.clone(),
+        };
+        let bytes = serde_json::to_vec(&checkpoint)
+            .map_err(|err| EhdbError::Storage(format!("encode durable checkpoint: {err}")))?;
+        let path = self.checkpoint_path();
+        let tmp = self.root.join(format!("{CHECKPOINT_FILE}.tmp"));
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.write_all(&bytes)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Materialize the full offset index if a checkpoint-trust open left it lazy.
+    /// This is where the replay-is-truth integrity check (CRC + gapless sequence)
+    /// runs for a checkpoint-opened store — corruption is caught on the first
+    /// read, never silently served (the append path never reads event bodies).
+    /// Idempotent; a no-op once loaded (a read-only cold-load loads eagerly at
+    /// open, so this never fires for it).
+    fn ensure_index_loaded(&mut self) -> Result<()> {
+        if self.index_loaded {
+            return Ok(());
+        }
+        self.replay()?;
+        self.index_loaded = true;
+        Ok(())
     }
 
     /// Enumerate the store's segment files in ascending id order.
@@ -302,6 +499,9 @@ impl DurableSegmentStore {
             self.active_segment_id = *id;
             self.active_len = good_len;
         }
+        // The offset index now holds every durable event; keep the explicit
+        // counter in lockstep (it is authoritative for the append hot path).
+        self.event_count = self.events.len() as u64;
         Ok(())
     }
 
@@ -515,8 +715,8 @@ impl DurableSegmentStore {
             )));
         }
         let execution_id = request.execution_id.trim().to_string();
-        let global_sequence = self.events.len() as u64 + 1;
-        let created_stream = self.events.is_empty();
+        let global_sequence = self.event_count + 1;
+        let created_stream = self.event_count == 0;
         let byte_len = request.payload.len();
 
         let frame = SegmentFrame::Event {
@@ -526,11 +726,20 @@ impl DurableSegmentStore {
             payload: request.payload.clone(),
         };
         let loc = self.write_frame(&frame)?;
-        self.events.push(loc);
-        self.by_execution
-            .entry(execution_id.clone())
-            .or_default()
-            .push(global_sequence);
+        self.event_count += 1;
+        // Keep the resident offset index current only when it is materialized; a
+        // checkpoint-trust open leaves it lazy and rebuilds it from disk on the
+        // first read (which sees this fsync'd frame).
+        if self.index_loaded {
+            self.events.push(loc);
+            self.by_execution
+                .entry(execution_id.clone())
+                .or_default()
+                .push(global_sequence);
+        }
+        // Rewrite the checkpoint AFTER the frame is `fsync`'d (in `write_frame`)
+        // so it never names more durable data than the segments hold.
+        self.persist_checkpoint()?;
 
         Ok(EventLogAppendOutcome {
             action: "eventlog-append".to_string(),
@@ -538,12 +747,15 @@ impl DurableSegmentStore {
             global_sequence,
             byte_len,
             created_stream,
-            log_record_count: self.events.len(),
+            log_record_count: self.event_count as usize,
         })
     }
 
-    /// Ordered scan of the whole log by global sequence.
-    pub fn scan_global(&self, request: &EventLogScanRequest) -> Result<EventLogScanOutcome> {
+    /// Ordered scan of the whole log by global sequence. Takes `&mut self`
+    /// because a checkpoint-trust open defers the offset-index rebuild to the
+    /// first read ([`ensure_index_loaded`](Self::ensure_index_loaded)).
+    pub fn scan_global(&mut self, request: &EventLogScanRequest) -> Result<EventLogScanOutcome> {
+        self.ensure_index_loaded()?;
         if self.events.is_empty() {
             return Ok(EventLogScanOutcome {
                 action: "eventlog-scan".to_string(),
@@ -574,12 +786,15 @@ impl DurableSegmentStore {
         })
     }
 
-    /// Ordered read scoped to a single execution.
+    /// Ordered read scoped to a single execution. Takes `&mut self` because a
+    /// checkpoint-trust open defers the offset-index rebuild to the first read
+    /// ([`ensure_index_loaded`](Self::ensure_index_loaded)).
     pub fn read_execution(
-        &self,
+        &mut self,
         request: &EventLogReadExecutionRequest,
     ) -> Result<EventLogReadExecutionOutcome> {
         validate_execution_id(&request.execution_id)?;
+        self.ensure_index_loaded()?;
         let execution_id = request.execution_id.trim().to_string();
         if self.events.is_empty() {
             return Ok(EventLogReadExecutionOutcome {
@@ -619,6 +834,9 @@ impl DurableSegmentStore {
     /// move the ack cursor).
     pub fn tail(&mut self, request: &EventLogTailRequest) -> Result<EventLogTailOutcome> {
         validate_consumer(&request.consumer)?;
+        // A tail pull reads pending event bodies (and may create-on-first-pull,
+        // a write); it needs the full offset index.
+        self.ensure_index_loaded()?;
         let consumer = request.consumer.trim().to_string();
         if self.events.is_empty() {
             return Ok(EventLogTailOutcome {
@@ -638,6 +856,10 @@ impl DurableSegmentStore {
                 consumer: consumer.clone(),
             })?;
             self.consumers_seen.insert(consumer.clone());
+            // The create advanced the active segment (a persisted frame) and the
+            // consumer set — checkpoint after the `fsync` so a subsequent
+            // checkpoint-trust open sees the consumer and the new active length.
+            self.persist_checkpoint()?;
         }
         let acked = self.consumer_acks.get(&consumer).copied();
         let cursor = acked.unwrap_or(0);
@@ -674,11 +896,13 @@ impl DurableSegmentStore {
                 "durable event-log ack sequence must be >= 1".to_string(),
             ));
         }
-        if request.sequence > self.events.len() as u64 {
+        // Bound against the explicit counter (authoritative even on a
+        // checkpoint-trust open where the offset index is not materialized); an
+        // ack needs no offset index, so it stays O(1) — no `ensure_index_loaded`.
+        if request.sequence > self.event_count {
             return Err(EhdbError::InvalidState(format!(
                 "durable event-log ack sequence {} exceeds log length {}",
-                request.sequence,
-                self.events.len()
+                request.sequence, self.event_count
             )));
         }
         self.write_frame(&SegmentFrame::Ack {
@@ -690,6 +914,9 @@ impl DurableSegmentStore {
         if request.sequence > *cursor {
             *cursor = request.sequence;
         }
+        // Checkpoint after the ack frame `fsync` so the persisted cursor + new
+        // active length survive to the next checkpoint-trust open.
+        self.persist_checkpoint()?;
         Ok(EventLogAckOutcome {
             action: "eventlog-ack".to_string(),
             consumer,
@@ -1295,7 +1522,7 @@ mod tests {
             segs.len()
         );
         // Replay across all segments reconstructs the whole gapless log.
-        let reopened = DurableSegmentStore::open_with_segment_size(&root, 128).unwrap();
+        let mut reopened = DurableSegmentStore::open_with_segment_size(&root, 128).unwrap();
         let scan = reopened
             .scan_global(&EventLogScanRequest {
                 after: None,
@@ -1383,10 +1610,29 @@ mod tests {
             .unwrap();
         // Flip a byte in the body (offset past the 12-byte header) so the frame
         // is complete but its CRC no longer matches — bit-rot, not a torn tail.
+        // The flip does NOT change the file length, so the checkpoint stays
+        // "consistent" (length-anchored) and a checkpoint-trust open succeeds
+        // WITHOUT scanning the bodies — that is the O(1) append path, which never
+        // reads event bodies. Integrity is enforced by replay-is-truth on the
+        // first READ: corruption is caught there, never silently served.
         let mut bytes = fs::read(&seg).unwrap();
         let body_byte = FRAME_HEADER_LEN + 2;
         bytes[body_byte] ^= 0xFF;
         fs::write(&seg, &bytes).unwrap();
+        // (a) With the checkpoint present, open-for-append does not touch bodies;
+        // the CRC error surfaces on the first read (which replays with full CRC).
+        let mut trusted = DurableSegmentStore::open(&root).unwrap();
+        let err = trusted
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 10,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EhdbError::Storage(_)), "{err:?}");
+        assert!(err.to_string().contains("CRC mismatch"));
+        // (b) With no checkpoint (legacy dir / lost sidecar), open falls back to a
+        // full replay and the corrupt frame is a hard error at open time.
+        fs::remove_file(root.join(CHECKPOINT_FILE)).unwrap();
         let err = DurableSegmentStore::open(&root).unwrap_err();
         assert!(matches!(err, EhdbError::Storage(_)), "{err:?}");
         assert!(err.to_string().contains("CRC mismatch"));
@@ -1619,7 +1865,7 @@ mod tests {
         }
         // A read-only cold-load view (what a non-owner replica opens) serves the
         // same records the owner wrote.
-        let view = DurableSegmentStore::open_read_only(&root).unwrap();
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
         assert!(view.is_read_only());
         let scan = view
             .scan_global(&EventLogScanRequest {
@@ -1725,5 +1971,204 @@ mod tests {
         assert!(view.is_empty());
         // Opening a read-only view of a missing shard must not create it.
         assert!(!root.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint sidecar — O(1) open-for-append (noetl/ehdb#267).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_trust_open_skips_replay_until_first_read() {
+        let root = tmp_root("ckpt-lazy");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "200", 2, "b");
+            append(&mut store, "100", 3, "c");
+        }
+        // A checkpoint sidecar was written.
+        assert!(root.join(CHECKPOINT_FILE).exists());
+        // Reopen: the checkpoint is trusted, so the offset index is NOT
+        // materialized (the O(1) open — no replay) yet the count is exact.
+        let mut reopened = DurableSegmentStore::open(&root).unwrap();
+        assert!(
+            !reopened.index_loaded,
+            "checkpoint-trust open must not replay the offset index"
+        );
+        assert_eq!(reopened.len(), 3);
+        // Appending needs no index and continues the sequence gaplessly.
+        assert_eq!(append(&mut reopened, "300", 4, "d"), 4);
+        assert!(
+            !reopened.index_loaded,
+            "append must not force an index rebuild"
+        );
+        // The first READ lazily materializes the index (replay-is-truth) and
+        // sees every event, including the ones appended while lazy.
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert!(reopened.index_loaded);
+        assert_eq!(scan.record_count, 4);
+        assert_eq!(
+            scan.records
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(scan.records[3].payload, "d");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_open_matches_full_replay_across_many_reopens() {
+        // Reopening repeatedly (the per-op worker shape) must never lose or
+        // duplicate an event, whether it trusts the checkpoint or replays.
+        let root = tmp_root("ckpt-idempotent");
+        let n = 50u64;
+        for i in 1..=n {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            assert_eq!(store.len() as u64, i - 1);
+            append(&mut store, "100", i, &format!("p{i}"));
+            // store dropped → next iteration opens fresh (per-op boundary).
+        }
+        let mut reopened = DurableSegmentStore::open(&root).unwrap();
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 1000,
+            })
+            .unwrap();
+        assert_eq!(scan.record_count, n as usize);
+        // Gapless, no duplicates.
+        assert_eq!(
+            scan.records
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            (1..=n).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_missing_falls_back_to_replay_and_recreates_it() {
+        let root = tmp_root("ckpt-missing");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "200", 2, "b");
+            append(&mut store, "100", 3, "c");
+        }
+        // Legacy dir / lost sidecar: delete the checkpoint.
+        fs::remove_file(root.join(CHECKPOINT_FILE)).unwrap();
+        let mut reopened = DurableSegmentStore::open(&root).unwrap();
+        // Fell back to a full replay: the index is eagerly loaded and correct.
+        assert!(reopened.index_loaded);
+        assert_eq!(reopened.len(), 3);
+        // And the checkpoint was recreated so the NEXT open is O(1) again.
+        assert!(root.join(CHECKPOINT_FILE).exists());
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.record_count, 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_checkpoint_is_ignored_in_favor_of_replay() {
+        let root = tmp_root("ckpt-stale");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "100", 2, "b");
+            append(&mut store, "100", 3, "c");
+            append(&mut store, "100", 4, "d");
+        }
+        // Hand-write a STALE checkpoint under-counting the log and naming a wrong
+        // active length (simulating a crash between a frame `fsync` and the
+        // checkpoint rewrite). The length anchor no longer matches the segment.
+        let stale = StoreCheckpoint {
+            event_count: 2,
+            active_segment_id: 1,
+            active_len: 1, // deliberately wrong
+            consumers_seen: Vec::new(),
+            consumer_acks: HashMap::new(),
+        };
+        fs::write(
+            root.join(CHECKPOINT_FILE),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        // Reopen: consistency check fails (active_len mismatch) → full replay
+        // recovers the true count of 4, not the stale 2. Replay-is-truth.
+        let mut reopened = DurableSegmentStore::open(&root).unwrap();
+        assert!(reopened.index_loaded);
+        assert_eq!(reopened.len(), 4);
+        // Next append continues from the true tip, no gap, no double-count.
+        assert_eq!(append(&mut reopened, "100", 5, "e"), 5);
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(
+            scan.records
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_survives_rotation_and_consumer_state() {
+        let root = tmp_root("ckpt-rotation");
+        // Tiny segments force rotation; the checkpoint's active-segment anchor
+        // must track the rotated (highest) segment, and consumer cursors must
+        // ride the sidecar so a checkpoint-trust open recovers them.
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 128).unwrap();
+            for i in 1..=20 {
+                append(&mut store, "100", i, &format!("payload-{i:03}"));
+            }
+            store
+                .ack(&EventLogAckRequest {
+                    consumer: "projector".to_string(),
+                    transaction_id: "ack".to_string(),
+                    sequence: 5,
+                })
+                .unwrap();
+        }
+        // Multiple segments exist (rotation happened).
+        let segs = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(SEGMENT_PREFIX))
+            .count();
+        assert!(segs > 1, "expected rotation, got {segs} segment(s)");
+        // Checkpoint-trust reopen: count + durable cursor survive without replay.
+        let mut reopened = DurableSegmentStore::open_with_segment_size(&root, 128).unwrap();
+        assert!(!reopened.index_loaded);
+        assert_eq!(reopened.len(), 20);
+        let tail = reopened
+            .tail(&EventLogTailRequest {
+                consumer: "projector".to_string(),
+                transaction_id: "t".to_string(),
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(tail.acked_sequence, Some(5));
+        assert!(!tail.created_consumer, "consumer-create survived reopen");
+        assert_eq!(tail.pending_count, 15);
+        let _ = fs::remove_dir_all(&root);
     }
 }
