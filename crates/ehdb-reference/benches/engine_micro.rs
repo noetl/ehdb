@@ -1018,6 +1018,50 @@ fn bench_segment_gc(c: &mut Criterion) {
             cleanup(dir);
         }
     }
+
+    // Limits-based retention (keep-last-N) — NO consumer, so interest reclaims
+    // nothing and retention drives. Same apply-dominated cost as interest; the
+    // extra plan step (a count-based boundary) is O(segments), negligible.
+    for &s in &[200u64, 800u64] {
+        let dirs: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment/retention_reclaim_at_size", s),
+            &s,
+            |b, &s| {
+                let counter = AtomicU64::new(0);
+                b.iter_batched(
+                    || {
+                        let n = counter.fetch_add(1, Ordering::Relaxed);
+                        let dir = unique_dir(&format!("el-gc-ret-{s}-{n}"));
+                        let driver =
+                            DurableEventLogDriver::open_with_segment_size(&dir, SEG).unwrap();
+                        for i in 0..s {
+                            driver
+                                .append(&EventLogAppendRequest {
+                                    execution_id: exec.clone(),
+                                    transaction_id: format!("seed-{i}"),
+                                    payload: event_payload(i, "exec-gc-ret"),
+                                })
+                                .unwrap();
+                        }
+                        (dir, driver)
+                    },
+                    |(dir, driver)| {
+                        black_box(
+                            driver
+                                .reclaim_segments(&SegmentGcPolicy::with_retention(2, 3))
+                                .unwrap(),
+                        );
+                        dirs.lock().unwrap().push(dir);
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+        for dir in dirs.lock().unwrap().iter() {
+            cleanup(dir);
+        }
+    }
     group.finish();
 }
 

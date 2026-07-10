@@ -1264,28 +1264,75 @@ impl DurableSegmentStore {
     /// tier commits a cross-replica watermark from a plan before the local
     /// unlink runs.
     fn plan_reclaim(&self, policy: &SegmentGcPolicy) -> Result<ReclaimPlanOutcome> {
-        let watermark = if self.consumers_seen.is_empty() {
-            0
+        let seg_last = self.segment_last_sequences();
+        let total_segments = self.segment_ids()?.len();
+
+        // Interest ceiling — never reclaim past what a real consumer has acked.
+        // `None` when NO consumer exists: interest then imposes no ceiling, so
+        // retention (if any) drives; interest-*only* with no consumer stays
+        // "reclaim nothing" (the pre-retention default), handled in the compose.
+        let interest_ceiling: Option<u64> = if self.consumers_seen.is_empty() {
+            None
         } else {
-            self.consumers_seen
-                .iter()
-                .map(|c| self.consumer_acks.get(c).copied().unwrap_or(0))
-                .min()
-                .unwrap_or(0)
+            Some(
+                self.consumers_seen
+                    .iter()
+                    .map(|c| self.consumer_acks.get(c).copied().unwrap_or(0))
+                    .min()
+                    .unwrap_or(0),
+            )
         };
-        if watermark == 0 {
+
+        // Retention target — keep-last-N segments (count-based): the highest
+        // sequence retention permits reclaiming so that at most
+        // `max_retained_segments` total segments (the active one + up to
+        // `max_ret - 1` sealed) remain. `None` when retention is off, or when
+        // there are not yet more sealed segments than the keep window. Count-based
+        // so it is **robust across hydrate / cold-load** (segment count is
+        // intrinsic; a timestamp-based max-age would reset on the fresh files a
+        // new owner materializes — see the design note).
+        let retention_target: Option<u64> = policy.max_retained_segments.and_then(|max_ret| {
+            let keep_sealed = max_ret.saturating_sub(1); // the active segment is always kept
+            if seg_last.len() > keep_sealed {
+                // Reclaim the oldest `len - keep_sealed` sealed segments; the
+                // boundary is the last sequence of the newest reclaimable one.
+                Some(seg_last[seg_last.len() - keep_sealed - 1].1)
+            } else {
+                None // fewer sealed segments than the keep window — retention idle
+            }
+        });
+
+        // Compose: retention drives, capped by a real consumer's ack cursor
+        // (`min`); interest-only with no consumer reclaims nothing. This is the
+        // `min(interest-watermark, retention-boundary)` rule, with "no consumer"
+        // treated as "no interest ceiling" rather than watermark 0.
+        let boundary = match retention_target {
+            Some(rt) => rt.min(interest_ceiling.unwrap_or(u64::MAX)),
+            None => interest_ceiling.unwrap_or(0),
+        };
+        if boundary == 0 {
             return Ok(ReclaimPlanOutcome::Nothing {
-                watermark,
-                note: if self.consumers_seen.is_empty() {
-                    "no durable consumer — nothing acked, nothing reclaimable".to_string()
-                } else {
-                    "a durable consumer has acked nothing (watermark 0) — nothing reclaimable"
-                        .to_string()
+                watermark: 0,
+                note: match (interest_ceiling, policy.max_retained_segments) {
+                    (None, None) => {
+                        "no durable consumer and no retention — nothing reclaimable".to_string()
+                    }
+                    (None, Some(_)) => {
+                        "retention window not yet exceeded — nothing reclaimable".to_string()
+                    }
+                    (Some(0), _) => {
+                        "a durable consumer has acked nothing (watermark 0) — nothing reclaimable"
+                            .to_string()
+                    }
+                    _ => "effective reclaim boundary is 0 — nothing reclaimable".to_string(),
                 },
             });
         }
-        let seg_last = self.segment_last_sequences();
-        let total_segments = self.segment_ids()?.len();
+
+        // Selection: the contiguous prefix of sealed segments with
+        // `last_seq <= boundary`, keeping the `min_retained_segments` floor and
+        // never the active segment. Unchanged — it consumes the composed boundary,
+        // so retention inherits the same crash-safety + coherence downstream.
         let keep_floor = policy.min_retained_segments.max(1);
         let max_reclaimable = total_segments.saturating_sub(keep_floor);
         let mut reclaim_count = 0usize;
@@ -1297,16 +1344,16 @@ impl DurableSegmentStore {
             if *seg_id >= self.active_segment_id {
                 break;
             }
-            if *last_seq <= watermark {
+            if *last_seq <= boundary {
                 reclaim_count = i + 1;
             } else {
-                break; // watermark reached — later segments are still needed.
+                break; // boundary reached — later segments are still needed.
             }
         }
         if reclaim_count == 0 {
             return Ok(ReclaimPlanOutcome::Nothing {
-                watermark,
-                note: "no sealed segment fully below the watermark within the min-retained floor"
+                watermark: boundary,
+                note: "no sealed segment fully below the effective boundary within the min-retained floor"
                     .to_string(),
             });
         }
@@ -1315,7 +1362,7 @@ impl DurableSegmentStore {
             reclaimed_segment,
             reclaimed_seq,
             segments: reclaim_count,
-            watermark,
+            watermark: boundary,
         }))
     }
 
@@ -1724,6 +1771,16 @@ pub struct SegmentGcPolicy {
     /// one, which is never reclaimable regardless), even when consumers have
     /// acked past them — a floor for late / debug readers. Clamped to `>= 1`.
     pub min_retained_segments: usize,
+    /// **Limits-based retention** — keep at most this many segments (the active
+    /// one + up to `N - 1` sealed), reclaiming older ones **independent of
+    /// consumer interest**. `None` ⇒ interest-only (the pre-retention behaviour:
+    /// a store with no durable consumer reclaims nothing). `Some(N)` ⇒ the store
+    /// self-bounds to `N` segments even under `shadow` with no consumer; a real
+    /// consumer still caps reclamation (the effective boundary is
+    /// `min(consumer-cursor, retention-boundary)`), so retention never reclaims
+    /// ahead of a consumer under `primary`. Clamped to `>= min_retained_segments`
+    /// (the floor always wins).
+    pub max_retained_segments: Option<usize>,
 }
 
 impl Default for SegmentGcPolicy {
@@ -1731,6 +1788,7 @@ impl Default for SegmentGcPolicy {
         Self {
             enabled: false,
             min_retained_segments: DEFAULT_MIN_RETAINED_SEGMENTS,
+            max_retained_segments: None,
         }
     }
 }
@@ -1741,22 +1799,44 @@ impl SegmentGcPolicy {
     pub const ENV_VAR: &'static str = "NOETL_EHDB_EVENTLOG_GC";
     /// The env var that overrides [`Self::min_retained_segments`].
     pub const MIN_RETAINED_ENV_VAR: &'static str = "NOETL_EHDB_EVENTLOG_GC_MIN_RETAINED_SEGMENTS";
+    /// The env var that enables limits-based retention
+    /// ([`Self::max_retained_segments`]) — unset / `0` ⇒ interest-only.
+    pub const MAX_RETAINED_ENV_VAR: &'static str = "NOETL_EHDB_EVENTLOG_GC_MAX_RETAINED_SEGMENTS";
 
-    /// A convenience constructor for an enabled policy with an explicit floor
-    /// (clamped to `>= 1`).
+    /// A convenience constructor for an enabled interest-only policy with an
+    /// explicit floor (clamped to `>= 1`), no retention.
     pub fn enabled(min_retained_segments: usize) -> Self {
         Self {
             enabled: true,
             min_retained_segments: min_retained_segments.max(1),
+            max_retained_segments: None,
         }
     }
 
-    /// Fail-safe parse from the two env-var values. Only the exact tokens
+    /// An enabled policy with limits-based retention: keep at most
+    /// `max_retained_segments` segments, floor `min_retained_segments`. The
+    /// retention cap is clamped to `>= min` (the floor always wins).
+    pub fn with_retention(min_retained_segments: usize, max_retained_segments: usize) -> Self {
+        let min = min_retained_segments.max(1);
+        Self {
+            enabled: true,
+            min_retained_segments: min,
+            max_retained_segments: Some(max_retained_segments.max(min)),
+        }
+    }
+
+    /// Fail-safe parse from the env-var values. Only the exact tokens
     /// `consumer_ack` / `on` / `enabled` (case-insensitive, trimmed) enable GC;
     /// everything else — unset, empty, unrecognised — leaves it disabled, so an
     /// unknown value never silently starts dropping segments. A non-numeric /
-    /// zero min-retained falls back to [`DEFAULT_MIN_RETAINED_SEGMENTS`].
-    pub fn from_raw(mode: Option<&str>, min_retained: Option<&str>) -> Self {
+    /// zero min-retained falls back to [`DEFAULT_MIN_RETAINED_SEGMENTS`]. A
+    /// non-numeric / zero / absent max-retained ⇒ retention off (interest-only);
+    /// a set max-retained is clamped up to the min floor.
+    pub fn from_raw(
+        mode: Option<&str>,
+        min_retained: Option<&str>,
+        max_retained: Option<&str>,
+    ) -> Self {
         let enabled = matches!(
             mode.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
             Some("consumer_ack") | Some("on") | Some("enabled")
@@ -1765,9 +1845,14 @@ impl SegmentGcPolicy {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(DEFAULT_MIN_RETAINED_SEGMENTS);
+        let max_retained_segments = max_retained
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .map(|n| n.max(min_retained_segments));
         Self {
             enabled,
             min_retained_segments,
+            max_retained_segments,
         }
     }
 }
@@ -3303,24 +3388,42 @@ mod tests {
     #[test]
     fn gc_policy_from_raw_is_fail_safe() {
         // Disabled unless an explicit enable token; unknown → disabled.
-        assert!(!SegmentGcPolicy::from_raw(None, None).enabled);
-        assert!(!SegmentGcPolicy::from_raw(Some(""), None).enabled);
-        assert!(!SegmentGcPolicy::from_raw(Some("garbage"), None).enabled);
-        assert!(SegmentGcPolicy::from_raw(Some(" Consumer_Ack "), None).enabled);
-        assert!(SegmentGcPolicy::from_raw(Some("on"), None).enabled);
-        assert!(SegmentGcPolicy::from_raw(Some("enabled"), None).enabled);
+        assert!(!SegmentGcPolicy::from_raw(None, None, None).enabled);
+        assert!(!SegmentGcPolicy::from_raw(Some(""), None, None).enabled);
+        assert!(!SegmentGcPolicy::from_raw(Some("garbage"), None, None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some(" Consumer_Ack "), None, None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some("on"), None, None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some("enabled"), None, None).enabled);
         // min-retained parse + fallbacks.
         assert_eq!(
-            SegmentGcPolicy::from_raw(Some("on"), Some("5")).min_retained_segments,
+            SegmentGcPolicy::from_raw(Some("on"), Some("5"), None).min_retained_segments,
             5
         );
         assert_eq!(
-            SegmentGcPolicy::from_raw(Some("on"), Some("0")).min_retained_segments,
+            SegmentGcPolicy::from_raw(Some("on"), Some("0"), None).min_retained_segments,
             DEFAULT_MIN_RETAINED_SEGMENTS
         );
         assert_eq!(
-            SegmentGcPolicy::from_raw(Some("on"), Some("nope")).min_retained_segments,
+            SegmentGcPolicy::from_raw(Some("on"), Some("nope"), None).min_retained_segments,
             DEFAULT_MIN_RETAINED_SEGMENTS
+        );
+        // retention: off by default; a set value clamps up to the min floor.
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), None, None).max_retained_segments,
+            None
+        );
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), None, Some("0")).max_retained_segments,
+            None
+        );
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), Some("2"), Some("5")).max_retained_segments,
+            Some(5)
+        );
+        // max < min ⇒ clamped up to min (the floor always wins).
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), Some("4"), Some("2")).max_retained_segments,
+            Some(4)
         );
     }
 
@@ -3346,6 +3449,133 @@ mod tests {
         let err = exercise_segment_gc(&root, 2, 220, &SegmentGcPolicy::enabled(2), "projector")
             .unwrap_err();
         assert!(err.to_string().contains("at least 4 events"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Limits-based retention — keep-last-N, composed with interest.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gc_retention_bounds_a_shadow_store_without_a_consumer() {
+        let root = tmp_root("gc-ret-shadow");
+        // Append under tiny segments → many sealed segments. NO consumer at all.
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+            for i in 1..=20 {
+                append(
+                    &mut store,
+                    "100",
+                    i,
+                    &format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+                );
+            }
+        }
+        let before = list_segment_files(&root).unwrap().len();
+        assert!(before > 4, "expected rollover, got {before}");
+
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        // Interest-only would reclaim NOTHING here (no consumer). Retention
+        // keep-last-3 drives instead — the shadow store self-bounds.
+        assert_eq!(
+            store
+                .reclaim_segments(&SegmentGcPolicy::enabled(2))
+                .unwrap()
+                .segments_reclaimed,
+            0,
+            "interest-only reclaims nothing without a consumer"
+        );
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::with_retention(2, 3))
+            .unwrap();
+        assert!(
+            out.segments_reclaimed > 0,
+            "retention must reclaim: {out:?}"
+        );
+        let after = list_segment_files(&root).unwrap().len();
+        assert!(after < before, "{before} -> {after}");
+        assert!(after <= 4, "self-bounded to ~max_retained (got {after})");
+        // Retained log is gapless-from-base; absolute tip unchanged.
+        assert_eq!(store.len(), 20);
+        let scan = store
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        let seqs: Vec<u64> = scan.records.iter().map(|r| r.global_sequence).collect();
+        let expected: Vec<u64> = (out.reclaimed_through_seq + 1..=20).collect();
+        assert_eq!(seqs, expected);
+        // Reopen honors the durable manifest (crash-safety / base offset).
+        let mut reopened = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        assert_eq!(reopened.reclaimed_through(), out.reclaimed_through_seq);
+        let rescan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(
+            rescan.records.first().unwrap().global_sequence,
+            out.reclaimed_through_seq + 1
+        );
+        assert_eq!(rescan.records.last().unwrap().global_sequence, 20);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_retention_never_reclaims_ahead_of_a_lagging_consumer() {
+        // Composition: retention wants to reclaim aggressively, but a consumer
+        // has only acked through 6 — the effective boundary is min(6, retention),
+        // so reclamation never passes the consumer cursor (the primary-safety).
+        let root = tmp_root("gc-ret-capped");
+        seed_for_gc(&root, 20, 220, "projector", 6);
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::with_retention(2, 2))
+            .unwrap();
+        assert!(
+            out.reclaimed_through_seq <= 6,
+            "must not reclaim ahead of the consumer (acked 6): {out:?}"
+        );
+        // The consumer's pending set from its cursor is fully preserved.
+        let tail = store
+            .tail(&EventLogTailRequest {
+                consumer: "projector".to_string(),
+                transaction_id: "t".to_string(),
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(tail.acked_sequence, Some(6));
+        assert_eq!(tail.pending_count, 20 - 6);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_retention_respects_the_min_retained_floor() {
+        let root = tmp_root("gc-ret-floor");
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+            for i in 1..=20 {
+                append(
+                    &mut store,
+                    "100",
+                    i,
+                    &format!("payload-{i:05}-0123456789abcdef"),
+                );
+            }
+        }
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        // Retention keep-1 requested, but min floor is 5 → the floor wins
+        // (with_retention clamps max up to min), so >= 5 segments survive.
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::with_retention(5, 1))
+            .unwrap();
+        assert!(out.segments_reclaimed > 0, "{out:?}");
+        assert!(
+            list_segment_files(&root).unwrap().len() >= 5,
+            "min-retained floor honored"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
