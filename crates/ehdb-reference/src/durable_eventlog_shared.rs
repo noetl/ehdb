@@ -123,7 +123,8 @@ use twox_hash::XxHash64;
 
 use crate::affinity::ShardOwnership;
 use crate::durable_eventlog::{
-    list_segment_files, segment_file_name, DurableSegmentStore, DEFAULT_SEGMENT_MAX_BYTES,
+    list_segment_files, segment_file_name, DurableSegmentStore, SegmentGcPolicy,
+    DEFAULT_SEGMENT_MAX_BYTES,
 };
 use crate::durable_eventlog_affinity::{AffinityRead, AffinityRoutedEventLog, Routed, ServedBy};
 use crate::eventlog::{
@@ -260,6 +261,47 @@ pub trait SharedSegmentBackend: Send + Sync {
             .get_segment(shard, segment_id)?
             .map(|bytes| bytes.len() as u64))
     }
+
+    /// Publish the shard's **cross-replica reclaim watermark** — the highest
+    /// reclaimed `(seq, segment_id)`. Idempotent + **monotonic**: never lowers a
+    /// higher existing watermark. Committed *before* any shared segment object is
+    /// deleted, so a non-owner cold-load / new-owner hydrate that reads the
+    /// watermark skips segments with id `<= segment_id` and therefore never
+    /// re-pulls a reclaimed segment or diverges from the owner — even mid-GC.
+    ///
+    /// The default errors: a backend that cannot durably persist a watermark
+    /// cannot support shared-tier GC (the shared tier refuses to reclaim on it),
+    /// which is safer than silently losing coherence. The filesystem/PVC backend
+    /// overrides it.
+    fn put_reclaim_watermark(&self, shard: u32, seq: u64, segment_id: u64) -> Result<()> {
+        let _ = (shard, seq, segment_id);
+        Err(EhdbError::InvalidState(
+            "shared backend does not support a reclaim watermark (shared-tier GC unavailable)"
+                .to_string(),
+        ))
+    }
+
+    /// The shard's cross-replica reclaim watermark `(seq, segment_id)`, or
+    /// `(0, 0)` when none was published. The default is `(0, 0)` — a backend
+    /// with no watermark support reports "nothing reclaimed", so readers skip
+    /// nothing and behave exactly as the pre-GC shared tier.
+    fn reclaim_watermark(&self, shard: u32) -> Result<(u64, u64)> {
+        let _ = shard;
+        Ok((0, 0))
+    }
+
+    /// Delete one shared segment object (its bytes + integrity marker).
+    /// Idempotent — an absent object is not an error. Used to reclaim shared disk
+    /// **after** the watermark is committed; a crash mid-delete leaves an orphan
+    /// object readers already skip (a space leak the next GC re-attempts), never
+    /// a correctness bug. The default errors (see [`Self::put_reclaim_watermark`]).
+    fn delete_segment(&self, shard: u32, segment_id: u64) -> Result<()> {
+        let _ = (shard, segment_id);
+        Err(EhdbError::InvalidState(
+            "shared backend does not support segment deletion (shared-tier GC unavailable)"
+                .to_string(),
+        ))
+    }
 }
 
 /// On-disk integrity sidecar committed *after* the segment bytes — its presence
@@ -283,6 +325,18 @@ struct SharedSegmentMeta {
     /// whole-prefix `digest` string instead), so it never affects correctness.
     #[serde(default)]
     hasher_state: Option<XxHash64>,
+}
+
+/// The shard's cross-replica reclaim watermark object — the highest reclaimed
+/// `(seq, segment)`. A non-owner cold-load / new-owner hydrate skips shared
+/// segments with id `<= segment`, so this object (committed before any shared
+/// segment is deleted) is what keeps readers coherent with the owner through a
+/// reclamation. Monotonic: never lowered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SharedReclaimWatermark {
+    seq: u64,
+    segment: u64,
 }
 
 /// A [`SharedSegmentBackend`] over a shared filesystem directory — the
@@ -316,6 +370,12 @@ impl FilesystemSharedBackend {
     fn meta_path(&self, shard: u32, segment_id: u64) -> PathBuf {
         self.root
             .join(format!("{}.meta", shared_segment_key(shard, segment_id)))
+    }
+
+    /// The shard's reclaim-watermark object path (a fixed-width, bounded key like
+    /// the segment keys). One per shard.
+    fn watermark_path(&self, shard: u32) -> PathBuf {
+        self.root.join(format!("noetl.ehdb.rw.{shard:08x}"))
     }
 
     /// Write `bytes` to `path` via a sibling temp file + rename (atomic publish).
@@ -586,6 +646,47 @@ impl SharedSegmentBackend for FilesystemSharedBackend {
     fn committed_len(&self, shard: u32, segment_id: u64) -> Result<Option<u64>> {
         Ok(read_meta(&self.meta_path(shard, segment_id))?.map(|meta| meta.byte_len))
     }
+
+    fn put_reclaim_watermark(&self, shard: u32, seq: u64, segment_id: u64) -> Result<()> {
+        let path = self.watermark_path(shard);
+        // Monotonic: never lower an existing higher watermark (a stale / retried
+        // GC must not resurrect already-skipped segments for readers).
+        let current = read_watermark(&path)?.unwrap_or_default();
+        if segment_id <= current.segment && seq <= current.seq {
+            return Ok(());
+        }
+        let next = SharedReclaimWatermark {
+            seq: seq.max(current.seq),
+            segment: segment_id.max(current.segment),
+        };
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|err| EhdbError::Storage(format!("encode reclaim watermark: {err}")))?;
+        Self::atomic_write(&path, &bytes)
+    }
+
+    fn reclaim_watermark(&self, shard: u32) -> Result<(u64, u64)> {
+        Ok(read_watermark(&self.watermark_path(shard))?
+            .map(|w| (w.seq, w.segment))
+            .unwrap_or((0, 0)))
+    }
+
+    fn delete_segment(&self, shard: u32, segment_id: u64) -> Result<()> {
+        // Remove the integrity marker FIRST so a crash between the two unlinks
+        // leaves an object with no `.meta` — which `list_segment_ids` / `get_segment`
+        // already treat as absent (an in-progress / removed object), never a
+        // half-present segment.
+        for path in [
+            self.meta_path(shard, segment_id),
+            self.object_path(shard, segment_id),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(EhdbError::Storage(err.to_string())),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The current on-disk length of a shared object, or `0` when it does not exist.
@@ -632,6 +733,17 @@ fn read_segment_delta(path: &Path, from: u64, len: u64) -> Result<Vec<u8>> {
     file.read_exact(&mut buf)
         .map_err(|err| EhdbError::Storage(err.to_string()))?;
     Ok(buf)
+}
+
+/// Read + decode a shard's reclaim-watermark object, or `None` when absent. A
+/// decode error is treated as absent (fail-safe: no watermark ⇒ readers skip
+/// nothing ⇒ pre-GC behavior), never a hard error.
+fn read_watermark(path: &Path) -> Result<Option<SharedReclaimWatermark>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(EhdbError::Storage(err.to_string())),
+    }
 }
 
 /// Read + decode a segment's integrity sidecar, or `None` when absent.
@@ -758,6 +870,12 @@ impl SharedTierEventLog {
         self.local.ownership()
     }
 
+    /// The underlying affinity-routed local store (owned-shard fast path). Exposed
+    /// so a caller can drive per-owned-shard GC planning / reconciliation.
+    pub fn local(&self) -> &AffinityRoutedEventLog {
+        &self.local
+    }
+
     /// The shared medium's name.
     pub fn shared_backend_name(&self) -> &'static str {
         self.shared.backend_name()
@@ -816,17 +934,33 @@ impl SharedTierEventLog {
         })
     }
 
+    /// The shard's shared segment ids that are still **retained** — i.e. above
+    /// the cross-replica reclaim watermark (`> watermark.segment`). A cold-load /
+    /// hydrate materializes only these, so a reader never re-pulls a reclaimed
+    /// segment and diverges from the owner — even in the crash window where the
+    /// watermark is committed but the shared objects are not yet deleted. The
+    /// base offset falls out of the first surviving frame on replay.
+    fn retained_shared_ids(&self, shard: u32) -> Result<Vec<u64>> {
+        let (_, wm_segment) = self.shared.reclaim_watermark(shard)?;
+        let mut ids = self.shared.list_segment_ids(shard)?;
+        if wm_segment > 0 {
+            ids.retain(|&id| id > wm_segment);
+        }
+        Ok(ids)
+    }
+
     /// Materialize a shard's shared segments into a fresh directory and return a
     /// read-only [`DurableSegmentStore`] over them — the cold-load-from-shared
     /// primitive. `dest` is cleared first so a stale prior materialization can
-    /// never leak. A shard with no shared segments yields an empty read-only
-    /// store (the shared-store-miss case — not an error).
+    /// never leak. A shard with no (retained) shared segments yields an empty
+    /// read-only store (the shared-store-miss case — not an error). Segments at
+    /// or below the reclaim watermark are skipped ([`Self::retained_shared_ids`]).
     fn materialize_from_shared(&self, shard: u32, dest: &Path) -> Result<DurableSegmentStore> {
         // Clear + recreate the destination so we never mix a stale cold-load.
         if dest.exists() {
             fs::remove_dir_all(dest).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
-        let ids = self.shared.list_segment_ids(shard)?;
+        let ids = self.retained_shared_ids(shard)?;
         if ids.is_empty() {
             // Shared-store miss: no segments for this shard. Open read-only over
             // the (absent) dir → an empty log, not an error.
@@ -881,7 +1015,10 @@ impl SharedTierEventLog {
         let local_dir = self.local.shard_dir(shard);
         let local_segments = list_segment_files(&local_dir)?;
         let was_empty = local_segments.is_empty();
-        let shared_ids = self.shared.list_segment_ids(shard)?;
+        // Hydrate only the RETAINED shared segments (above the reclaim watermark);
+        // a reclaimed segment is never pulled back, so the inheriting owner's base
+        // offset matches the reclaiming owner's — no un-reclaim on transfer.
+        let shared_ids = self.retained_shared_ids(shard)?;
         let mut materialized = 0usize;
         if was_empty && !shared_ids.is_empty() {
             fs::create_dir_all(&local_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
@@ -1003,6 +1140,385 @@ impl SharedTierEventLog {
             Routed::NotOwner { owner_shard } => Ok(Routed::NotOwner { owner_shard }),
         }
     }
+
+    /// Adopt the shard's published cross-replica reclaim watermark into this
+    /// **owned** replica's local store — reclaiming any local segment at/below it.
+    /// This is the crash-window recovery: if a prior `reclaim_shard` committed the
+    /// shared watermark but crashed before the local unlink (or before this owner
+    /// restarted), the owner's local segments are ahead of the watermark and it
+    /// would over-serve reclaimed sequences that non-owners already skip. Calling
+    /// this on bring-up realigns the owner with the shared watermark so all
+    /// replicas agree. Idempotent; a no-op when there is no watermark or the local
+    /// store is already at/below it. Errors if this replica does not own `shard`.
+    pub fn reconcile_owned_shard(&self, shard: u32) -> Result<u64> {
+        let driver = self.local.owned_driver(shard)?;
+        let (_, wm_segment) = self.shared.reclaim_watermark(shard)?;
+        if wm_segment > 0 {
+            driver.reclaim_to_segment(wm_segment)?;
+        }
+        Ok(wm_segment)
+    }
+
+    /// Reclaim consumed sealed segments for an **owned** shard across BOTH the
+    /// local store AND the shared tier — coherently (segment GC for the
+    /// shared-medium topology). Owner-only; a non-owner is refused
+    /// ([`Routed::NotOwner`]).
+    ///
+    /// The order is the crux (watermark-first):
+    ///
+    /// 1. **Reconcile** — adopt any already-published watermark locally first, so
+    ///    the plan is computed against a store aligned with the shared state.
+    /// 2. **Plan** the reclaim boundary from the owner's local consumer cursors
+    ///    ([`DurableEventLogDriver::plan_reclaim_boundary`]) — no mutation yet.
+    /// 3. **Commit the shared watermark** ([`SharedSegmentBackend::put_reclaim_watermark`])
+    ///    — the cross-replica point of no return. From here every cold-load /
+    ///    hydrate skips segments `<= watermark.segment`, so a reader can never
+    ///    re-pull a segment this reclamation is about to remove.
+    /// 4. **Reclaim locally** to the boundary ([`DurableEventLogDriver::reclaim_to_segment`]),
+    ///    which write-forwards consumer state + `fsync`s the local manifest +
+    ///    unlinks the local segments.
+    /// 5. **Delete the shared objects** `<= watermark.segment`.
+    ///
+    /// A crash after (3) leaves readers skipping the watermark while some shared /
+    /// local objects linger — a bounded space leak the next `reclaim_shard`
+    /// re-attempts, never a divergence (readers already skip them; the owner
+    /// realigns via step 1 on its next run / bring-up).
+    pub fn reclaim_shard(
+        &self,
+        shard: u32,
+        policy: &SegmentGcPolicy,
+    ) -> Result<Routed<SharedShardGcOutcome>> {
+        if !self.ownership().owns_shard(shard) {
+            return Ok(Routed::NotOwner { owner_shard: shard });
+        }
+        let mut outcome = SharedShardGcOutcome {
+            shard,
+            reclaim_watermark_seq: 0,
+            reclaimed_through_segment: 0,
+            local_segments_reclaimed: 0,
+            shared_objects_deleted: 0,
+            note: None,
+        };
+        if !policy.enabled {
+            outcome.note = Some("segment GC disabled".to_string());
+            return Ok(Routed::Served(outcome));
+        }
+        let driver = self.local.owned_driver(shard)?;
+
+        // (1) Reconcile local to any already-committed watermark.
+        self.reconcile_owned_shard(shard)?;
+
+        // (2) Plan the (new) boundary from the owner's local consumers.
+        let Some((seq, segment)) = driver.plan_reclaim_boundary(policy)? else {
+            outcome.note =
+                Some("nothing reclaimable (no consumer interest past the floor)".to_string());
+            return Ok(Routed::Served(outcome));
+        };
+
+        // (3) COMMIT the shared watermark FIRST — readers now skip <= segment.
+        self.shared.put_reclaim_watermark(shard, seq, segment)?;
+        outcome.reclaim_watermark_seq = seq;
+        outcome.reclaimed_through_segment = segment;
+
+        // (4) Reclaim locally to the boundary (write-forward + manifest + unlink).
+        let local = driver.reclaim_to_segment(segment)?;
+        outcome.local_segments_reclaimed = local.segments_reclaimed;
+
+        // (5) Delete the shared objects at/below the watermark (idempotent; a
+        //     crash here leaves orphans readers already skip).
+        let mut deleted = 0usize;
+        for id in self.shared.list_segment_ids(shard)? {
+            if id <= segment {
+                self.shared.delete_segment(shard, id)?;
+                deleted += 1;
+            }
+        }
+        outcome.shared_objects_deleted = deleted;
+        Ok(Routed::Served(outcome))
+    }
+}
+
+/// Secret-free outcome of a shared-tier reclamation for one owned shard — counts
+/// + the committed watermark, no payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedShardGcOutcome {
+    /// The shard reclaimed.
+    pub shard: u32,
+    /// The committed cross-replica reclaim watermark sequence (highest reclaimed
+    /// global sequence). 0 when nothing was reclaimed.
+    pub reclaim_watermark_seq: u64,
+    /// The committed watermark segment id (readers skip shared segments `<=` this).
+    pub reclaimed_through_segment: u64,
+    /// Local segment files unlinked this call.
+    pub local_segments_reclaimed: usize,
+    /// Shared segment objects deleted this call.
+    pub shared_objects_deleted: usize,
+    /// Why nothing (more) was reclaimed, or `None`. Secret-free.
+    pub note: Option<String>,
+}
+
+// ===========================================================================
+// Shared-tier segment-GC drive — proves coherent reclamation across the shared
+// medium: the owner reclaims local + shared, and BOTH a non-owner cold-load and
+// a NEW owner hydrating from shared see exactly the owner's retained set (no
+// re-pull of reclaimed segments, no un-reclaim on transfer, shared disk bounded).
+// ===========================================================================
+
+/// Secret-free proof of one shared-tier segment-GC cycle. Counts + verdicts only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedTierGcReport {
+    /// Replicas / shards in the simulated pool.
+    pub shard_count: u32,
+    /// Events appended to the reclaimed shard before GC.
+    pub appended: usize,
+    /// The durable-consumer cursor acked before GC (the interest watermark).
+    pub acked_through: u64,
+    /// The committed cross-replica reclaim watermark sequence.
+    pub reclaim_watermark_seq: u64,
+    /// Shared segment objects for the shard before / after GC (fewer ⇒ shared
+    /// disk was bounded, not just local).
+    pub shared_segments_before: usize,
+    pub shared_segments_after: usize,
+    /// The owner's retained log is gapless from the reclaimed base to the tip.
+    pub owner_retained_gapless: bool,
+    /// A non-owner cold-load from shared returns EXACTLY the owner's retained
+    /// records (same sequences + payloads) — it did not re-pull reclaimed
+    /// segments and diverge.
+    pub nonowner_coldload_coherent: bool,
+    /// A NEW owner with an empty local disk hydrates from shared, recovers the
+    /// same retained set with the base offset intact, and continues the sequence
+    /// (reclamation stuck across the ownership transfer — no un-reclaim).
+    pub new_owner_hydrate_coherent: bool,
+    /// The shared objects at/below the watermark were pruned (shared disk bounded).
+    pub shared_pruned: bool,
+    /// The single reason an invariant failed, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl SharedTierGcReport {
+    /// Whether reclamation was coherent across the shared medium AND bounded disk.
+    pub fn holds(&self) -> bool {
+        self.reclaim_watermark_seq > 0
+            && self.owner_retained_gapless
+            && self.nonowner_coldload_coherent
+            && self.new_owner_hydrate_coherent
+            && self.shared_pruned
+            && self.divergence.is_none()
+    }
+}
+
+/// Drive a coherent shared-tier segment-GC cycle under `root` with a
+/// `shard_count`-replica pool (each replica its own local disk, one shared
+/// store). Appends many events to a shard-0 execution under small segments (to
+/// force rollover), acks a durable consumer to ~3/4, reclaims shard 0 via the
+/// owner, then proves a non-owner cold-load and a fresh new-owner hydrate both
+/// see exactly the owner's retained set — no re-pull of reclaimed segments, no
+/// un-reclaim on transfer, shared disk bounded. `shard_count` must be `>= 2`.
+pub fn exercise_shared_tier_gc(
+    root: impl Into<PathBuf>,
+    shard_count: u32,
+) -> Result<SharedTierGcReport> {
+    if shard_count < 2 {
+        return Err(EhdbError::InvalidState(
+            "shared-tier GC drive requires shard_count >= 2".to_string(),
+        ));
+    }
+    let root = root.into();
+    let shared: Arc<dyn SharedSegmentBackend> =
+        Arc::new(FilesystemSharedBackend::open(root.join("shared"))?);
+    // Small segments so a modest event count rolls over into many segments.
+    let seg = 300u64;
+    let appended = 40usize;
+    let acked_through = (appended as u64 * 3 / 4).max(1);
+    let consumer = "projector";
+
+    // The shard-0 owner (replica 0) drives the whole cycle.
+    let owner = SharedTierEventLog::open_with_segment_size(
+        root.join("local-0"),
+        ShardOwnership::new(0, shard_count)?,
+        Arc::clone(&shared),
+        root.join("coldload-0"),
+        seg,
+    )?;
+    // A deterministic execution owned by shard 0.
+    let exec0 = one_execution_per_shard(shard_count)
+        .into_iter()
+        .find(|(_, s)| *s == 0)
+        .map(|(id, _)| id)
+        .ok_or_else(|| EhdbError::InvalidState("no shard-0 execution".to_string()))?;
+
+    let mut divergence: Option<String> = None;
+    for i in 1..=appended {
+        let served = owner.append(&EventLogAppendRequest {
+            execution_id: exec0.clone(),
+            transaction_id: format!("gc-{i:05}"),
+            payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+        })?;
+        if !served.is_served() {
+            record_first(&mut divergence, format!("owner did not serve append {i}"));
+        }
+    }
+    // Durable consumer acks ~3/4 (the interest watermark).
+    owner.tail(
+        0,
+        &EventLogTailRequest {
+            consumer: consumer.to_string(),
+            transaction_id: "gc-tail".to_string(),
+            limit: appended,
+        },
+    )?;
+    owner.ack(
+        0,
+        &EventLogAckRequest {
+            consumer: consumer.to_string(),
+            transaction_id: "gc-ack".to_string(),
+            sequence: acked_through,
+        },
+    )?;
+
+    let shared_segments_before = shared.list_segment_ids(0)?.len();
+
+    // --- Reclaim shard 0 (local + shared, watermark-first). ----------------
+    let gc = match owner.reclaim_shard(0, &SegmentGcPolicy::enabled(2))? {
+        Routed::Served(o) => o,
+        Routed::NotOwner { .. } => {
+            return Err(EhdbError::InvalidState(
+                "owner refused its own shard".to_string(),
+            ))
+        }
+    };
+    let reclaim_watermark_seq = gc.reclaim_watermark_seq;
+    let shared_segments_after = shared.list_segment_ids(0)?.len();
+    let shared_pruned = shared_segments_after < shared_segments_before;
+
+    // The owner's retained log: gapless from the base to the tip.
+    let owner_scan = owner.scan_shard(
+        0,
+        &EventLogScanRequest {
+            after: None,
+            limit: appended * 2,
+        },
+    )?;
+    let owner_seqs: Vec<u64> = owner_scan
+        .outcome
+        .records
+        .iter()
+        .map(|r| r.global_sequence)
+        .collect();
+    let expected: Vec<u64> = (reclaim_watermark_seq + 1..=appended as u64).collect();
+    let owner_retained_gapless = owner_seqs == expected;
+    if !owner_retained_gapless {
+        record_first(
+            &mut divergence,
+            format!("owner retained not gapless-from-base: {owner_seqs:?} != {expected:?}"),
+        );
+    }
+
+    // --- Non-owner cold-load from shared must equal the owner's retained set. --
+    let nonowner = SharedTierEventLog::open_with_segment_size(
+        root.join("local-nonowner"),
+        // Owns a different shard, so shard 0 is a cold-load from shared.
+        ShardOwnership::new(1, shard_count)?,
+        Arc::clone(&shared),
+        root.join("coldload-nonowner"),
+        seg,
+    )?;
+    let cold = nonowner.read_execution(&EventLogReadExecutionRequest {
+        execution_id: exec0.clone(),
+        after: None,
+        limit: appended * 2,
+    })?;
+    let cold_seqs: Vec<u64> = cold
+        .outcome
+        .records
+        .iter()
+        .map(|r| r.global_sequence)
+        .collect();
+    let owner_read = owner.read_execution(&EventLogReadExecutionRequest {
+        execution_id: exec0.clone(),
+        after: None,
+        limit: appended * 2,
+    })?;
+    let owner_read_seqs: Vec<u64> = owner_read
+        .outcome
+        .records
+        .iter()
+        .map(|r| r.global_sequence)
+        .collect();
+    let nonowner_coldload_coherent = cold.served_by == ServedBy::NonOwnerColdLoad
+        && cold_seqs == owner_read_seqs
+        && !cold_seqs.contains(&1)
+        && cold
+            .outcome
+            .records
+            .iter()
+            .zip(owner_read.outcome.records.iter())
+            .all(|(a, b)| a.global_sequence == b.global_sequence && a.payload == b.payload);
+    if !nonowner_coldload_coherent {
+        record_first(
+            &mut divergence,
+            format!("non-owner cold-load diverged: {cold_seqs:?} vs owner {owner_read_seqs:?}"),
+        );
+    }
+
+    // --- New owner (empty local disk) hydrates + continues, no un-reclaim. --
+    drop(owner);
+    let new_owner = SharedTierEventLog::open_with_segment_size(
+        root.join("local-newowner"),
+        ShardOwnership::new(0, shard_count)?,
+        Arc::clone(&shared),
+        root.join("coldload-newowner"),
+        seg,
+    )?;
+    new_owner.hydrate_owned_shard(0)?;
+    let hydrated = new_owner.scan_shard(
+        0,
+        &EventLogScanRequest {
+            after: None,
+            limit: appended * 2,
+        },
+    )?;
+    let hydrated_seqs: Vec<u64> = hydrated
+        .outcome
+        .records
+        .iter()
+        .map(|r| r.global_sequence)
+        .collect();
+    // Continue the sequence — the next append must be appended+1 (no un-reclaim
+    // would reset the base / duplicate).
+    let next = new_owner.append(&EventLogAppendRequest {
+        execution_id: exec0.clone(),
+        transaction_id: "gc-post".to_string(),
+        payload: "post-hydrate".to_string(),
+    })?;
+    let next_seq = next.served().map(|o| o.global_sequence).unwrap_or(0);
+    let new_owner_hydrate_coherent = hydrated.served_by == ServedBy::OwnerResident
+        && hydrated_seqs == expected
+        && next_seq == appended as u64 + 1;
+    if !new_owner_hydrate_coherent {
+        record_first(
+            &mut divergence,
+            format!(
+                "new-owner hydrate diverged: seqs {hydrated_seqs:?} (want {expected:?}), next {next_seq}"
+            ),
+        );
+    }
+
+    Ok(SharedTierGcReport {
+        shard_count,
+        appended,
+        acked_through,
+        reclaim_watermark_seq,
+        shared_segments_before,
+        shared_segments_after,
+        owner_retained_gapless,
+        nonowner_coldload_coherent,
+        new_owner_hydrate_coherent,
+        shared_pruned,
+        divergence,
+    })
 }
 
 // ===========================================================================
@@ -1944,6 +2460,208 @@ mod tests {
         // A mismatched committed_len is a hard error, not a silent overwrite.
         let err = d.append_segment(0, 1, 999, b"x").unwrap_err();
         assert!(err.to_string().contains("committed_len"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared-tier segment GC — coherent reclamation across the shared medium.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_backend_watermark_is_monotonic_and_delete_is_idempotent() {
+        let root = tmp_root("wm");
+        let backend = FilesystemSharedBackend::open(root.join("shared")).unwrap();
+        assert_eq!(backend.reclaim_watermark(0).unwrap(), (0, 0));
+        backend.put_reclaim_watermark(0, 100, 3).unwrap();
+        assert_eq!(backend.reclaim_watermark(0).unwrap(), (100, 3));
+        // A lower watermark never lowers the committed one (monotonic).
+        backend.put_reclaim_watermark(0, 50, 1).unwrap();
+        assert_eq!(backend.reclaim_watermark(0).unwrap(), (100, 3));
+        // A higher one advances.
+        backend.put_reclaim_watermark(0, 200, 6).unwrap();
+        assert_eq!(backend.reclaim_watermark(0).unwrap(), (200, 6));
+        // delete_segment is idempotent (absent = ok).
+        backend.delete_segment(0, 999).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_tier_gc_drive_holds_two_shards() {
+        let root = tmp_root("gc-drive2");
+        let report = exercise_shared_tier_gc(&root, 2).unwrap();
+        assert!(report.holds(), "{report:?}");
+        assert!(report.reclaim_watermark_seq > 0);
+        assert!(report.shared_segments_after < report.shared_segments_before);
+        assert!(report.owner_retained_gapless);
+        assert!(report.nonowner_coldload_coherent);
+        assert!(report.new_owner_hydrate_coherent);
+        assert!(report.shared_pruned);
+        assert!(report.divergence.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_tier_gc_drive_holds_four_shards() {
+        let root = tmp_root("gc-drive4");
+        let report = exercise_shared_tier_gc(&root, 4).unwrap();
+        assert!(report.holds(), "{report:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_tier_gc_requires_two_shards() {
+        let root = tmp_root("gc-drive1");
+        let err = exercise_shared_tier_gc(&root, 1).unwrap_err();
+        assert!(err.to_string().contains("shard_count >= 2"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclaim_shard_refused_on_non_owner() {
+        let root = tmp_root("gc-nonowner");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        // A replica that owns shard 1 cannot reclaim shard 0.
+        let replica = SharedTierEventLog::open(
+            root.join("local"),
+            ShardOwnership::new(1, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload"),
+        )
+        .unwrap();
+        let routed = replica
+            .reclaim_shard(0, &SegmentGcPolicy::enabled(2))
+            .unwrap();
+        assert_eq!(routed.owner_shard(), Some(0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crash_window_reconcile_realigns_owner_to_shared_watermark() {
+        // Simulate a crash AFTER the shared watermark was committed but BEFORE the
+        // owner reclaimed its local segments: the owner's local store is ahead of
+        // the shared watermark and would over-serve reclaimed sequences that a
+        // non-owner already skips. `reconcile_owned_shard` must realign it.
+        let root = tmp_root("gc-crashwindow");
+        let shared: Arc<dyn SharedSegmentBackend> =
+            Arc::new(FilesystemSharedBackend::open(root.join("shared")).unwrap());
+        let seg = 300u64;
+        let owner = SharedTierEventLog::open_with_segment_size(
+            root.join("local-0"),
+            ShardOwnership::new(0, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-0"),
+            seg,
+        )
+        .unwrap();
+        let exec0 = one_execution_per_shard(2)
+            .into_iter()
+            .find(|(_, s)| *s == 0)
+            .map(|(id, _)| id)
+            .unwrap();
+        for i in 1..=30 {
+            owner
+                .append(&EventLogAppendRequest {
+                    execution_id: exec0.clone(),
+                    transaction_id: format!("c-{i:05}"),
+                    payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+                })
+                .unwrap();
+        }
+        // Determine a mid segment id + its last seq from the owner's own view, then
+        // publish ONLY the shared watermark (simulating a crash before local +
+        // shared-object reclamation).
+        let driver = owner.local().owned_driver(0).unwrap();
+        let boundary = driver
+            .plan_reclaim_boundary(&SegmentGcPolicy::enabled(2))
+            .unwrap();
+        // Give the plan an interest watermark first: ack ~3/4.
+        owner
+            .tail(
+                0,
+                &EventLogTailRequest {
+                    consumer: "projector".to_string(),
+                    transaction_id: "t".to_string(),
+                    limit: 30,
+                },
+            )
+            .unwrap();
+        owner
+            .ack(
+                0,
+                &EventLogAckRequest {
+                    consumer: "projector".to_string(),
+                    transaction_id: "a".to_string(),
+                    sequence: 22,
+                },
+            )
+            .unwrap();
+        assert!(boundary.is_none(), "no interest before the ack");
+        let (seq, segment) = driver
+            .plan_reclaim_boundary(&SegmentGcPolicy::enabled(2))
+            .unwrap()
+            .expect("a boundary once a consumer has acked");
+        // Commit ONLY the shared watermark — local segments still present (crash).
+        shared.put_reclaim_watermark(0, seq, segment).unwrap();
+
+        // A non-owner cold-load already skips <= watermark (coherent immediately).
+        let nonowner = SharedTierEventLog::open_with_segment_size(
+            root.join("local-nonowner"),
+            ShardOwnership::new(1, 2).unwrap(),
+            Arc::clone(&shared),
+            root.join("coldload-nonowner"),
+            seg,
+        )
+        .unwrap();
+        let cold = nonowner
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: exec0.clone(),
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        let cold_min = cold.outcome.records.first().map(|r| r.global_sequence);
+        assert_eq!(
+            cold_min,
+            Some(seq + 1),
+            "non-owner skips reclaimed via watermark"
+        );
+
+        // The owner, still holding local segments, realigns on reconcile.
+        owner.reconcile_owned_shard(0).unwrap();
+        let owner_scan = owner
+            .scan_shard(
+                0,
+                &EventLogScanRequest {
+                    after: None,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        let owner_min = owner_scan
+            .outcome
+            .records
+            .first()
+            .map(|r| r.global_sequence);
+        assert_eq!(
+            owner_min,
+            Some(seq + 1),
+            "owner realigned to the shared watermark"
+        );
+        // Owner + non-owner now agree.
+        let owner_seqs: Vec<u64> = owner_scan
+            .outcome
+            .records
+            .iter()
+            .map(|r| r.global_sequence)
+            .collect();
+        let cold_seqs: Vec<u64> = cold
+            .outcome
+            .records
+            .iter()
+            .map(|r| r.global_sequence)
+            .collect();
+        assert_eq!(owner_seqs, cold_seqs);
         let _ = fs::remove_dir_all(&root);
     }
 }

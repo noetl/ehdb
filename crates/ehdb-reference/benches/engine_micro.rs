@@ -1021,11 +1021,112 @@ fn bench_segment_gc(c: &mut Criterion) {
     group.finish();
 }
 
+/// Shared-tier segment-GC (`reclaim_shard`) cost: local reclaim + the shared
+/// watermark commit + shared-object deletes, at a couple pre-warmed sizes. Like
+/// [`bench_segment_gc`] the per-iteration re-seed is O(S) `fsync`'d appends (each
+/// also publishes to shared), so sizes stay small; the point is that the
+/// shared-side work (one watermark write + a delete per reclaimed segment) is a
+/// small constant on top of the local reclaim.
+fn bench_shared_tier_gc(c: &mut Criterion) {
+    use std::sync::Arc;
+
+    use ehdb_reference::affinity::ShardOwnership;
+    use ehdb_reference::durable_eventlog::SegmentGcPolicy;
+    use ehdb_reference::durable_eventlog_shared::{
+        FilesystemSharedBackend, SharedSegmentBackend, SharedTierEventLog,
+    };
+    use ehdb_reference::{EventLogAckRequest, EventLogTailRequest};
+
+    let mut group = c.benchmark_group("eventlog_shared_tier_gc");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(1));
+
+    const SEG: u64 = 300;
+    let exec = format!("{}", 500_000_000_000u64);
+
+    // Small sizes: the per-iteration re-seed is O(S) `fsync`'d appends that ALSO
+    // publish to shared (two fsyncs each), so it dominates wall-clock; the
+    // measured `reclaim_shard` is the point, and it tracks the retained set + a
+    // small constant of shared ops, not S.
+    for &s in &[50u64, 150u64] {
+        let dirs: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment_shared/reclaim_shard_at_size", s),
+            &s,
+            |b, &s| {
+                let counter = AtomicU64::new(0);
+                b.iter_batched(
+                    || {
+                        let n = counter.fetch_add(1, Ordering::Relaxed);
+                        let dir = unique_dir(&format!("el-shared-gc-{s}-{n}"));
+                        let shared: Arc<dyn SharedSegmentBackend> =
+                            Arc::new(FilesystemSharedBackend::open(dir.join("shared")).unwrap());
+                        let owner = SharedTierEventLog::open_with_segment_size(
+                            dir.join("local"),
+                            ShardOwnership::single_owner(),
+                            Arc::clone(&shared),
+                            dir.join("coldload"),
+                            SEG,
+                        )
+                        .unwrap();
+                        for i in 0..s {
+                            owner
+                                .append(&EventLogAppendRequest {
+                                    execution_id: exec.clone(),
+                                    transaction_id: format!("seed-{i}"),
+                                    payload: event_payload(i, "exec-shared-gc"),
+                                })
+                                .unwrap();
+                        }
+                        owner
+                            .tail(
+                                0,
+                                &EventLogTailRequest {
+                                    consumer: "projector".to_string(),
+                                    transaction_id: "gc-tail".to_string(),
+                                    limit: s as usize,
+                                },
+                            )
+                            .unwrap();
+                        owner
+                            .ack(
+                                0,
+                                &EventLogAckRequest {
+                                    consumer: "projector".to_string(),
+                                    transaction_id: "gc-ack".to_string(),
+                                    sequence: (s * 3 / 4).max(1),
+                                },
+                            )
+                            .unwrap();
+                        (dir, owner)
+                    },
+                    |(dir, owner)| {
+                        black_box(
+                            owner
+                                .reclaim_shard(0, &SegmentGcPolicy::enabled(2))
+                                .unwrap(),
+                        );
+                        dirs.lock().unwrap().push(dir);
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+        for dir in dirs.lock().unwrap().iter() {
+            cleanup(dir);
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eventlog,
     bench_shared_tier_append,
     bench_segment_gc,
+    bench_shared_tier_gc,
     bench_projection,
     bench_kv,
     bench_object,

@@ -299,6 +299,21 @@ impl AffinityRoutedEventLog {
         Ok(out)
     }
 
+    /// The owned writable driver for a shard this replica owns (opened lazily,
+    /// `Arc`-shared). Errors if this replica does not own `shard` — opening a
+    /// non-owned shard writable would violate single-writer. Exposed so the
+    /// shared tier can drive segment GC (plan / reclaim-to-watermark) on the
+    /// owner's local store.
+    pub fn owned_driver(&self, shard: u32) -> Result<DurableEventLogDriver> {
+        if !self.ownership.owns_shard(shard) {
+            return Err(EhdbError::InvalidState(format!(
+                "cannot access shard {shard} writable: not owned by this replica (shard_index {})",
+                self.ownership.shard_index()
+            )));
+        }
+        self.owned_store(shard)
+    }
+
     /// Cold-load a read-only view of a shard this replica does not own.
     fn cold_load(&self, shard: u32) -> Result<DurableSegmentStore> {
         DurableSegmentStore::open_read_only_with_segment_size(
