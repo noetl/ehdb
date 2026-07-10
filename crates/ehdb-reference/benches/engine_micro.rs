@@ -937,10 +937,95 @@ fn bench_shared_tier_append(c: &mut Criterion) {
     group.finish();
 }
 
+/// Segment-GC (`reclaim_segments`) cost at a range of pre-warmed store sizes S.
+/// GC is off the append hot path (run periodically, not per-op), so what matters
+/// is that a reclamation stays affordable as the store grows — the interest
+/// watermark keeps the *retained* set bounded, so a reclaim replays only the
+/// surviving segments, not the whole history. Each iteration re-seeds a fresh
+/// S-event store with a consumer acked to ~3/4 (setup, untimed) and times a
+/// single `reclaim_segments` call.
+fn bench_segment_gc(c: &mut Criterion) {
+    use ehdb_reference::durable_eventlog::SegmentGcPolicy;
+    use ehdb_reference::{EventLogAckRequest, EventLogTailRequest};
+
+    let mut group = c.benchmark_group("eventlog_segment_gc");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(1));
+
+    // A realistic-ish segment size that still rolls many times over S events.
+    // Sizes stay modest: the per-iteration re-seed is O(S) fsync'd appends
+    // (untimed but wall-clock heavy), and the point under test is that a reclaim
+    // replays only the *surviving* segments, so the cost tracks the retained set,
+    // not S.
+    const SEG: u64 = 4096;
+    let exec = format!("{}", 500_000_000_000u64);
+
+    for &s in &[200u64, 800u64, 2_000u64] {
+        // Stash the per-iteration dirs and clean them AFTER the timed loop so the
+        // measurement covers only `reclaim_segments`, not teardown.
+        let dirs: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        group.bench_with_input(
+            BenchmarkId::new("durable_segment/reclaim_at_size", s),
+            &s,
+            |b, &s| {
+                let counter = AtomicU64::new(0);
+                b.iter_batched(
+                    || {
+                        let n = counter.fetch_add(1, Ordering::Relaxed);
+                        let dir = unique_dir(&format!("el-gc-{s}-{n}"));
+                        let driver =
+                            DurableEventLogDriver::open_with_segment_size(&dir, SEG).unwrap();
+                        for i in 0..s {
+                            driver
+                                .append(&EventLogAppendRequest {
+                                    execution_id: exec.clone(),
+                                    transaction_id: format!("seed-{i}"),
+                                    payload: event_payload(i, "exec-gc"),
+                                })
+                                .unwrap();
+                        }
+                        driver
+                            .tail(&EventLogTailRequest {
+                                consumer: "projector".to_string(),
+                                transaction_id: "gc-tail".to_string(),
+                                limit: s as usize,
+                            })
+                            .unwrap();
+                        driver
+                            .ack(&EventLogAckRequest {
+                                consumer: "projector".to_string(),
+                                transaction_id: "gc-ack".to_string(),
+                                sequence: (s * 3 / 4).max(1),
+                            })
+                            .unwrap();
+                        (dir, driver)
+                    },
+                    |(dir, driver)| {
+                        black_box(
+                            driver
+                                .reclaim_segments(&SegmentGcPolicy::enabled(2))
+                                .unwrap(),
+                        );
+                        dirs.lock().unwrap().push(dir);
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+        for dir in dirs.lock().unwrap().iter() {
+            cleanup(dir);
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_eventlog,
     bench_shared_tier_append,
+    bench_segment_gc,
     bench_projection,
     bench_kv,
     bench_object,

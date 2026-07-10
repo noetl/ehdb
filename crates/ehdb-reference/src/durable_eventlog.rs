@@ -112,6 +112,18 @@ const SEGMENT_SUFFIX: &str = ".eslog";
 /// replaying every segment to rebuild the offset index. Not a segment file, so
 /// [`DurableSegmentStore::segment_ids`] ignores it.
 const CHECKPOINT_FILE: &str = "checkpoint.json";
+/// Reclaim manifest file name — the durable, `fsync`'d record of how far
+/// segment GC has reclaimed (`reclaimed_through_seq` + `reclaimed_through_segment`).
+/// Unlike the checkpoint (an optimization cache that a crash may lose), this is
+/// durable **truth**: it is the *commit point* of a reclamation. A crash mid-GC
+/// replays to a consistent state — below-watermark segments still on disk are
+/// re-deleted, and the retained log's base offset (gapless-from-`reclaimed+1`) is
+/// honored. Not a segment file, so [`DurableSegmentStore::segment_ids`] ignores it.
+const RECLAIM_FILE: &str = "reclaim.json";
+/// Default floor for [`SegmentGcPolicy::min_retained_segments`] — always keep at
+/// least the active segment plus one sealed segment for late / debug readers,
+/// even when consumers have acked past them.
+pub const DEFAULT_MIN_RETAINED_SEGMENTS: usize = 2;
 
 /// One durable frame as serialized into a segment file.  Events and consumer
 /// state (create + ack) share the segment stream so a single replay rebuilds
@@ -173,6 +185,32 @@ struct StoreCheckpoint {
     consumer_acks: HashMap<String, u64>,
 }
 
+/// The durable, `fsync`'d reclaim manifest ([`RECLAIM_FILE`]) — the commit point
+/// of segment GC. It records how far reclamation has progressed so that:
+///
+/// * the retained log's **base offset** is authoritative — reads below
+///   `reclaimed_through_seq` report *reclaimed* (absent), and replay seeds the
+///   gapless-from-`reclaimed_through_seq + 1` sequence check;
+/// * a **crash mid-GC** is idempotently completed on the next open — any segment
+///   at/below `reclaimed_through_segment` still on disk (the manifest committed
+///   but the file deletes had not finished) is re-deleted.
+///
+/// It is written *after* the write-forward of durable-consumer state and *before*
+/// the segment files are unlinked, so it can never name reclamation that would
+/// lose data a surviving segment does not carry. A missing manifest ⇒ nothing
+/// reclaimed (the default, an un-GC'd store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ReclaimManifest {
+    /// Highest global sequence whose segment has been reclaimed (0 = none). Every
+    /// sequence `<=` this is gone from local disk; the retained log is gapless
+    /// from `reclaimed_through_seq + 1`.
+    reclaimed_through_seq: u64,
+    /// Highest reclaimed segment id (0 = none). Segments with id `<=` this are
+    /// reclaimed; a crash mid-GC leftover is re-deleted on the next open.
+    reclaimed_through_segment: u64,
+}
+
 /// A durable, append-only, segmented event-log store: the production disk
 /// format underneath the [`EventLogDriver`] contract.
 ///
@@ -213,6 +251,17 @@ pub struct DurableSegmentStore {
     /// replays on the first read ([`ensure_index_loaded`](Self::ensure_index_loaded));
     /// a full-replay open (fallback) or a read-only cold-load sets it `true`.
     index_loaded: bool,
+    /// Highest global sequence reclaimed by segment GC (0 = none). The retained
+    /// log is gapless from `reclaimed_through + 1`; a read below it reports
+    /// *reclaimed* (absent), never corruption. The offset index is base-shifted:
+    /// `events[i]` locates global sequence `reclaimed_through + i + 1`. Loaded
+    /// from the durable [`ReclaimManifest`] and recomputed from the first
+    /// surviving segment frame on replay. `0` for an un-GC'd store ⇒ every path
+    /// is byte-identical to the pre-GC backend.
+    reclaimed_through: u64,
+    /// Highest reclaimed segment id (0 = none) — the [`ReclaimManifest`] segment
+    /// anchor, used to re-delete a crash-mid-GC leftover segment on open.
+    reclaimed_segment: u64,
 }
 
 impl DurableSegmentStore {
@@ -276,6 +325,8 @@ impl DurableSegmentStore {
             read_only,
             event_count: 0,
             index_loaded: false,
+            reclaimed_through: 0,
+            reclaimed_segment: 0,
         };
         if read_only {
             // A cold-load of a never-written shard is an empty log; do not
@@ -299,6 +350,18 @@ impl DurableSegmentStore {
         if let Some(checkpoint) = store.load_checkpoint()? {
             if store.checkpoint_consistent(&checkpoint)? {
                 store.apply_checkpoint(checkpoint);
+                // The base offset is durable truth (the reclaim manifest), not
+                // part of the checkpoint cache — load it so `reclaimed_through()`
+                // and scan-start are correct before the first read. The first
+                // read (`ensure_index_loaded` → `replay`) recomputes it from disk
+                // and re-deletes any crash-mid-GC leftover segment.
+                let manifest = store.load_reclaim_manifest()?;
+                store.reclaimed_through = manifest.reclaimed_through_seq;
+                store.reclaimed_segment = manifest.reclaimed_through_segment;
+                // Complete a crashed GC eagerly (the replay that normally does
+                // this is skipped on the checkpoint-trust path), so a
+                // below-watermark leftover segment never lingers until a read.
+                store.reclaim_leftover_segments()?;
                 store.index_loaded = false;
                 return Ok(store);
             }
@@ -330,6 +393,13 @@ impl DurableSegmentStore {
     /// Whether the log is empty (no event ever appended).
     pub fn is_empty(&self) -> bool {
         self.event_count == 0
+    }
+
+    /// Highest global sequence reclaimed by segment GC (0 for an un-GC'd store).
+    /// The retained log is gapless from `reclaimed_through() + 1`; a scan / read
+    /// below it reports absent (reclaimed), never corruption.
+    pub fn reclaimed_through(&self) -> u64 {
+        self.reclaimed_through
     }
 
     /// The checkpoint sidecar path under the store root.
@@ -430,6 +500,78 @@ impl DurableSegmentStore {
         Ok(())
     }
 
+    /// The reclaim manifest sidecar path under the store root.
+    fn reclaim_manifest_path(&self) -> PathBuf {
+        self.root.join(RECLAIM_FILE)
+    }
+
+    /// Load the durable reclaim manifest, or the default (nothing reclaimed) when
+    /// absent. A decode error is treated as absent — an un-GC'd store is the
+    /// fail-safe (nothing was ever reclaimed, so the full log is retained).
+    fn load_reclaim_manifest(&self) -> Result<ReclaimManifest> {
+        match fs::read(self.reclaim_manifest_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ReclaimManifest::default())
+            }
+            Err(err) => Err(EhdbError::Storage(err.to_string())),
+        }
+    }
+
+    /// Persist the reclaim manifest **durably** — the commit point of a
+    /// reclamation. Unlike the checkpoint (an optimization written without
+    /// `fsync`), this is truth: the temp file is `fsync`'d, atomically renamed,
+    /// and the directory entry `fsync`'d, so a crash after this returns can never
+    /// lose the record that the segments below the watermark are being reclaimed.
+    /// A read-only cold-load view never reclaims, so it never writes one.
+    fn persist_reclaim_manifest(&self, manifest: &ReclaimManifest) -> Result<()> {
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|err| EhdbError::Storage(format!("encode reclaim manifest: {err}")))?;
+        let path = self.reclaim_manifest_path();
+        let tmp = self.root.join(format!("{RECLAIM_FILE}.tmp"));
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.write_all(&bytes)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.sync_all()
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // `fsync` the directory so the rename (and thus the manifest) is durable
+        // across a crash. Best-effort on platforms where a dir handle cannot be
+        // opened for sync; the temp-file `fsync` + rename already gives atomicity.
+        if let Ok(dir) = File::open(&self.root) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Delete any segment at/below the reclaimed watermark still on disk — a
+    /// crash between the reclaim-manifest commit and the segment unlinks. This
+    /// completes a crashed GC even on the checkpoint-trust open (which skips the
+    /// replay that would otherwise do it), so a below-watermark leftover never
+    /// lingers waiting for the first read. Idempotent; a no-op on a read-only
+    /// view or an un-GC'd store.
+    fn reclaim_leftover_segments(&self) -> Result<()> {
+        if self.read_only || self.reclaimed_segment == 0 {
+            return Ok(());
+        }
+        for id in self.segment_ids()? {
+            if id <= self.reclaimed_segment {
+                let path = self.segment_path(id);
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Materialize the full offset index if a checkpoint-trust open left it lazy.
     /// This is where the replay-is-truth integrity check (CRC + gapless sequence)
     /// runs for a checkpoint-opened store — corruption is caught on the first
@@ -479,9 +621,28 @@ impl DurableSegmentStore {
         self.consumer_acks.clear();
         self.active_segment_id = 0;
         self.active_len = 0;
+        self.reclaimed_through = 0;
+
+        // Honor a committed reclaim manifest (segment GC): segments at/below
+        // `reclaimed_through_segment` are reclaimed. A writable owner re-deletes
+        // any that linger from a crash between the manifest commit and the file
+        // unlinks (idempotent GC completion); a read-only cold-load view only
+        // skips them (never mutates another owner's shard).
+        let manifest = self.load_reclaim_manifest()?;
+        self.reclaimed_segment = manifest.reclaimed_through_segment;
 
         let ids = self.segment_ids()?;
         for id in &ids {
+            if *id <= manifest.reclaimed_through_segment {
+                if !self.read_only {
+                    let path = self.segment_path(*id);
+                    if path.exists() {
+                        fs::remove_file(&path)
+                            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+                    }
+                }
+                continue;
+            }
             let path = self.segment_path(*id);
             let bytes = fs::read(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
             let good_len = self.replay_segment(*id, &bytes)?;
@@ -499,9 +660,18 @@ impl DurableSegmentStore {
             self.active_segment_id = *id;
             self.active_len = good_len;
         }
-        // The offset index now holds every durable event; keep the explicit
-        // counter in lockstep (it is authoritative for the append hot path).
-        self.event_count = self.events.len() as u64;
+        // The first surviving event frame seeded `reclaimed_through` (the base
+        // offset) in `apply_frame`; the manifest's sequence is the durable floor.
+        // For a whole-segment reclamation the surviving segment's first frame is
+        // exactly `reclaimed_through_seq + 1`, so the two agree — the max is
+        // defensive.
+        if manifest.reclaimed_through_seq > self.reclaimed_through {
+            self.reclaimed_through = manifest.reclaimed_through_seq;
+        }
+        // The offset index now holds every *retained* durable event; the explicit
+        // counter is the absolute tip (base + retained), authoritative for the
+        // append hot path.
+        self.event_count = self.reclaimed_through + self.events.len() as u64;
         Ok(())
     }
 
@@ -561,11 +731,20 @@ impl DurableSegmentStore {
                 execution_id,
                 ..
             } => {
-                let expected = self.events.len() as u64 + 1;
-                if global_sequence != expected {
-                    return Err(EhdbError::Storage(format!(
-                        "durable event-log: replay sequence gap, expected {expected} got {global_sequence}"
-                    )));
+                if self.events.is_empty() {
+                    // The first surviving event frame defines the retained base
+                    // offset: `1` (base 0) for an un-reclaimed log, or the first
+                    // sequence that survived segment GC (base
+                    // `first_seq - 1`). Subsequent frames are checked gapless
+                    // from this base.
+                    self.reclaimed_through = global_sequence.saturating_sub(1);
+                } else {
+                    let expected = self.reclaimed_through + self.events.len() as u64 + 1;
+                    if global_sequence != expected {
+                        return Err(EhdbError::Storage(format!(
+                            "durable event-log: replay sequence gap, expected {expected} got {global_sequence}"
+                        )));
+                    }
                 }
                 self.events.push(EventLoc { segment_id, offset });
                 self.by_execution
@@ -612,9 +791,12 @@ impl DurableSegmentStore {
         let frame_len = (FRAME_HEADER_LEN + body.len()) as u64;
 
         // First append ever, or the active segment is full → start a new one.
-        // A frame never spans two segments (the offset index stays valid).
+        // A frame never spans two segments (the offset index stays valid). A
+        // fresh segment starts at `reclaimed_segment + 1` so a new id can never
+        // collide with (and be re-deleted as) a reclaimed one — `reclaimed_segment`
+        // is 0 for an un-GC'd store, so this is the usual `1`.
         if self.active_segment_id == 0 {
-            self.active_segment_id = 1;
+            self.active_segment_id = self.reclaimed_segment + 1;
             self.active_len = 0;
         } else if self.active_len > 0 && self.active_len + frame_len > self.segment_max_bytes {
             self.active_segment_id += 1;
@@ -652,9 +834,18 @@ impl DurableSegmentStore {
 
     /// Cold-load one event frame's body from its segment file and project it.
     fn read_event(&self, global_sequence: u64) -> Result<EventLogRecordView> {
+        // A sequence below the reclaimed base is gone from local disk — report it
+        // as reclaimed (absent), distinct from corruption. Callers (`scan_global`)
+        // start at the base, so this only fires on an explicit stale read.
+        if global_sequence <= self.reclaimed_through {
+            return Err(EhdbError::InvalidState(format!(
+                "durable event-log: global sequence {global_sequence} was reclaimed by segment GC (retained from {})",
+                self.reclaimed_through + 1
+            )));
+        }
         let loc = self
             .events
-            .get((global_sequence - 1) as usize)
+            .get((global_sequence - self.reclaimed_through - 1) as usize)
             .copied()
             .ok_or_else(|| {
                 EhdbError::InvalidState(format!(
@@ -765,8 +956,10 @@ impl DurableSegmentStore {
                 records: Vec::new(),
             });
         }
-        let after = request.after.unwrap_or(0);
-        let total = self.events.len() as u64;
+        // Never scan below the reclaimed base — those sequences are gone from
+        // local disk. `total` is the absolute tip (base + retained events).
+        let after = request.after.unwrap_or(0).max(self.reclaimed_through);
+        let total = self.event_count;
         let mut records = Vec::new();
         let mut record_count = 0usize;
         let mut seq = after + 1;
@@ -863,10 +1056,13 @@ impl DurableSegmentStore {
         }
         let acked = self.consumer_acks.get(&consumer).copied();
         let cursor = acked.unwrap_or(0);
-        let total = self.events.len() as u64;
+        // `total` is the absolute tip (base + retained); never tail below the
+        // reclaimed base (a consumer that has acked past the watermark — the
+        // precondition for reclamation — already sits at/above it).
+        let total = self.event_count;
         let mut records = Vec::new();
         let mut pending_count = 0usize;
-        let mut seq = cursor + 1;
+        let mut seq = cursor.max(self.reclaimed_through) + 1;
         while seq <= total {
             pending_count += 1;
             if records.len() < request.limit {
@@ -922,6 +1118,188 @@ impl DurableSegmentStore {
             consumer,
             acked_sequence: request.sequence,
         })
+    }
+
+    /// `(segment_id, last_global_sequence)` for every event-bearing segment, in
+    /// ascending segment order — derived from the resident offset index (caller
+    /// must have loaded it). Consumer-only segments (e.g. a rotated active
+    /// segment holding just write-forward `Ack` frames) carry no event and are
+    /// absent; they are never reclaim candidates anyway (the active segment is
+    /// never reclaimed).
+    fn segment_last_sequences(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for (i, loc) in self.events.iter().enumerate() {
+            let seq = self.reclaimed_through + i as u64 + 1;
+            match out.last_mut() {
+                Some((seg, last)) if *seg == loc.segment_id => *last = seq,
+                _ => out.push((loc.segment_id, seq)),
+            }
+        }
+        out
+    }
+
+    /// Reclaim sealed segments a durable consumer has already consumed — the
+    /// **interest-based segment GC** that bounds on-disk growth (the runbook §C
+    /// residual-risk R1 / D11 gap). Disabled unless `policy.enabled`; a disabled
+    /// call reclaims nothing and is a no-op (the fail-safe default, so an
+    /// un-opted-in store's on-disk behavior is byte-identical to the pre-GC
+    /// backend).
+    ///
+    /// ## Retention rule
+    ///
+    /// A sealed segment `S` is reclaimable when **every** durable consumer has
+    /// acked past `S`'s last global sequence (the interest watermark), respecting
+    /// a `min_retained_segments` floor. Concretely:
+    ///
+    /// 1. `watermark = min` over all durable consumers of their ack cursor. No
+    ///    consumer, or any consumer that has acked nothing ⇒ `watermark = 0` ⇒
+    ///    nothing is reclaimed (no interest means no event may be dropped).
+    /// 2. Reclaim the contiguous **prefix** of sealed segments whose last global
+    ///    sequence `<= watermark`, keeping at least `min_retained_segments`
+    ///    most-recent segments (including the active one, which is never
+    ///    reclaimable).
+    ///
+    /// ## Crash safety
+    ///
+    /// The reclamation is a durable, crash-atomic sequence:
+    ///
+    /// 1. **Write-forward** the current durable-consumer state (`Ack` frames at
+    ///    each consumer's cursor) into the active segment + `fsync`, so
+    ///    replay-is-truth survives deleting the segments that physically held the
+    ///    earlier `ConsumerCreate` / `Ack` frames. (Every consumer has acked
+    ///    `>= watermark >= reclaimed_seq`, so a re-asserted `Ack` re-establishes
+    ///    both the consumer and its cursor from surviving segments alone.)
+    /// 2. **Commit** the `fsync`'d [`ReclaimManifest`] — the point of no return.
+    /// 3. **Unlink** the reclaimed segment files (best-effort — a crash here
+    ///    leaves below-watermark leftovers the next open re-deletes via the
+    ///    manifest, so the outcome is identical either way).
+    /// 4. **Replay** to rebuild the in-memory index with the new base offset, and
+    ///    refresh the checkpoint sidecar.
+    ///
+    /// A read-only cold-load view cannot reclaim (it is not the shard owner).
+    pub fn reclaim_segments(&mut self, policy: &SegmentGcPolicy) -> Result<SegmentGcOutcome> {
+        if self.read_only {
+            return Err(EhdbError::InvalidState(
+                "durable event-log: read-only cold-load view cannot reclaim segments (not the shard owner)"
+                    .to_string(),
+            ));
+        }
+        let mut outcome = SegmentGcOutcome {
+            enabled: policy.enabled,
+            segments_reclaimed: 0,
+            events_reclaimed: 0,
+            reclaim_watermark: 0,
+            reclaimed_through_seq: self.reclaimed_through,
+            segments_retained: 0,
+            note: None,
+        };
+        if !policy.enabled {
+            outcome.note = Some("segment GC disabled".to_string());
+            outcome.segments_retained = self.segment_ids()?.len();
+            return Ok(outcome);
+        }
+        // Reclamation reads the segment→sequence layout — materialize the index.
+        self.ensure_index_loaded()?;
+
+        // (1) Interest watermark: the highest global sequence EVERY durable
+        //     consumer has acked past. No interest ⇒ 0 ⇒ reclaim nothing.
+        let watermark = if self.consumers_seen.is_empty() {
+            0
+        } else {
+            self.consumers_seen
+                .iter()
+                .map(|c| self.consumer_acks.get(c).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0)
+        };
+        outcome.reclaim_watermark = watermark;
+        if watermark == 0 {
+            outcome.note = Some(if self.consumers_seen.is_empty() {
+                "no durable consumer — nothing acked, nothing reclaimable".to_string()
+            } else {
+                "a durable consumer has acked nothing (watermark 0) — nothing reclaimable"
+                    .to_string()
+            });
+            outcome.segments_retained = self.segment_ids()?.len();
+            return Ok(outcome);
+        }
+
+        // (2) Select the contiguous prefix of sealed, event-bearing segments
+        //     whose last sequence is <= watermark, keeping the min-retained floor.
+        let seg_last = self.segment_last_sequences();
+        let total_segments = self.segment_ids()?.len();
+        let keep_floor = policy.min_retained_segments.max(1);
+        let max_reclaimable = total_segments.saturating_sub(keep_floor);
+        let mut reclaim_count = 0usize;
+        for (i, (seg_id, last_seq)) in seg_last.iter().enumerate() {
+            if i >= max_reclaimable {
+                break;
+            }
+            // The active (appended-to) segment is never reclaimed.
+            if *seg_id >= self.active_segment_id {
+                break;
+            }
+            if *last_seq <= watermark {
+                reclaim_count = i + 1;
+            } else {
+                break; // watermark reached — later segments are still needed.
+            }
+        }
+        if reclaim_count == 0 {
+            outcome.note = Some(
+                "no sealed segment fully below the watermark within the min-retained floor"
+                    .to_string(),
+            );
+            outcome.segments_retained = total_segments;
+            return Ok(outcome);
+        }
+        let reclaim_set: Vec<(u64, u64)> = seg_last[..reclaim_count].to_vec();
+        let reclaimed_segment = reclaim_set.last().map(|(s, _)| *s).unwrap();
+        let reclaimed_seq = reclaim_set.last().map(|(_, s)| *s).unwrap();
+        let events_reclaimed = reclaimed_seq - self.reclaimed_through;
+
+        // (3) Write-forward durable-consumer state so replay-is-truth survives the
+        //     unlink of segments that physically held the earlier consumer frames.
+        let consumers: Vec<(String, u64)> = self
+            .consumers_seen
+            .iter()
+            .map(|c| (c.clone(), self.consumer_acks.get(c).copied().unwrap_or(0)))
+            .collect();
+        for (consumer, cursor) in &consumers {
+            // A re-asserted `Ack` frame's replay re-inserts the consumer into
+            // `consumers_seen` and re-establishes its cursor — so the surviving
+            // segments alone reconstruct full consumer state after reclamation.
+            self.write_frame(&SegmentFrame::Ack {
+                consumer: consumer.clone(),
+                sequence: *cursor,
+            })?;
+        }
+
+        // (4) COMMIT: the `fsync`'d reclaim manifest is the point of no return.
+        self.persist_reclaim_manifest(&ReclaimManifest {
+            reclaimed_through_seq: reclaimed_seq,
+            reclaimed_through_segment: reclaimed_segment,
+        })?;
+
+        // (5) Unlink the reclaimed segment files (a crash here is re-completed on
+        //     the next open via the manifest).
+        for (seg_id, _) in &reclaim_set {
+            let path = self.segment_path(*seg_id);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            }
+        }
+
+        // (6) Rebuild the in-memory index with the new base offset, and refresh
+        //     the O(1) checkpoint sidecar for the next open.
+        self.replay()?;
+        self.persist_checkpoint()?;
+
+        outcome.segments_reclaimed = reclaim_set.len();
+        outcome.events_reclaimed = events_reclaimed;
+        outcome.reclaimed_through_seq = self.reclaimed_through;
+        outcome.segments_retained = self.segment_ids()?.len();
+        Ok(outcome)
     }
 }
 
@@ -1064,6 +1442,18 @@ impl DurableEventLogDriver {
             EhdbError::InvalidState("durable event-log store lock poisoned".to_string())
         })
     }
+
+    /// Reclaim sealed segments a durable consumer has already consumed (segment
+    /// GC). See [`DurableSegmentStore::reclaim_segments`]. A no-op unless
+    /// `policy.enabled`.
+    pub fn reclaim_segments(&self, policy: &SegmentGcPolicy) -> Result<SegmentGcOutcome> {
+        self.lock()?.reclaim_segments(policy)
+    }
+
+    /// Highest global sequence reclaimed by segment GC (0 for an un-GC'd store).
+    pub fn reclaimed_through(&self) -> Result<u64> {
+        Ok(self.lock()?.reclaimed_through())
+    }
 }
 
 impl EventLogDriver for DurableEventLogDriver {
@@ -1140,6 +1530,100 @@ impl EventLogStorageBackend {
             _ => EventLogStorageBackend::LocalReference,
         }
     }
+}
+
+/// Retention policy for reclaiming consumed sealed segments — the interest-based
+/// **segment GC** that bounds the durable backend's on-disk growth (the
+/// prod-cutover runbook §C residual-risk R1 / the D11 gap that blocked Stage C).
+///
+/// The default is **disabled** (`enabled: false`), so an operator must opt in
+/// exactly like [`EventLogStorageBackend`]: an un-opted-in store reclaims
+/// nothing and its on-disk behavior is byte-identical to the pre-GC backend.
+/// Orthogonal to the tier-mode (`off`/`shadow`/`primary`) and storage-backend
+/// (`local_reference`/`durable_segment`) axes — GC only applies to the durable
+/// segment backend, and only when explicitly enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentGcPolicy {
+    /// Master switch. `false` ⇒ [`DurableSegmentStore::reclaim_segments`] is a
+    /// no-op that reclaims nothing (the fail-safe default).
+    pub enabled: bool,
+    /// Always keep at least this many most-recent segments (including the active
+    /// one, which is never reclaimable regardless), even when consumers have
+    /// acked past them — a floor for late / debug readers. Clamped to `>= 1`.
+    pub min_retained_segments: usize,
+}
+
+impl Default for SegmentGcPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_retained_segments: DEFAULT_MIN_RETAINED_SEGMENTS,
+        }
+    }
+}
+
+impl SegmentGcPolicy {
+    /// The env var that enables segment GC: `consumer_ack` (or `on` / `enabled`)
+    /// turns it on; unset / empty / unrecognised leaves it **off** (fail-safe).
+    pub const ENV_VAR: &'static str = "NOETL_EHDB_EVENTLOG_GC";
+    /// The env var that overrides [`Self::min_retained_segments`].
+    pub const MIN_RETAINED_ENV_VAR: &'static str = "NOETL_EHDB_EVENTLOG_GC_MIN_RETAINED_SEGMENTS";
+
+    /// A convenience constructor for an enabled policy with an explicit floor
+    /// (clamped to `>= 1`).
+    pub fn enabled(min_retained_segments: usize) -> Self {
+        Self {
+            enabled: true,
+            min_retained_segments: min_retained_segments.max(1),
+        }
+    }
+
+    /// Fail-safe parse from the two env-var values. Only the exact tokens
+    /// `consumer_ack` / `on` / `enabled` (case-insensitive, trimmed) enable GC;
+    /// everything else — unset, empty, unrecognised — leaves it disabled, so an
+    /// unknown value never silently starts dropping segments. A non-numeric /
+    /// zero min-retained falls back to [`DEFAULT_MIN_RETAINED_SEGMENTS`].
+    pub fn from_raw(mode: Option<&str>, min_retained: Option<&str>) -> Self {
+        let enabled = matches!(
+            mode.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+            Some("consumer_ack") | Some("on") | Some("enabled")
+        );
+        let min_retained_segments = min_retained
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_MIN_RETAINED_SEGMENTS);
+        Self {
+            enabled,
+            min_retained_segments,
+        }
+    }
+}
+
+/// Secret-free outcome of one [`DurableSegmentStore::reclaim_segments`] call —
+/// counts + verdicts, no payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentGcOutcome {
+    /// Whether GC ran (policy enabled). `false` ⇒ everything below is zero.
+    pub enabled: bool,
+    /// Segments reclaimed (unlinked) this call.
+    pub segments_reclaimed: usize,
+    /// Events dropped from local disk this call (their count in the reclaimed
+    /// segments).
+    pub events_reclaimed: u64,
+    /// The reclaim watermark = the lowest durable-consumer ack cursor (the
+    /// highest global sequence *every* consumer has acked past). `0` when no
+    /// consumer has acked / none exists ⇒ nothing reclaimable.
+    pub reclaim_watermark: u64,
+    /// Highest global sequence reclaimed across the store's lifetime after this
+    /// call (== the reclaim manifest's `reclaimed_through_seq`).
+    pub reclaimed_through_seq: u64,
+    /// Segments remaining on disk after this call (including the active one).
+    pub segments_retained: usize,
+    /// Why nothing (more) was reclaimed, or `None` when the eligible set was
+    /// fully reclaimed. Secret-free (counts + reasons only).
+    pub note: Option<String>,
 }
 
 // ===========================================================================
@@ -1315,6 +1799,203 @@ pub fn exercise_durable_recovery(
         payloads_match,
         cursor_survived,
         pending_after_restart,
+        divergence,
+    })
+}
+
+// ===========================================================================
+// Segment-GC drive — proves interest-based reclamation bounds on-disk growth
+// while preserving the retained log's zero-loss + gapless-from-base contract
+// and surviving a restart (crash recovery after GC).
+// ===========================================================================
+
+/// Secret-free proof of one segment-GC cycle: how much a reclamation dropped and
+/// that the retained log stayed correct + recoverable. Counts + verdicts only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentGcDriveReport {
+    /// The backing driver name.
+    pub driver_name: String,
+    /// Events appended before reclamation.
+    pub appended: usize,
+    /// The rollover threshold used (small, to force multi-segment rollover).
+    pub segment_max_bytes: u64,
+    /// The durable-consumer cursor acked before reclamation (the interest
+    /// watermark).
+    pub acked_through: u64,
+    /// Segment files on disk before reclamation.
+    pub segments_before: usize,
+    /// Segment files on disk after reclamation (fewer ⇒ growth was bounded).
+    pub segments_after: usize,
+    /// Segments reclaimed this cycle.
+    pub segments_reclaimed: usize,
+    /// Events dropped from local disk this cycle.
+    pub events_reclaimed: u64,
+    /// Highest global sequence reclaimed (the new base offset).
+    pub reclaimed_through_seq: u64,
+    /// After reclamation the retained log replays gapless from
+    /// `reclaimed_through_seq + 1 ..= appended` with zero loss of retained events.
+    pub retained_zero_loss: bool,
+    /// Reclaimed sequences are absent from reads (the scan starts at the base;
+    /// sequence 1 is gone) — reclamation actually dropped data, not just relabelled.
+    pub reclaimed_reads_absent: bool,
+    /// A simulated restart (a fresh driver over the same root) recovers the
+    /// identical retained set with the base offset intact — crash recovery after GC.
+    pub restart_recovers: bool,
+    /// The durable-consumer cursor survived reclamation (write-forward of
+    /// consumer state before the reclaimed segments were unlinked).
+    pub cursor_survived: bool,
+    /// The single reason an invariant failed, or `None`.
+    pub divergence: Option<String>,
+}
+
+impl SegmentGcDriveReport {
+    /// Whether reclamation bounded growth AND preserved every retained-log
+    /// invariant + recovery.
+    pub fn holds(&self) -> bool {
+        self.segments_reclaimed > 0
+            && self.segments_after < self.segments_before
+            && self.retained_zero_loss
+            && self.reclaimed_reads_absent
+            && self.restart_recovers
+            && self.cursor_survived
+            && self.divergence.is_none()
+    }
+}
+
+/// Drive a segment-GC cycle over the store rooted at `root`: append `appended`
+/// events under a small `segment_max_bytes` (to force rollover across many
+/// segments), ack a durable consumer to `~3/4` of the log, reclaim under
+/// `policy`, then verify the retained log is still gapless-from-base + zero-loss,
+/// the reclaimed sequences are gone, the consumer cursor survived, and a fresh
+/// reopen (simulated restart) recovers the identical retained set.
+///
+/// `appended` must be `>= 4` so there is room to reclaim within the min-retained
+/// floor; `policy` should be enabled (a disabled policy reclaims nothing and the
+/// drive reports `segments_reclaimed == 0`, failing [`SegmentGcDriveReport::holds`]).
+pub fn exercise_segment_gc(
+    root: impl Into<PathBuf>,
+    appended: usize,
+    segment_max_bytes: u64,
+    policy: &SegmentGcPolicy,
+    consumer: &str,
+) -> Result<SegmentGcDriveReport> {
+    if appended < 4 {
+        return Err(EhdbError::InvalidState(
+            "segment-GC drive requires at least 4 events".to_string(),
+        ));
+    }
+    let root = root.into();
+
+    let driver = DurableEventLogDriver::open_with_segment_size(&root, segment_max_bytes)?;
+    for i in 1..=appended {
+        driver.append(&EventLogAppendRequest {
+            execution_id: "100".to_string(),
+            // A wide-ish payload so a small segment holds only a few frames and
+            // rollover fires often (many reclaim candidates).
+            transaction_id: format!("gc-txn-{i:05}"),
+            payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+        })?;
+    }
+
+    // A durable consumer acks ~3/4 of the log — the interest watermark.
+    driver.tail(&EventLogTailRequest {
+        consumer: consumer.to_string(),
+        transaction_id: "gc-tail".to_string(),
+        limit: appended,
+    })?;
+    let acked_through = ((appended as u64) * 3 / 4).max(1);
+    driver.ack(&EventLogAckRequest {
+        consumer: consumer.to_string(),
+        transaction_id: "gc-ack".to_string(),
+        sequence: acked_through,
+    })?;
+
+    let segments_before = list_segment_files(&root)?.len();
+    let gc = driver.reclaim_segments(policy)?;
+    let segments_after = list_segment_files(&root)?.len();
+    let reclaimed_through_seq = gc.reclaimed_through_seq;
+
+    // Retained log: gapless from base to tip, zero loss of retained events.
+    let scan = driver.scan_global(&EventLogScanRequest {
+        after: None,
+        limit: appended * 2,
+    })?;
+    let retained_seqs: Vec<u64> = scan.records.iter().map(|r| r.global_sequence).collect();
+    let expected: Vec<u64> = (reclaimed_through_seq + 1..=appended as u64).collect();
+    let retained_zero_loss = retained_seqs == expected && scan.record_count == expected.len();
+
+    // Reclaimed sequences are absent from reads (the scan starts at the base).
+    let reclaimed_reads_absent = reclaimed_through_seq == 0
+        || (retained_seqs.first() == Some(&(reclaimed_through_seq + 1))
+            && !retained_seqs.contains(&1));
+
+    // The durable cursor survived the write-forward + reclamation.
+    let tail = driver.tail(&EventLogTailRequest {
+        consumer: consumer.to_string(),
+        transaction_id: "gc-tail-2".to_string(),
+        limit: appended,
+    })?;
+    // The cursor survived AND pending is computed off the absolute tip (base +
+    // retained), not the retained count — i.e. `appended - acked_through`.
+    let cursor_survived = tail.acked_sequence == Some(acked_through)
+        && !tail.created_consumer
+        && tail.pending_count as u64 == appended as u64 - acked_through;
+
+    // Simulated restart: a fresh driver over the same root replays the retained
+    // segments + honors the durable reclaim manifest (base offset intact).
+    drop(driver);
+    let reopened = DurableEventLogDriver::open_with_segment_size(&root, segment_max_bytes)?;
+    let rescan = reopened.scan_global(&EventLogScanRequest {
+        after: None,
+        limit: appended * 2,
+    })?;
+    let restart_seqs: Vec<u64> = rescan.records.iter().map(|r| r.global_sequence).collect();
+    let restart_recovers =
+        restart_seqs == expected && reopened.reclaimed_through()? == reclaimed_through_seq;
+
+    let divergence = if gc.segments_reclaimed == 0 {
+        Some(format!(
+            "nothing reclaimed: watermark={} note={:?}",
+            gc.reclaim_watermark, gc.note
+        ))
+    } else if segments_after >= segments_before {
+        Some(format!(
+            "growth not bounded: {segments_before} → {segments_after} segments"
+        ))
+    } else if !retained_zero_loss {
+        Some(format!(
+            "retained log not gapless-from-base: got {retained_seqs:?}, expected {expected:?}"
+        ))
+    } else if !reclaimed_reads_absent {
+        Some("reclaimed sequences still readable".to_string())
+    } else if !cursor_survived {
+        Some(format!(
+            "durable cursor lost across reclamation: acked={:?} created={}",
+            tail.acked_sequence, tail.created_consumer
+        ))
+    } else if !restart_recovers {
+        Some(format!(
+            "restart did not recover retained set: got {restart_seqs:?}, expected {expected:?}"
+        ))
+    } else {
+        None
+    };
+
+    Ok(SegmentGcDriveReport {
+        driver_name: reopened.driver_name().to_string(),
+        appended,
+        segment_max_bytes,
+        acked_through,
+        segments_before,
+        segments_after,
+        segments_reclaimed: gc.segments_reclaimed,
+        events_reclaimed: gc.events_reclaimed,
+        reclaimed_through_seq,
+        retained_zero_loss,
+        reclaimed_reads_absent,
+        restart_recovers,
+        cursor_survived,
         divergence,
     })
 }
@@ -2169,6 +2850,326 @@ mod tests {
         assert_eq!(tail.acked_sequence, Some(5));
         assert!(!tail.created_consumer, "consumer-create survived reopen");
         assert_eq!(tail.pending_count, 15);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment GC — interest-based reclamation (noetl/ehdb#254 slice, D11 gap).
+    // -----------------------------------------------------------------------
+
+    /// Append `n` wide-ish events under a small segment size so rollover fires
+    /// often, then tail+ack a durable consumer to `acked` — the setup every GC
+    /// test shares.
+    fn seed_for_gc(root: &Path, n: u64, seg_size: u64, consumer: &str, acked: u64) {
+        let mut store = DurableSegmentStore::open_with_segment_size(root, seg_size).unwrap();
+        for i in 1..=n {
+            append(
+                &mut store,
+                "100",
+                i,
+                &format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+            );
+        }
+        store
+            .tail(&EventLogTailRequest {
+                consumer: consumer.to_string(),
+                transaction_id: "gc-seed-tail".to_string(),
+                limit: n as usize,
+            })
+            .unwrap();
+        if acked > 0 {
+            store
+                .ack(&EventLogAckRequest {
+                    consumer: consumer.to_string(),
+                    transaction_id: "gc-seed-ack".to_string(),
+                    sequence: acked,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn gc_disabled_is_a_noop() {
+        let root = tmp_root("gc-off");
+        seed_for_gc(&root, 20, 220, "projector", 15);
+        let before = list_segment_files(&root).unwrap().len();
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        // Default policy is disabled — nothing reclaimed, on-disk unchanged.
+        let out = store.reclaim_segments(&SegmentGcPolicy::default()).unwrap();
+        assert!(!out.enabled);
+        assert_eq!(out.segments_reclaimed, 0);
+        assert_eq!(out.reclaimed_through_seq, 0);
+        assert_eq!(store.reclaimed_through(), 0);
+        assert_eq!(list_segment_files(&root).unwrap().len(), before);
+        // Full log still readable from sequence 1.
+        let scan = store
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.record_count, 20);
+        assert_eq!(scan.records[0].global_sequence, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_reclaims_consumed_sealed_segments() {
+        let root = tmp_root("gc-basic");
+        seed_for_gc(&root, 20, 220, "projector", 15);
+        let before = list_segment_files(&root).unwrap().len();
+        assert!(before > 3, "expected rollover, got {before} segment(s)");
+
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::enabled(2))
+            .unwrap();
+        assert!(out.enabled);
+        assert_eq!(out.reclaim_watermark, 15);
+        assert!(out.segments_reclaimed > 0, "{out:?}");
+        // Reclaimed only fully-consumed segments (last seq <= watermark 15).
+        assert!(out.reclaimed_through_seq <= 15, "{out:?}");
+        assert_eq!(store.reclaimed_through(), out.reclaimed_through_seq);
+        assert!(list_segment_files(&root).unwrap().len() < before);
+
+        // Absolute tip is unchanged (event_count is base + retained).
+        assert_eq!(store.len(), 20);
+        // Retained log is gapless from the base to the tip; reclaimed absent.
+        let scan = store
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        let seqs: Vec<u64> = scan.records.iter().map(|r| r.global_sequence).collect();
+        let expected: Vec<u64> = (out.reclaimed_through_seq + 1..=20).collect();
+        assert_eq!(seqs, expected);
+        assert_eq!(scan.records.last().unwrap().global_sequence, 20);
+        assert_eq!(
+            scan.records.last().unwrap().payload,
+            "payload-00020-0123456789abcdef0123456789abcdef"
+        );
+        // A reclaimed sequence reads as reclaimed (absent), not corruption.
+        if out.reclaimed_through_seq >= 1 {
+            let err = store.read_event(1).unwrap_err();
+            assert!(matches!(err, EhdbError::InvalidState(_)), "{err:?}");
+            assert!(err.to_string().contains("reclaimed"));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_reclaims_nothing_without_consumer_interest() {
+        let root = tmp_root("gc-nointerest");
+        // No consumer at all → watermark 0 → nothing reclaimable.
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+            for i in 1..=20 {
+                append(
+                    &mut store,
+                    "100",
+                    i,
+                    &format!("payload-{i:05}-0123456789abcdef"),
+                );
+            }
+        }
+        let before = list_segment_files(&root).unwrap().len();
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::enabled(2))
+            .unwrap();
+        assert_eq!(out.reclaim_watermark, 0);
+        assert_eq!(out.segments_reclaimed, 0);
+        assert!(out.note.is_some());
+        assert_eq!(list_segment_files(&root).unwrap().len(), before);
+
+        // A consumer that has acked NOTHING also holds a watermark of 0.
+        store
+            .tail(&EventLogTailRequest {
+                consumer: "projector".to_string(),
+                transaction_id: "t".to_string(),
+                limit: 20,
+            })
+            .unwrap();
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::enabled(2))
+            .unwrap();
+        assert_eq!(out.reclaim_watermark, 0);
+        assert_eq!(out.segments_reclaimed, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_respects_min_retained_floor() {
+        let root = tmp_root("gc-floor");
+        seed_for_gc(&root, 20, 220, "projector", 20);
+        let before = list_segment_files(&root).unwrap().len();
+        let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        // A floor >= the segment count keeps everything even though all acked.
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::enabled(before + 5))
+            .unwrap();
+        assert_eq!(out.segments_reclaimed, 0, "{out:?}");
+        assert_eq!(list_segment_files(&root).unwrap().len(), before);
+        // A small floor reclaims (all consumed), keeping exactly the floor count.
+        let out = store
+            .reclaim_segments(&SegmentGcPolicy::enabled(2))
+            .unwrap();
+        assert!(out.segments_reclaimed > 0, "{out:?}");
+        assert!(list_segment_files(&root).unwrap().len() >= 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_survives_reopen_with_base_offset() {
+        let root = tmp_root("gc-reopen");
+        seed_for_gc(&root, 20, 220, "projector", 15);
+        let reclaimed_through;
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+            let out = store
+                .reclaim_segments(&SegmentGcPolicy::enabled(2))
+                .unwrap();
+            reclaimed_through = out.reclaimed_through_seq;
+            assert!(reclaimed_through >= 1);
+        }
+        // Reopen (a simulated restart): the durable reclaim manifest carries the
+        // base offset; the retained log replays gapless from it.
+        let mut reopened = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        assert_eq!(reopened.reclaimed_through(), reclaimed_through);
+        assert_eq!(reopened.len(), 20);
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.records[0].global_sequence, reclaimed_through + 1);
+        assert_eq!(scan.records.last().unwrap().global_sequence, 20);
+        // The durable consumer cursor survived reclamation (write-forward).
+        let tail = reopened
+            .tail(&EventLogTailRequest {
+                consumer: "projector".to_string(),
+                transaction_id: "t".to_string(),
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(tail.acked_sequence, Some(15));
+        assert!(
+            !tail.created_consumer,
+            "consumer survived reclamation+restart"
+        );
+        // Pending is computed off the absolute tip (20), not the retained count:
+        // 20 - 15 acked = 5 pending. (Regression guard for the base-offset tail.)
+        assert_eq!(tail.pending_count, 5);
+        // A new append continues the absolute sequence without a gap.
+        assert_eq!(append(&mut reopened, "100", 21, "next"), 21);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_crash_mid_delete_recovers_via_manifest() {
+        // Simulate a crash AFTER the reclaim manifest committed but BEFORE (or
+        // during) the segment unlinks: a below-watermark segment lingers on disk.
+        // The next open must re-delete it via the manifest and serve the correct
+        // base offset — the leftover is never read (so even garbage is harmless).
+        let root = tmp_root("gc-crash");
+        seed_for_gc(&root, 20, 220, "projector", 15);
+        let reclaimed_through;
+        {
+            let mut store = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+            let out = store
+                .reclaim_segments(&SegmentGcPolicy::enabled(2))
+                .unwrap();
+            reclaimed_through = out.reclaimed_through_seq;
+            assert!(
+                reclaimed_through >= 2,
+                "need >=1 reclaimed segment ({out:?})"
+            );
+        }
+        // Re-create a garbage leftover with a reclaimed id (id 1 is always in the
+        // reclaimed prefix). It must be re-deleted on open, not read/replayed.
+        let leftover = root.join(segment_file_name(1));
+        fs::write(&leftover, b"this-is-not-a-valid-frame-and-must-not-be-read").unwrap();
+        assert!(leftover.exists());
+
+        let mut reopened = DurableSegmentStore::open_with_segment_size(&root, 220).unwrap();
+        // The leftover was re-deleted (idempotent GC completion), not read.
+        assert!(
+            !leftover.exists(),
+            "crash-mid-GC leftover must be re-deleted"
+        );
+        assert_eq!(reopened.reclaimed_through(), reclaimed_through);
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(scan.records[0].global_sequence, reclaimed_through + 1);
+        assert_eq!(scan.record_count as u64, 20 - reclaimed_through);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_reclaimed_read_only_view_refused() {
+        let root = tmp_root("gc-ro");
+        seed_for_gc(&root, 8, 220, "projector", 6);
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+        let err = view
+            .reclaim_segments(&SegmentGcPolicy::enabled(1))
+            .unwrap_err();
+        assert!(matches!(err, EhdbError::InvalidState(_)));
+        assert!(err.to_string().contains("read-only"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_policy_from_raw_is_fail_safe() {
+        // Disabled unless an explicit enable token; unknown → disabled.
+        assert!(!SegmentGcPolicy::from_raw(None, None).enabled);
+        assert!(!SegmentGcPolicy::from_raw(Some(""), None).enabled);
+        assert!(!SegmentGcPolicy::from_raw(Some("garbage"), None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some(" Consumer_Ack "), None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some("on"), None).enabled);
+        assert!(SegmentGcPolicy::from_raw(Some("enabled"), None).enabled);
+        // min-retained parse + fallbacks.
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), Some("5")).min_retained_segments,
+            5
+        );
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), Some("0")).min_retained_segments,
+            DEFAULT_MIN_RETAINED_SEGMENTS
+        );
+        assert_eq!(
+            SegmentGcPolicy::from_raw(Some("on"), Some("nope")).min_retained_segments,
+            DEFAULT_MIN_RETAINED_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn exercise_segment_gc_drive_holds() {
+        let root = tmp_root("gc-drive");
+        let report =
+            exercise_segment_gc(&root, 40, 220, &SegmentGcPolicy::enabled(2), "projector").unwrap();
+        assert!(report.holds(), "{report:?}");
+        assert!(report.segments_reclaimed > 0);
+        assert!(report.segments_after < report.segments_before);
+        assert!(report.retained_zero_loss);
+        assert!(report.reclaimed_reads_absent);
+        assert!(report.restart_recovers);
+        assert!(report.cursor_survived);
+        assert!(report.divergence.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exercise_segment_gc_requires_minimum_events() {
+        let root = tmp_root("gc-drive-min");
+        let err = exercise_segment_gc(&root, 2, 220, &SegmentGcPolicy::enabled(2), "projector")
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 4 events"));
         let _ = fs::remove_dir_all(&root);
     }
 }
