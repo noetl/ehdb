@@ -211,6 +211,33 @@ struct ReclaimManifest {
     reclaimed_through_segment: u64,
 }
 
+/// A computed reclamation boundary — the contiguous prefix of sealed segments to
+/// reclaim, decided from the interest watermark but **not yet applied**.
+/// Separating the decision ([`DurableSegmentStore::plan_reclaim`]) from the
+/// mutation ([`DurableSegmentStore::apply_reclaim`]) lets the shared tier commit
+/// a cross-replica watermark *before* the local unlink, so a non-owner /
+/// new-owner never re-pulls a reclaimed segment.
+#[derive(Debug, Clone, Copy)]
+struct ReclaimPlan {
+    /// Highest segment id to reclaim (inclusive).
+    reclaimed_segment: u64,
+    /// Highest global sequence to reclaim (the last sequence in
+    /// `reclaimed_segment`).
+    reclaimed_seq: u64,
+    /// Number of segments this plan reclaims.
+    segments: usize,
+    /// The interest watermark that produced the plan (for reporting).
+    watermark: u64,
+}
+
+/// The result of planning a reclamation: either a boundary to apply, or nothing
+/// reclaimable (with the watermark + human reason for the outcome report).
+#[derive(Debug, Clone)]
+enum ReclaimPlanOutcome {
+    Reclaim(ReclaimPlan),
+    Nothing { watermark: u64, note: String },
+}
+
 /// A durable, append-only, segmented event-log store: the production disk
 /// format underneath the [`EventLogDriver`] contract.
 ///
@@ -1184,25 +1211,59 @@ impl DurableSegmentStore {
                     .to_string(),
             ));
         }
-        let mut outcome = SegmentGcOutcome {
-            enabled: policy.enabled,
-            segments_reclaimed: 0,
-            events_reclaimed: 0,
-            reclaim_watermark: 0,
-            reclaimed_through_seq: self.reclaimed_through,
-            segments_retained: 0,
-            note: None,
-        };
         if !policy.enabled {
-            outcome.note = Some("segment GC disabled".to_string());
-            outcome.segments_retained = self.segment_ids()?.len();
-            return Ok(outcome);
+            return Ok(SegmentGcOutcome {
+                enabled: false,
+                segments_reclaimed: 0,
+                events_reclaimed: 0,
+                reclaim_watermark: 0,
+                reclaimed_through_seq: self.reclaimed_through,
+                reclaimed_through_segment: self.reclaimed_segment,
+                segments_retained: self.segment_ids()?.len(),
+                note: Some("segment GC disabled".to_string()),
+            });
         }
         // Reclamation reads the segment→sequence layout — materialize the index.
         self.ensure_index_loaded()?;
+        match self.plan_reclaim(policy)? {
+            ReclaimPlanOutcome::Nothing { watermark, note } => Ok(SegmentGcOutcome {
+                enabled: true,
+                segments_reclaimed: 0,
+                events_reclaimed: 0,
+                reclaim_watermark: watermark,
+                reclaimed_through_seq: self.reclaimed_through,
+                reclaimed_through_segment: self.reclaimed_segment,
+                segments_retained: self.segment_ids()?.len(),
+                note: Some(note),
+            }),
+            ReclaimPlanOutcome::Reclaim(plan) => {
+                let events_reclaimed = plan.reclaimed_seq - self.reclaimed_through;
+                let segments = plan.segments;
+                let watermark = plan.watermark;
+                self.apply_reclaim(&plan)?;
+                Ok(SegmentGcOutcome {
+                    enabled: true,
+                    segments_reclaimed: segments,
+                    events_reclaimed,
+                    reclaim_watermark: watermark,
+                    reclaimed_through_seq: self.reclaimed_through,
+                    reclaimed_through_segment: self.reclaimed_segment,
+                    segments_retained: self.segment_ids()?.len(),
+                    note: None,
+                })
+            }
+        }
+    }
 
-        // (1) Interest watermark: the highest global sequence EVERY durable
-        //     consumer has acked past. No interest ⇒ 0 ⇒ reclaim nothing.
+    /// Compute the reclamation boundary from the interest watermark **without
+    /// mutating**. The interest watermark is the lowest durable-consumer ack
+    /// cursor; the plan is the contiguous prefix of sealed, event-bearing
+    /// segments whose last sequence is `<= watermark`, keeping the
+    /// `min_retained_segments` floor and never the active segment. Assumes the
+    /// offset index is materialized. This is the *decision* half — the shared
+    /// tier commits a cross-replica watermark from a plan before the local
+    /// unlink runs.
+    fn plan_reclaim(&self, policy: &SegmentGcPolicy) -> Result<ReclaimPlanOutcome> {
         let watermark = if self.consumers_seen.is_empty() {
             0
         } else {
@@ -1212,20 +1273,17 @@ impl DurableSegmentStore {
                 .min()
                 .unwrap_or(0)
         };
-        outcome.reclaim_watermark = watermark;
         if watermark == 0 {
-            outcome.note = Some(if self.consumers_seen.is_empty() {
-                "no durable consumer — nothing acked, nothing reclaimable".to_string()
-            } else {
-                "a durable consumer has acked nothing (watermark 0) — nothing reclaimable"
-                    .to_string()
+            return Ok(ReclaimPlanOutcome::Nothing {
+                watermark,
+                note: if self.consumers_seen.is_empty() {
+                    "no durable consumer — nothing acked, nothing reclaimable".to_string()
+                } else {
+                    "a durable consumer has acked nothing (watermark 0) — nothing reclaimable"
+                        .to_string()
+                },
             });
-            outcome.segments_retained = self.segment_ids()?.len();
-            return Ok(outcome);
         }
-
-        // (2) Select the contiguous prefix of sealed, event-bearing segments
-        //     whose last sequence is <= watermark, keeping the min-retained floor.
         let seg_last = self.segment_last_sequences();
         let total_segments = self.segment_ids()?.len();
         let keep_floor = policy.min_retained_segments.max(1);
@@ -1246,19 +1304,28 @@ impl DurableSegmentStore {
             }
         }
         if reclaim_count == 0 {
-            outcome.note = Some(
-                "no sealed segment fully below the watermark within the min-retained floor"
+            return Ok(ReclaimPlanOutcome::Nothing {
+                watermark,
+                note: "no sealed segment fully below the watermark within the min-retained floor"
                     .to_string(),
-            );
-            outcome.segments_retained = total_segments;
-            return Ok(outcome);
+            });
         }
-        let reclaim_set: Vec<(u64, u64)> = seg_last[..reclaim_count].to_vec();
-        let reclaimed_segment = reclaim_set.last().map(|(s, _)| *s).unwrap();
-        let reclaimed_seq = reclaim_set.last().map(|(_, s)| *s).unwrap();
-        let events_reclaimed = reclaimed_seq - self.reclaimed_through;
+        let (reclaimed_segment, reclaimed_seq) = seg_last[reclaim_count - 1];
+        Ok(ReclaimPlanOutcome::Reclaim(ReclaimPlan {
+            reclaimed_segment,
+            reclaimed_seq,
+            segments: reclaim_count,
+            watermark,
+        }))
+    }
 
-        // (3) Write-forward durable-consumer state so replay-is-truth survives the
+    /// Apply a [`ReclaimPlan`] — the *mutation* half. Write-forward durable
+    /// consumer state, commit the `fsync`'d manifest (the crash-atomic point of
+    /// no return), unlink the reclaimed segment files, then rebuild the index
+    /// with the new base offset and refresh the checkpoint sidecar. See
+    /// [`Self::reclaim_segments`] for the crash-safety contract.
+    fn apply_reclaim(&mut self, plan: &ReclaimPlan) -> Result<()> {
+        // (1) Write-forward durable-consumer state so replay-is-truth survives the
         //     unlink of segments that physically held the earlier consumer frames.
         let consumers: Vec<(String, u64)> = self
             .consumers_seen
@@ -1274,32 +1341,123 @@ impl DurableSegmentStore {
                 sequence: *cursor,
             })?;
         }
-
-        // (4) COMMIT: the `fsync`'d reclaim manifest is the point of no return.
+        // (2) COMMIT: the `fsync`'d reclaim manifest is the point of no return.
         self.persist_reclaim_manifest(&ReclaimManifest {
-            reclaimed_through_seq: reclaimed_seq,
-            reclaimed_through_segment: reclaimed_segment,
+            reclaimed_through_seq: plan.reclaimed_seq,
+            reclaimed_through_segment: plan.reclaimed_segment,
         })?;
-
-        // (5) Unlink the reclaimed segment files (a crash here is re-completed on
+        // (3) Unlink the reclaimed segment files (a crash here is re-completed on
         //     the next open via the manifest).
-        for (seg_id, _) in &reclaim_set {
-            let path = self.segment_path(*seg_id);
-            if path.exists() {
-                fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        for id in self.segment_ids()? {
+            if id <= plan.reclaimed_segment {
+                let path = self.segment_path(id);
+                if path.exists() {
+                    fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+                }
             }
         }
-
-        // (6) Rebuild the in-memory index with the new base offset, and refresh
+        // (4) Rebuild the in-memory index with the new base offset, and refresh
         //     the O(1) checkpoint sidecar for the next open.
         self.replay()?;
         self.persist_checkpoint()?;
+        Ok(())
+    }
 
-        outcome.segments_reclaimed = reclaim_set.len();
+    /// Apply an **externally-decided** reclaim boundary: reclaim every segment
+    /// with id `<= target_segment`, honoring the same crash-safe write-forward +
+    /// manifest + unlink sequence as [`Self::reclaim_segments`]. This is how a
+    /// replica adopts a **cross-replica reclaim watermark** the shared tier
+    /// published (e.g. after a restart that left this owner's local segments
+    /// ahead of the shared watermark, or when reconciling on bring-up) — the
+    /// interest decision was already made by whichever replica ran GC; this
+    /// replica just realizes it locally so its reads agree with a non-owner
+    /// cold-load. Idempotent: a target at/below the current reclaimed segment is
+    /// a no-op. Needs the offset index (loads it).
+    pub fn reclaim_to_segment(&mut self, target_segment: u64) -> Result<SegmentGcOutcome> {
+        if self.read_only {
+            return Err(EhdbError::InvalidState(
+                "durable event-log: read-only cold-load view cannot reclaim segments (not the shard owner)"
+                    .to_string(),
+            ));
+        }
+        self.ensure_index_loaded()?;
+        let mut outcome = SegmentGcOutcome {
+            enabled: true,
+            segments_reclaimed: 0,
+            events_reclaimed: 0,
+            reclaim_watermark: 0,
+            reclaimed_through_seq: self.reclaimed_through,
+            reclaimed_through_segment: self.reclaimed_segment,
+            segments_retained: self.segment_ids()?.len(),
+            note: None,
+        };
+        if target_segment <= self.reclaimed_segment {
+            outcome.note = Some("already reclaimed at/below the target segment".to_string());
+            return Ok(outcome);
+        }
+        // The reclaim set is the contiguous prefix of sealed event-bearing
+        // segments with id <= target_segment (never the active segment).
+        let seg_last = self.segment_last_sequences();
+        let mut reclaimed_segment = 0u64;
+        let mut reclaimed_seq = 0u64;
+        let mut count = 0usize;
+        for (seg_id, last_seq) in &seg_last {
+            if *seg_id <= target_segment && *seg_id < self.active_segment_id {
+                reclaimed_segment = *seg_id;
+                reclaimed_seq = *last_seq;
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        if count == 0 {
+            // No local segment at/below the target (e.g. a new owner that only
+            // hydrated segments above the watermark) — the base offset is already
+            // derived from the first surviving frame, nothing to unlink.
+            outcome.note = Some("no local segment at/below the target watermark".to_string());
+            return Ok(outcome);
+        }
+        let events_reclaimed = reclaimed_seq - self.reclaimed_through;
+        self.apply_reclaim(&ReclaimPlan {
+            reclaimed_segment,
+            reclaimed_seq,
+            segments: count,
+            watermark: reclaimed_seq,
+        })?;
+        outcome.segments_reclaimed = count;
         outcome.events_reclaimed = events_reclaimed;
+        outcome.reclaim_watermark = reclaimed_seq;
         outcome.reclaimed_through_seq = self.reclaimed_through;
+        outcome.reclaimed_through_segment = self.reclaimed_segment;
         outcome.segments_retained = self.segment_ids()?.len();
         Ok(outcome)
+    }
+
+    /// Compute the reclaim boundary `(reclaimed_seq, reclaimed_segment)` from the
+    /// interest watermark **without mutating**, or `None` when nothing is
+    /// reclaimable. The shared tier calls this to learn the boundary, publishes
+    /// it as the cross-replica watermark, and only *then* applies the local
+    /// reclaim via [`Self::reclaim_to_segment`] — so a non-owner / new-owner
+    /// never re-pulls a segment mid-reclamation. Loads the offset index.
+    pub fn plan_reclaim_boundary(
+        &mut self,
+        policy: &SegmentGcPolicy,
+    ) -> Result<Option<(u64, u64)>> {
+        if self.read_only {
+            return Err(EhdbError::InvalidState(
+                "durable event-log: read-only cold-load view cannot plan reclamation".to_string(),
+            ));
+        }
+        if !policy.enabled {
+            return Ok(None);
+        }
+        self.ensure_index_loaded()?;
+        match self.plan_reclaim(policy)? {
+            ReclaimPlanOutcome::Reclaim(plan) => {
+                Ok(Some((plan.reclaimed_seq, plan.reclaimed_segment)))
+            }
+            ReclaimPlanOutcome::Nothing { .. } => Ok(None),
+        }
     }
 }
 
@@ -1448,6 +1606,20 @@ impl DurableEventLogDriver {
     /// `policy.enabled`.
     pub fn reclaim_segments(&self, policy: &SegmentGcPolicy) -> Result<SegmentGcOutcome> {
         self.lock()?.reclaim_segments(policy)
+    }
+
+    /// Adopt a cross-replica reclaim watermark: reclaim every segment with id
+    /// `<= target_segment`. See [`DurableSegmentStore::reclaim_to_segment`] — the
+    /// shared tier uses this so a replica realizes a watermark another replica
+    /// decided.
+    pub fn reclaim_to_segment(&self, target_segment: u64) -> Result<SegmentGcOutcome> {
+        self.lock()?.reclaim_to_segment(target_segment)
+    }
+
+    /// Compute the reclaim boundary `(seq, segment)` without mutating, or `None`.
+    /// See [`DurableSegmentStore::plan_reclaim_boundary`].
+    pub fn plan_reclaim_boundary(&self, policy: &SegmentGcPolicy) -> Result<Option<(u64, u64)>> {
+        self.lock()?.plan_reclaim_boundary(policy)
     }
 
     /// Highest global sequence reclaimed by segment GC (0 for an un-GC'd store).
@@ -1619,6 +1791,10 @@ pub struct SegmentGcOutcome {
     /// Highest global sequence reclaimed across the store's lifetime after this
     /// call (== the reclaim manifest's `reclaimed_through_seq`).
     pub reclaimed_through_seq: u64,
+    /// Highest segment id reclaimed across the store's lifetime after this call
+    /// (== the reclaim manifest's `reclaimed_through_segment`). The shared tier
+    /// publishes this as the cross-replica reclaim watermark.
+    pub reclaimed_through_segment: u64,
     /// Segments remaining on disk after this call (including the active one).
     pub segments_retained: usize,
     /// Why nothing (more) was reclaimed, or `None` when the eligible set was

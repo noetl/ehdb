@@ -106,9 +106,10 @@ pub use durable_eventlog_affinity::{
 /// [`durable_eventlog_shared`].
 pub mod durable_eventlog_shared;
 pub use durable_eventlog_shared::{
-    exercise_shared_tier, segment_digest, shared_segment_key, FilesystemSharedBackend,
-    ShardHydrateOutcome, ShardPublishOutcome, SharedSegmentBackend, SharedSegmentPutOutcome,
-    SharedTierEventLog, SharedTierReport,
+    exercise_shared_tier, exercise_shared_tier_gc, segment_digest, shared_segment_key,
+    FilesystemSharedBackend, ShardHydrateOutcome, ShardPublishOutcome, SharedSegmentBackend,
+    SharedSegmentPutOutcome, SharedShardGcOutcome, SharedTierEventLog, SharedTierGcReport,
+    SharedTierReport,
 };
 
 /// EHDB projection / read-model core engine (completion program Phase 7) — builds
