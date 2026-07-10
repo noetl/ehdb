@@ -32,6 +32,9 @@ use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
 
+/// Flight SQL projection-tier read surface — the external EHDB driver MVP.
+pub mod flight_sql;
+
 pub const SCAN_FLIGHT_TICKET_VERSION: &str = "ehdb.arrow.scan.v1";
 pub const SCAN_FLIGHT_RESULT_STREAM_VERSION: &str = "ehdb.arrow.scan.result.v1";
 pub const DEFAULT_FLIGHT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
