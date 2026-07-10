@@ -33,6 +33,8 @@
 // error type would fight the tonic API for no benefit — allow it module-wide.
 #![allow(clippy::result_large_err)]
 
+use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -619,6 +621,31 @@ impl FlightSqlService for FlightSqlProjectionService {
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+/// Serve a [`FlightSqlProjectionService`] on `addr` until `shutdown` resolves.
+///
+/// The service is wrapped in the standard `FlightServiceServer` (a
+/// [`FlightSqlService`] is a `FlightService` via arrow-flight's blanket impl),
+/// so any Flight SQL client (`pyarrow.flight`, ADBC, the Flight SQL JDBC
+/// driver) can connect. Keeping the gRPC serving here means the deploying role
+/// (the worker endpoint) needs no direct tonic / arrow-flight dependency.
+pub async fn serve<F>(
+    service: FlightSqlProjectionService,
+    addr: SocketAddr,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    use arrow_flight::flight_service_server::FlightServiceServer;
+    use tonic::transport::Server;
+
+    Server::builder()
+        .add_service(FlightServiceServer::new(service))
+        .serve_with_shutdown(addr, shutdown)
+        .await
+        .map_err(|err| EhdbError::Storage(format!("serve Flight SQL projection service: {err}")))
 }
 
 #[cfg(test)]
