@@ -68,7 +68,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::affinity::ShardOwnership;
 use crate::durable_eventlog::{
-    DurableEventLogDriver, DurableSegmentStore, DEFAULT_SEGMENT_MAX_BYTES,
+    DurableEventLogDriver, DurableSegmentStore, SegmentGcOutcome, SegmentGcPolicy,
+    DEFAULT_SEGMENT_MAX_BYTES,
 };
 use crate::eventlog::{
     EventLogAckOutcome, EventLogAckRequest, EventLogAppendOutcome, EventLogAppendRequest,
@@ -248,6 +249,54 @@ impl AffinityRoutedEventLog {
         )?;
         owned.insert(shard, driver.clone());
         Ok(driver)
+    }
+
+    /// Shard ids with an on-disk store directory under the root, ascending.
+    fn present_shard_ids(&self) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        if !self.root.exists() {
+            return Ok(ids);
+        }
+        for entry in fs::read_dir(&self.root).map_err(|err| EhdbError::Storage(err.to_string()))? {
+            let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+            let name = entry.file_name();
+            if let Some(id) = name
+                .to_string_lossy()
+                .strip_prefix(SHARD_DIR_PREFIX)
+                .and_then(|d| d.parse::<u32>().ok())
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Reclaim consumed sealed segments for every **owned** shard present on disk
+    /// — the affinity-layer fan-out of [`DurableSegmentStore::reclaim_segments`]
+    /// (segment GC). A no-op per shard unless `policy.enabled`. Returns
+    /// `(shard, outcome)` for each owned shard touched, ascending.
+    ///
+    /// Only owned shards are reclaimed — a non-owned shard's single writer is a
+    /// different replica, so this replica must never mutate its segments. This is
+    /// **local** reclamation (each owner bounds its own local segment store); the
+    /// shared segment tier's own object reclamation + watermark coherence across
+    /// an ownership transfer is a separate concern (see the design note's
+    /// shared-tier scope), so run this only where the durable store is the
+    /// single-writer local authority (the recommended PVC bootstrapping topology).
+    pub fn reclaim_owned_shards(
+        &self,
+        policy: &SegmentGcPolicy,
+    ) -> Result<Vec<(u32, SegmentGcOutcome)>> {
+        let mut out = Vec::new();
+        for shard in self.present_shard_ids()? {
+            if !self.ownership.owns_shard(shard) {
+                continue;
+            }
+            let driver = self.owned_store(shard)?;
+            out.push((shard, driver.reclaim_segments(policy)?));
+        }
+        Ok(out)
     }
 
     /// Cold-load a read-only view of a shard this replica does not own.

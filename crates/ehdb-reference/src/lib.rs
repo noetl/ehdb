@@ -66,9 +66,10 @@ pub use eventlog::{
 /// See [`durable_eventlog`].
 pub mod durable_eventlog;
 pub use durable_eventlog::{
-    exercise_durable_recovery, list_segment_files, parse_segment_file_name, segment_file_name,
-    DurableEventLogDriver, DurableRecoveryReport, DurableSegmentStore, EventLogStorageBackend,
-    DEFAULT_SEGMENT_MAX_BYTES,
+    exercise_durable_recovery, exercise_segment_gc, list_segment_files, parse_segment_file_name,
+    segment_file_name, DurableEventLogDriver, DurableRecoveryReport, DurableSegmentStore,
+    EventLogStorageBackend, SegmentGcDriveReport, SegmentGcOutcome, SegmentGcPolicy,
+    DEFAULT_MIN_RETAINED_SEGMENTS, DEFAULT_SEGMENT_MAX_BYTES,
 };
 
 /// EHDB execution-affinity **shard ownership** (completion program, durable
