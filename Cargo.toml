@@ -20,10 +20,12 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 arrow-array = "53"
-arrow-flight = "53"
+arrow-flight = { version = "53", features = ["flight-sql-experimental"] }
 arrow-ipc = "53"
 arrow-schema = { version = "53", features = ["serde"] }
 criterion = "0.5"
+prost = "0.13"
+sqlparser = "0.51"
 ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
 ehdb-reference = { path = "crates/ehdb-reference" }
