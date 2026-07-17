@@ -107,7 +107,7 @@ pub fn plan_next_merge(manifest: &Manifest, policy: &MergePolicy) -> Option<Merg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{PartMeta, SparseIndex};
+    use crate::catalog::{PartMeta, ReplicaLocation, SparseIndex};
 
     fn small(partition: u32, min: u64, max: u64) -> PartMeta {
         PartMeta {
@@ -117,7 +117,10 @@ mod tests {
             max_sequence: max,
             record_count: max - min + 1,
             byte_size: 100,
-            replicas: vec!["parts/x".into()],
+            replicas: vec![ReplicaLocation {
+                replica: "replica-0".into(),
+                key: "parts/x".into(),
+            }],
             local_path: None,
             sparse_index: SparseIndex {
                 granule_size: 4,

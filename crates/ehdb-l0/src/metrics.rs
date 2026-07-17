@@ -38,6 +38,12 @@ pub struct L0Metrics {
     pub orphan_bytes: AtomicU64,
     /// Whole parts dropped by retention (L0.5).
     pub parts_dropped: AtomicU64,
+    /// Immutable-part copies written to durable replicas (L0.6). With
+    /// replication factor N, `replica_writes ≈ N × parts_sealed`.
+    pub replica_writes: AtomicU64,
+    /// Reads that fell back to a non-primary replica because an earlier replica
+    /// was unreachable (L0.6) — the durability payoff in action.
+    pub read_fallbacks: AtomicU64,
     /// Cold-load operations (a fresh node reconstructing from the object store).
     pub cold_loads: AtomicU64,
     /// Read lookups served.
@@ -73,6 +79,12 @@ impl L0Metrics {
     pub(crate) fn incr_cold_loads(&self) {
         self.cold_loads.fetch_add(1, Ordering::Relaxed);
     }
+    pub(crate) fn record_replica_write(&self) {
+        self.replica_writes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_read_fallback(&self) {
+        self.read_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
     pub(crate) fn record_merge(&self, source_parts: u64, merged_bytes: u64) {
         self.merges.fetch_add(1, Ordering::Relaxed);
         self.parts_merged.fetch_add(source_parts, Ordering::Relaxed);
@@ -107,6 +119,8 @@ impl L0Metrics {
             orphans_reclaimed: self.orphans_reclaimed.load(Ordering::Relaxed),
             orphan_bytes: self.orphan_bytes.load(Ordering::Relaxed),
             parts_dropped: self.parts_dropped.load(Ordering::Relaxed),
+            replica_writes: self.replica_writes.load(Ordering::Relaxed),
+            read_fallbacks: self.read_fallbacks.load(Ordering::Relaxed),
             cold_loads: self.cold_loads.load(Ordering::Relaxed),
             reads: self.reads.load(Ordering::Relaxed),
             parts_pruned: self.parts_pruned.load(Ordering::Relaxed),
@@ -130,6 +144,8 @@ pub struct L0MetricsSnapshot {
     pub orphans_reclaimed: u64,
     pub orphan_bytes: u64,
     pub parts_dropped: u64,
+    pub replica_writes: u64,
+    pub read_fallbacks: u64,
     pub cold_loads: u64,
     pub reads: u64,
     pub parts_pruned: u64,

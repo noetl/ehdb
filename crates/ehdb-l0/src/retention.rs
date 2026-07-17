@@ -60,7 +60,7 @@ pub fn plan_keep_last(manifest: &Manifest, keep_last_records: u64) -> RetentionP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{Manifest, PartMeta, SparseIndex};
+    use crate::catalog::{Manifest, PartMeta, ReplicaLocation, SparseIndex};
 
     fn part(id: &str, min: u64, max: u64) -> PartMeta {
         PartMeta {
@@ -70,7 +70,10 @@ mod tests {
             max_sequence: max,
             record_count: max - min + 1,
             byte_size: 100,
-            replicas: vec![format!("parts/{id}")],
+            replicas: vec![ReplicaLocation {
+                replica: "replica-0".into(),
+                key: format!("parts/{id}"),
+            }],
             local_path: None,
             sparse_index: SparseIndex {
                 granule_size: 4,

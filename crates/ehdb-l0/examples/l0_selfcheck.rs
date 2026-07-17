@@ -299,6 +299,67 @@ fn main() {
     );
     drop(slow);
 
+    // --- L0.6 N-way replication: copy to N replicas, survive a dead one ---
+    {
+        use ehdb_l0::ReplicaTarget;
+        println!("\n-- N-way replication (immutable parts, no consensus) --");
+        let dirs: Vec<_> = (0..3).map(|i| tmp(&format!("nway-r{i}"))).collect();
+        let nlocal = tmp("nway-local");
+        for d in dirs.iter().chain([&nlocal]) {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let mk_targets = || -> Vec<ReplicaTarget> {
+            dirs.iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let s: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(d).unwrap());
+                    ReplicaTarget::new(format!("replica-{i}"), s)
+                })
+                .collect()
+        };
+        let mut w = L0EventLogEngine::open_replicated(
+            L0Config::d1(&nlocal)
+                .with_shard_count(1)
+                .with_seal_max_records(8),
+            mk_targets(),
+        )
+        .unwrap();
+        for i in 0..24u64 {
+            w.append("1001", &format!("t{i}"), format!("p{i}")).unwrap();
+        }
+        w.flush_and_wait_uploads().unwrap();
+        let man = w.manifest_snapshot();
+        let rf = man.parts.first().map(|p| p.replica_count()).unwrap_or(0);
+        println!(
+            "wrote 24 events → {} parts, each replicated {rf}-way; replica_writes={}",
+            man.parts.len(),
+            w.metrics().snapshot().replica_writes
+        );
+        drop(w);
+        // Kill replica-0, cold-load from the survivors.
+        std::fs::remove_dir_all(&dirs[0]).unwrap();
+        let ncold = tmp("nway-cold");
+        let _ = std::fs::remove_dir_all(&ncold);
+        let cold = L0EventLogEngine::cold_load_replicated(
+            L0Config::d1(&ncold)
+                .with_shard_count(1)
+                .with_seal_max_records(8),
+            mk_targets(),
+        )
+        .unwrap();
+        let recs = cold.replay_all().unwrap();
+        println!(
+            "killed replica-0 → cold-load reproduced {} records (correct={}); read_fallbacks={}",
+            recs.len(),
+            recs.len() == 24,
+            cold.metrics().snapshot().read_fallbacks
+        );
+        drop(cold);
+        for d in dirs.iter().chain([&nlocal, &ncold]) {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     // cleanup
     for d in [
         &object_dir,
