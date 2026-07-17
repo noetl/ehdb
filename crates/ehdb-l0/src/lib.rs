@@ -101,13 +101,21 @@
 //! - Where a dataset maps onto an existing tier (D5 blobs → Phase-8
 //!   `ObjectBlobDriver`), L0 wires the tier rather than reinventing it (RFC §2.4).
 //!
-//! ## Scope of L0.1 (this slice) — everything else is a later slice
+//! ## Slices implemented here (D1 only; all additive, kind/local shadow)
 //!
-//! IN: the part model, the meta-catalog, the tiering, cold-load, D1 only. OUT
-//! (later L0 slices): the few fixed per-dataset inverted indexes (L0.2), the
-//! background small→big merge engine (L0.3), columnar-per-field (L0.4),
-//! retention-as-drop-partition (L0.5), and **all** of L1/L2/L3. L0.1 touches no
-//! NATS, cuts nothing over, and is kind/local shadow only.
+//! - **L0.1** — part model + meta-catalog + hot-local/durable-async tiering +
+//!   cold-load ([`engine`], [`catalog`], [`part`], [`substrate`]).
+//! - **L0.2** — the fixed per-dataset inverted index: per-part + per-granule
+//!   [`bloom`] over `execution_id`, with index-first pruning in the read path.
+//! - **L0.3** — the background small→big [`merge`] engine (contiguous-run
+//!   compaction, rebuilt sparse index + blooms, atomic manifest swap).
+//! - **L0.5** — [`retention`] as drop-partition + orphan reclaim/GC (vacuums the
+//!   superseded merge sources + dropped parts).
+//!
+//! Still OUT (later slices): **L0.4** columnar-per-field for the event tier +
+//! wiring the Phase-8 blob shape; generalizing beyond D1; and **all** of
+//! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
+//! shadow only.
 
 pub mod bloom;
 pub mod catalog;
@@ -117,6 +125,7 @@ pub mod frame;
 pub mod merge;
 pub mod metrics;
 pub mod part;
+pub mod retention;
 pub mod substrate;
 
 pub use bloom::Bloom;
@@ -126,4 +135,5 @@ pub use engine::{L0Config, L0EventLogEngine};
 pub use merge::{MergePlan, MergePolicy};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};
+pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};

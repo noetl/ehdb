@@ -72,6 +72,11 @@ pub trait DurableSubstrate: Send + Sync {
     /// List every substrate key under a `/`-terminated (or prefix-matched) logical
     /// prefix. Order is unspecified; callers sort.
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// Delete an object (L0.5 retention/GC — reclaiming superseded merge sources
+    /// and dropped-partition parts). Deleting a missing key is a no-op (`Ok`), so
+    /// GC is idempotent.
+    fn delete(&self, key: &str) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +170,15 @@ impl DurableSubstrate for LocalFsSubstrate {
         walk_keys(&self.root, &self.root, prefix, &mut out)?;
         Ok(out)
     }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let target = self.resolve(key)?;
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(EhdbError::Storage(err.to_string())),
+        }
+    }
 }
 
 fn walk_keys(root: &Path, dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
@@ -217,6 +231,8 @@ pub struct SubstrateCounters {
     pub get_all_calls: AtomicU64,
     /// Total bytes fetched by `get_all`.
     pub get_all_bytes: AtomicU64,
+    /// Number of `delete` calls (L0.5 GC reclaims).
+    pub delete_calls: AtomicU64,
 }
 
 /// A transparent [`DurableSubstrate`] wrapper that records per-key I/O and can
@@ -319,6 +335,11 @@ impl<S: DurableSubstrate> DurableSubstrate for CountingSubstrate<S> {
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list_prefix(prefix)
     }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.counters.delete_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.delete(key)
+    }
 }
 
 /// Blanket impl so an `Arc<dyn DurableSubstrate>` (and `Arc<S>`) is itself an
@@ -342,6 +363,9 @@ impl DurableSubstrate for Arc<dyn DurableSubstrate> {
     }
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         (**self).list_prefix(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        (**self).delete(key)
     }
 }
 
