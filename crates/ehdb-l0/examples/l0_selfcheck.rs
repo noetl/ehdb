@@ -41,7 +41,9 @@ fn main() {
     let origin_store: Arc<dyn L0ObjectStore> = Arc::new(counting);
     let mut origin = L0EventLogEngine::open(cfg(&origin_local), origin_store).unwrap();
 
-    let executions = ["1001", "1002", "1003", "2007", "3011", "4013", "5019", "6023"];
+    let executions = [
+        "1001", "1002", "1003", "2007", "3011", "4013", "5019", "6023",
+    ];
     let events_each = 25u64;
     for i in 0..events_each {
         for e in &executions {
@@ -145,8 +147,9 @@ fn main() {
     let base_local = tmp("hp-base-local");
     let _ = std::fs::remove_dir_all(&base_obj);
     let _ = std::fs::remove_dir_all(&base_local);
-    let base_store: Arc<dyn L0ObjectStore> =
-        Arc::new(CountingObjectStore::new(LocalFsObjectStore::new(&base_obj).unwrap()));
+    let base_store: Arc<dyn L0ObjectStore> = Arc::new(CountingObjectStore::new(
+        LocalFsObjectStore::new(&base_obj).unwrap(),
+    ));
     let mut base = L0EventLogEngine::open(
         L0Config::d1(&base_local)
             .with_shard_count(1)
@@ -157,7 +160,8 @@ fn main() {
     .unwrap();
     let t0 = Instant::now();
     for i in 0..n {
-        base.append("1001", &format!("t{i}"), format!("p{i}")).unwrap();
+        base.append("1001", &format!("t{i}"), format!("p{i}"))
+            .unwrap();
     }
     let t_base = t0.elapsed();
     let seals = base.metrics().snapshot().seals;
@@ -181,7 +185,8 @@ fn main() {
     .unwrap();
     let t1 = Instant::now();
     for i in 0..n {
-        slow.append("1001", &format!("t{i}"), format!("p{i}")).unwrap();
+        slow.append("1001", &format!("t{i}"), format!("p{i}"))
+            .unwrap();
     }
     let t_slow = t1.elapsed();
 
