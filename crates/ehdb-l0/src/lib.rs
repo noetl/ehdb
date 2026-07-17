@@ -109,16 +109,21 @@
 //!   [`bloom`] over `execution_id`, with index-first pruning in the read path.
 //! - **L0.3** — the background small→big [`merge`] engine (contiguous-run
 //!   compaction, rebuilt sparse index + blooms, atomic manifest swap).
+//! - **L0.4** — the [`columnar`] per-field codec for the event tier
+//!   (VictoriaLogs-style per-field columns, the big payload field isolated,
+//!   single-column projection). Provided as a codec, additive to the row-frame
+//!   part format; wiring it in as the event-tier encoding is the follow-on.
 //! - **L0.5** — [`retention`] as drop-partition + orphan reclaim/GC (vacuums the
 //!   superseded merge sources + dropped parts).
 //!
-//! Still OUT (later slices): **L0.4** columnar-per-field for the event tier +
-//! wiring the Phase-8 blob shape; generalizing beyond D1; and **all** of
+//! Still OUT (later work): wiring the columnar codec in as the on-disk part
+//! encoding + the Phase-8 blob shape (D5); generalizing beyond D1; and **all** of
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
 
 pub mod bloom;
 pub mod catalog;
+pub mod columnar;
 pub mod dataset;
 pub mod engine;
 pub mod frame;
@@ -130,6 +135,7 @@ pub mod substrate;
 
 pub use bloom::Bloom;
 pub use catalog::{Manifest, PartMeta, SparseIndex};
+pub use columnar::{decode_columnar, encode_columnar, project_column, Column, Field};
 pub use dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 pub use engine::{L0Config, L0EventLogEngine};
 pub use merge::{MergePlan, MergePolicy};
