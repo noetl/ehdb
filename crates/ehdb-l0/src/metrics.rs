@@ -25,6 +25,12 @@ pub struct L0Metrics {
     /// Cumulative upload lag in **microseconds** (seal → object-store durable),
     /// summed across uploads. Mean lag = `upload_lag_micros_total / uploads`.
     pub upload_lag_micros_total: AtomicU64,
+    /// Merge/compaction operations performed (L0.3).
+    pub merges: AtomicU64,
+    /// Source parts consumed by merges (their count summed).
+    pub parts_merged: AtomicU64,
+    /// Bytes written by merges (merged-part sizes summed).
+    pub merged_bytes: AtomicU64,
     /// Cold-load operations (a fresh node reconstructing from the object store).
     pub cold_loads: AtomicU64,
     /// Read lookups served.
@@ -60,6 +66,11 @@ impl L0Metrics {
     pub(crate) fn incr_cold_loads(&self) {
         self.cold_loads.fetch_add(1, Ordering::Relaxed);
     }
+    pub(crate) fn record_merge(&self, source_parts: u64, merged_bytes: u64) {
+        self.merges.fetch_add(1, Ordering::Relaxed);
+        self.parts_merged.fetch_add(source_parts, Ordering::Relaxed);
+        self.merged_bytes.fetch_add(merged_bytes, Ordering::Relaxed);
+    }
     pub(crate) fn record_read(&self, pruned: u64, bloom_pruned: u64, scanned: u64) {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.parts_pruned.fetch_add(pruned, Ordering::Relaxed);
@@ -76,6 +87,9 @@ impl L0Metrics {
             uploads: self.uploads.load(Ordering::Relaxed),
             upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
             upload_lag_micros_total: self.upload_lag_micros_total.load(Ordering::Relaxed),
+            merges: self.merges.load(Ordering::Relaxed),
+            parts_merged: self.parts_merged.load(Ordering::Relaxed),
+            merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
             cold_loads: self.cold_loads.load(Ordering::Relaxed),
             reads: self.reads.load(Ordering::Relaxed),
             parts_pruned: self.parts_pruned.load(Ordering::Relaxed),
@@ -93,6 +107,9 @@ pub struct L0MetricsSnapshot {
     pub uploads: u64,
     pub upload_bytes: u64,
     pub upload_lag_micros_total: u64,
+    pub merges: u64,
+    pub parts_merged: u64,
+    pub merged_bytes: u64,
     pub cold_loads: u64,
     pub reads: u64,
     pub parts_pruned: u64,
