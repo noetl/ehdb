@@ -134,10 +134,10 @@ pub mod retention;
 pub mod substrate;
 
 pub use bloom::Bloom;
-pub use catalog::{Manifest, PartMeta, SparseIndex};
+pub use catalog::{Manifest, PartMeta, ReplicaLocation, SparseIndex};
 pub use columnar::{decode_columnar, encode_columnar, project_column, Column, Field};
 pub use dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
-pub use engine::{L0Config, L0EventLogEngine};
+pub use engine::{L0Config, L0EventLogEngine, ReplicaTarget};
 pub use merge::{MergePlan, MergePolicy};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};

@@ -25,6 +25,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::bloom::Bloom;
 
+/// One durable copy of an immutable part — **the N-way replication unit**
+/// (L0.6). Names *which* substrate replica holds the copy and *where* (its key).
+/// Because parts are immutable, every replica is byte-identical and replicas
+/// never conflict, so replication is a plain write-once N-way copy (HDFS /
+/// block-replication model) with **no consensus / no Raft**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaLocation {
+    /// The id of the durable-substrate replica holding this copy (e.g.
+    /// `replica-0`). A read resolves this to the substrate handle and, on
+    /// failure, falls back to the next replica in the part's list.
+    pub replica: String,
+    /// The substrate key of the copy within that replica (deterministic from the
+    /// part id, so all replicas of a part share the same key — but each lives on
+    /// a *different* substrate).
+    pub key: String,
+}
+
 /// One entry in a part's [`SparseIndex`]: the start of a granule (a block of
 /// consecutive frames) — the granule's first sort-key value and the byte offset
 /// (the "mark") of that frame's magic within the part.
@@ -110,15 +128,15 @@ pub struct PartMeta {
     pub record_count: u64,
     /// On-disk byte size of the part (frame bytes).
     pub byte_size: u64,
-    /// **The N-way replication seam.** The durable-substrate key(s) where this
-    /// immutable part is stored — **one entry per replica**. noetl writes each
-    /// immutable part write-once to N substrate replicas and records their
-    /// locations here; because parts are **immutable**, replicas never conflict,
-    /// so replication is a plain N-way copy (the HDFS / block-replication model)
-    /// with **no consensus / no Raft**. Empty while the part is local-only (not
-    /// yet replicated). L0.1 writes a **single** replica; N-way copy is the
-    /// additive later step that simply appends more entries here.
-    pub replicas: Vec<String>,
+    /// **The N-way replication list (L0.6).** One [`ReplicaLocation`] per durable
+    /// copy — noetl writes each immutable part write-once to N substrate replicas
+    /// and records where every copy lives here. Because parts are **immutable**,
+    /// replicas never conflict, so this is a plain N-way copy (HDFS /
+    /// block-replication) with **no consensus / no Raft**. Empty while the part
+    /// is local-only (not yet replicated). A read tries the replicas in order and
+    /// falls back to the next on failure (`replica-0` dead ⇒ serve from
+    /// `replica-1`).
+    pub replicas: Vec<ReplicaLocation>,
     /// Local hot-tier file path while the part is resident on this node
     /// (`None` on a cold-loaded node). Reads prefer this (no substrate I/O).
     pub local_path: Option<String>,
@@ -155,10 +173,15 @@ impl PartMeta {
         !self.replicas.is_empty()
     }
 
-    /// The primary (first) substrate replica key, if any — the replica a read
-    /// fetches from (a failover slice would try the rest in order).
-    pub fn primary_replica(&self) -> Option<&String> {
+    /// The primary (first) replica location, if any — the replica a read tries
+    /// first (it falls back to the rest in order on failure).
+    pub fn primary_replica(&self) -> Option<&ReplicaLocation> {
         self.replicas.first()
+    }
+
+    /// The number of durable copies (replication factor achieved for this part).
+    pub fn replica_count(&self) -> usize {
+        self.replicas.len()
     }
 
     /// Whether this part **may** contain `execution_id` per its bloom. `true`
@@ -350,7 +373,10 @@ mod tests {
             max_sequence,
             record_count: (max_sequence - min_sequence + 1),
             byte_size: 100,
-            replicas: vec![format!("parts/{part_id}")],
+            replicas: vec![ReplicaLocation {
+                replica: "replica-0".into(),
+                key: format!("parts/{part_id}"),
+            }],
             local_path: None,
             sparse_index: idx(&[(min_sequence, 0)], 8),
             execution_bloom: None,
@@ -382,7 +408,10 @@ mod tests {
             max_sequence: 5,
             record_count: 5,
             byte_size: 50,
-            replicas: vec!["parts/uploaded".into()],
+            replicas: vec![ReplicaLocation {
+                replica: "replica-0".into(),
+                key: "parts/uploaded".into(),
+            }],
             local_path: Some("/local/uploaded".into()),
             sparse_index: idx(&[(1, 0)], 8),
             execution_bloom: None,

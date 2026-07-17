@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use ehdb_core::{EhdbError, Result};
 
-use crate::catalog::{Manifest, PartMeta};
+use crate::catalog::{Manifest, PartMeta, ReplicaLocation};
 use crate::dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 use crate::frame::iter_frames_from;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
@@ -126,6 +126,29 @@ impl L0Config {
     }
 }
 
+/// One durable-substrate replica the engine writes copies to (L0.6). `id` names
+/// the replica (recorded in [`ReplicaLocation::replica`]); `substrate` is its
+/// byte-sink handle. In kind/dev each replica is a distinct
+/// [`crate::substrate::LocalFsSubstrate`] directory; conceptually each is a
+/// distinct node/disk.
+#[derive(Clone)]
+pub struct ReplicaTarget {
+    /// Stable replica id (e.g. `replica-0`).
+    pub id: String,
+    /// The replica's durable byte-sink.
+    pub substrate: Arc<dyn DurableSubstrate>,
+}
+
+impl ReplicaTarget {
+    /// Construct a replica target.
+    pub fn new(id: impl Into<String>, substrate: Arc<dyn DurableSubstrate>) -> Self {
+        Self {
+            id: id.into(),
+            substrate,
+        }
+    }
+}
+
 /// A unit of upload work handed to the background uploader thread.
 struct UploadJob {
     substrate_key: String,
@@ -138,7 +161,10 @@ struct UploadJob {
 /// shard owner, matching #254's single-writer assumption).
 pub struct L0EventLogEngine {
     config: L0Config,
-    substrate: Arc<dyn DurableSubstrate>,
+    /// The **N-way replica set** (L0.6): every immutable part + the durable
+    /// manifest is written to all of these; reads try them in order with
+    /// fallback. A single-substrate `open` yields one replica (`replica-0`).
+    replicas: Vec<ReplicaTarget>,
     metrics: Arc<L0Metrics>,
     /// In-RAM catalog — local-only + durable parts. Shared with the uploader
     /// thread, which records a replica on upload.
@@ -155,74 +181,122 @@ pub struct L0EventLogEngine {
 }
 
 impl L0EventLogEngine {
-    /// Open a writer engine over `substrate`, reusing any manifest already in
-    /// the substrate (so a restart of the owner resumes its catalog). The
-    /// local hot tier is `config.local_root`.
+    /// Open a **single-replica** writer engine over `substrate` (`replica-0`),
+    /// reusing any manifest already there. The local hot tier is
+    /// `config.local_root`.
     pub fn open(config: L0Config, substrate: Arc<dyn DurableSubstrate>) -> Result<Self> {
-        let metrics = L0Metrics::new();
-        Self::open_with_metrics(config, substrate, metrics)
+        Self::open_replicated(config, vec![ReplicaTarget::new("replica-0", substrate)])
     }
 
-    /// Open sharing an existing [`L0Metrics`] handle (so a caller can read
-    /// counters).
+    /// Open sharing an existing [`L0Metrics`] handle (single replica).
     pub fn open_with_metrics(
         config: L0Config,
         substrate: Arc<dyn DurableSubstrate>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
+        Self::open_replicated_with_metrics(
+            config,
+            vec![ReplicaTarget::new("replica-0", substrate)],
+            metrics,
+        )
+    }
+
+    /// **Open an N-way replicated writer engine** (L0.6). Every immutable part +
+    /// the durable manifest is written to all `replicas`; reads fall back across
+    /// them. `replicas` must be non-empty.
+    pub fn open_replicated(config: L0Config, replicas: Vec<ReplicaTarget>) -> Result<Self> {
+        Self::open_replicated_with_metrics(config, replicas, L0Metrics::new())
+    }
+
+    /// N-way open sharing a metrics handle.
+    pub fn open_replicated_with_metrics(
+        config: L0Config,
+        replicas: Vec<ReplicaTarget>,
+        metrics: Arc<L0Metrics>,
+    ) -> Result<Self> {
+        if replicas.is_empty() {
+            return Err(EhdbError::InvalidState(
+                "L0 engine needs at least one replica target".into(),
+            ));
+        }
         fs::create_dir_all(&config.local_root)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
-        // Resume the durable catalog if present (owner restart), else start empty.
-        let manifest = load_durable_manifest(&*substrate, &config.dataset)?
+        // Resume the durable catalog if present (owner restart) — from any
+        // surviving replica, else start empty.
+        let manifest = load_durable_manifest(&replicas, &config.dataset)?
             .unwrap_or_else(|| Manifest::empty(&config.dataset));
         let global_sequence = manifest.max_sequence();
-        let mut engine = Self::assemble(config, substrate, metrics, manifest, global_sequence);
+        let mut engine = Self::assemble(config, replicas, metrics, manifest, global_sequence);
         engine.start_uploader();
         Ok(engine)
     }
 
-    /// **Cold-load** a fresh node (empty local dir) from the substrate: read
-    /// the durable manifest and serve reads entirely from substrate-replica parts.
+    /// **Cold-load** a fresh node (empty local dir) from a single substrate:
+    /// read the durable manifest and serve reads from substrate-replica parts.
     /// Reproduces the exact record set + global sequence of the origin — the
     /// fungible-writer property that retires the per-shard-Raft "T-RF" plan
-    /// (RFC §2.7). The returned engine can also *resume writing* (new parts
-    /// continue from the recovered `global_sequence`).
+    /// (RFC §2.7).
     pub fn cold_load(config: L0Config, substrate: Arc<dyn DurableSubstrate>) -> Result<Self> {
-        let metrics = L0Metrics::new();
-        Self::cold_load_with_metrics(config, substrate, metrics)
+        Self::cold_load_replicated(config, vec![ReplicaTarget::new("replica-0", substrate)])
     }
 
-    /// Cold-load sharing a metrics handle.
+    /// Cold-load (single replica) sharing a metrics handle.
     pub fn cold_load_with_metrics(
         config: L0Config,
         substrate: Arc<dyn DurableSubstrate>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
+        Self::cold_load_replicated_with_metrics(
+            config,
+            vec![ReplicaTarget::new("replica-0", substrate)],
+            metrics,
+        )
+    }
+
+    /// **Cold-load from an N-way replica set** (L0.6). A fresh node reads the
+    /// durable manifest from any surviving replica and serves reads across all of
+    /// them with fallback — the durability payoff: one dead replica does not
+    /// stop recovery.
+    pub fn cold_load_replicated(config: L0Config, replicas: Vec<ReplicaTarget>) -> Result<Self> {
+        Self::cold_load_replicated_with_metrics(config, replicas, L0Metrics::new())
+    }
+
+    /// N-way cold-load sharing a metrics handle.
+    pub fn cold_load_replicated_with_metrics(
+        config: L0Config,
+        replicas: Vec<ReplicaTarget>,
+        metrics: Arc<L0Metrics>,
+    ) -> Result<Self> {
+        if replicas.is_empty() {
+            return Err(EhdbError::InvalidState(
+                "L0 cold-load needs at least one replica target".into(),
+            ));
+        }
         fs::create_dir_all(&config.local_root)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
-        let manifest = load_durable_manifest(&*substrate, &config.dataset)?.ok_or_else(|| {
+        let manifest = load_durable_manifest(&replicas, &config.dataset)?.ok_or_else(|| {
             EhdbError::InvalidState(format!(
-                "cold-load: no durable manifest for dataset {}",
+                "cold-load: no durable manifest for dataset {} on any replica",
                 config.dataset
             ))
         })?;
         let global_sequence = manifest.max_sequence();
         metrics.incr_cold_loads();
-        let mut engine = Self::assemble(config, substrate, metrics, manifest, global_sequence);
+        let mut engine = Self::assemble(config, replicas, metrics, manifest, global_sequence);
         engine.start_uploader();
         Ok(engine)
     }
 
     fn assemble(
         config: L0Config,
-        substrate: Arc<dyn DurableSubstrate>,
+        replicas: Vec<ReplicaTarget>,
         metrics: Arc<L0Metrics>,
         manifest: Manifest,
         global_sequence: u64,
     ) -> Self {
         Self {
             config,
-            substrate,
+            replicas,
             metrics,
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
@@ -235,7 +309,7 @@ impl L0EventLogEngine {
 
     fn start_uploader(&mut self) {
         let (tx, rx) = mpsc::channel::<UploadJob>();
-        let substrate = Arc::clone(&self.substrate);
+        let replicas = self.replicas.clone();
         let manifest = Arc::clone(&self.manifest);
         let metrics = Arc::clone(&self.metrics);
         let outstanding = Arc::clone(&self.outstanding);
@@ -244,50 +318,46 @@ impl L0EventLogEngine {
             .name("ehdb-l0-uploader".to_string())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    // Read the sealed part bytes and ship them to the object
-                    // store. The append path never does this — durability is
-                    // asynchronous (RFC §2.3).
-                    let upload_result = (|| -> Result<u64> {
-                        let bytes = fs::read(&job.local_path)
-                            .map_err(|err| EhdbError::Storage(err.to_string()))?;
-                        substrate.put_if_absent(&job.substrate_key, &bytes)?;
-                        Ok(bytes.len() as u64)
-                    })();
-
-                    let bytes_len = match upload_result {
-                        Ok(n) => n,
+                    // Read the sealed part bytes and **write-once copy to every
+                    // replica** (N-way, L0.6). The append path never does this —
+                    // durability is asynchronous (RFC §2.3). Parts are immutable,
+                    // so each copy is byte-identical and no consensus is needed.
+                    let read_result = fs::read(&job.local_path)
+                        .map_err(|err| EhdbError::Storage(err.to_string()));
+                    let bytes = match read_result {
+                        Ok(b) => b,
                         Err(_) => {
-                            // On upload failure the part stays local-only (its
-                            // manifest row keeps `replicas` empty); a later
-                            // retry slice re-drives it. Still decrement so a
-                            // waiter isn't wedged.
                             decrement(&outstanding);
                             continue;
                         }
                     };
+                    let locations =
+                        replicate_bytes(&replicas, &job.substrate_key, &bytes, &metrics);
+                    if locations.is_empty() {
+                        // Every replica write failed → part stays local-only (its
+                        // manifest row keeps `replicas` empty); a retry slice
+                        // re-drives it. Decrement so a waiter isn't wedged.
+                        decrement(&outstanding);
+                        continue;
+                    }
 
-                    // Record the replica on the part and snapshot the durable view
-                    // — under the lock, but the substrate write happens
+                    // Record the replica locations on the part and snapshot the
+                    // durable view — under the lock; the substrate writes happen
                     // OUTSIDE the lock so a slow store never blocks appends/reads.
                     let durable = {
                         let mut m = manifest.lock().unwrap();
                         if let Some(p) = m.parts.iter_mut().find(|p| p.part_id == job.part_id) {
-                            // Single-replica write now; N-way copy appends more
-                            // keys here (the replication seam — parts are
-                            // immutable, so no consensus is needed).
-                            p.replicas = vec![job.substrate_key.clone()];
+                            p.replicas = locations.clone();
                         }
                         m.version += 1;
                         m.durable_view()
                     };
-                    if let Ok(ser) = serde_json::to_vec(&durable) {
-                        let _ = substrate.put_overwrite(&manifest_latest_key(&dataset), &ser);
-                        let _ = substrate
-                            .put_if_absent(&manifest_version_key(&dataset, durable.version), &ser);
-                    }
+                    // The durable manifest must exist on EVERY replica so any one
+                    // of them can serve a cold-load alone.
+                    write_manifest_to_all(&replicas, &dataset, &durable);
 
                     let lag = job.sealed_at.elapsed().as_micros() as u64;
-                    metrics.record_upload(bytes_len, lag);
+                    metrics.record_upload(bytes.len() as u64, lag);
                     decrement(&outstanding);
                 }
             })
@@ -477,8 +547,8 @@ impl L0EventLogEngine {
             &records,
         )?;
 
-        // Upload the merged part synchronously so the manifest swap that removes
-        // the sources is durable-consistent for a cold-load.
+        // Write the merged part synchronously to ALL replicas so the manifest
+        // swap that removes the sources is durable-consistent for a cold-load.
         let substrate_key =
             substrate_key_for(&self.config.dataset, plan.partition, &sealed.meta.part_id);
         let local_path = sealed
@@ -487,7 +557,12 @@ impl L0EventLogEngine {
             .clone()
             .ok_or_else(|| EhdbError::InvalidState("merged part missing local_path".into()))?;
         let bytes = fs::read(&local_path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-        self.substrate.put_if_absent(&substrate_key, &bytes)?;
+        let locations = replicate_bytes(&self.replicas, &substrate_key, &bytes, &self.metrics);
+        if locations.is_empty() {
+            return Err(EhdbError::Storage(
+                "merge: merged part failed to write to any replica".into(),
+            ));
+        }
 
         // Atomic manifest swap: remove the sources, add the merged part (durable).
         let durable = {
@@ -495,19 +570,12 @@ impl L0EventLogEngine {
             let source_set: std::collections::HashSet<&String> = plan.source_ids.iter().collect();
             m.parts.retain(|p| !source_set.contains(&p.part_id));
             let mut merged = sealed.meta.clone();
-            merged.replicas = vec![substrate_key.clone()];
+            merged.replicas = locations;
             m.parts.push(merged);
             m.version += 1;
             m.durable_view()
         };
-        if let Ok(ser) = serde_json::to_vec(&durable) {
-            self.substrate
-                .put_overwrite(&manifest_latest_key(&self.config.dataset), &ser)?;
-            let _ = self.substrate.put_if_absent(
-                &manifest_version_key(&self.config.dataset, durable.version),
-                &ser,
-            );
-        }
+        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
 
         self.metrics
             .record_merge(sources.len() as u64, bytes.len() as u64);
@@ -526,9 +594,13 @@ impl L0EventLogEngine {
         let (referenced_objects, referenced_locals) = {
             let m = self.manifest.lock().unwrap();
             // Every substrate key referenced by any part's replica list — a
-            // part may have N replicas, all of which must be kept.
-            let objs: std::collections::HashSet<String> =
-                m.parts.iter().flat_map(|p| p.replicas.clone()).collect();
+            // part may have N replicas (same key on different substrates), all of
+            // which must be kept.
+            let objs: std::collections::HashSet<String> = m
+                .parts
+                .iter()
+                .flat_map(|p| p.replicas.iter().map(|r| r.key.clone()))
+                .collect();
             let locals: std::collections::HashSet<String> = m
                 .parts
                 .iter()
@@ -539,18 +611,20 @@ impl L0EventLogEngine {
 
         let mut reclaimed = 0usize;
 
-        // Object-store orphans under this dataset's parts prefix.
+        // Object orphans on EVERY replica substrate under this dataset's prefix.
         let prefix = format!("parts/{}/", self.config.dataset);
-        for key in self.substrate.list_prefix(&prefix)? {
-            if !referenced_objects.contains(&key) {
-                let bytes = self
-                    .substrate
-                    .get_all(&key)
-                    .map(|b| b.len() as u64)
-                    .unwrap_or(0);
-                self.substrate.delete(&key)?;
-                self.metrics.record_orphan_reclaim(bytes);
-                reclaimed += 1;
+        for target in &self.replicas {
+            for key in target.substrate.list_prefix(&prefix)? {
+                if !referenced_objects.contains(&key) {
+                    let bytes = target
+                        .substrate
+                        .get_all(&key)
+                        .map(|b| b.len() as u64)
+                        .unwrap_or(0);
+                    target.substrate.delete(&key)?;
+                    self.metrics.record_orphan_reclaim(bytes);
+                    reclaimed += 1;
+                }
             }
         }
 
@@ -600,14 +674,7 @@ impl L0EventLogEngine {
             m.version += 1;
             m.durable_view()
         };
-        if let Ok(ser) = serde_json::to_vec(&durable) {
-            self.substrate
-                .put_overwrite(&manifest_latest_key(&self.config.dataset), &ser)?;
-            let _ = self.substrate.put_if_absent(
-                &manifest_version_key(&self.config.dataset, durable.version),
-                &ser,
-            );
-        }
+        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
 
         let dropped = plan.drop_ids.len();
         self.metrics.record_parts_dropped(dropped as u64);
@@ -634,19 +701,55 @@ impl L0EventLogEngine {
         self.manifest.lock().unwrap().reclaimed_through
     }
 
-    /// Read a whole part's bytes — local hot tier if resident, else the durable
-    /// substrate (primary replica).
+    /// Read a whole part's bytes — local hot tier if resident, else across the
+    /// durable replicas with fallback.
     fn read_whole_part(&self, part: &PartMeta) -> Result<Vec<u8>> {
         if let Some(local_path) = &part.local_path {
-            fs::read(local_path).map_err(|err| EhdbError::Storage(err.to_string()))
-        } else if let Some(replica) = part.primary_replica() {
-            self.substrate.get_all(replica)
-        } else {
-            Err(EhdbError::InvalidState(format!(
-                "part {} has no location",
-                part.part_id
-            )))
+            return fs::read(local_path).map_err(|err| EhdbError::Storage(err.to_string()));
         }
+        self.read_across_replicas(part, |substrate, key| substrate.get_all(key))
+    }
+
+    /// Read a part from its durable replicas **with fallback** (L0.6): try each
+    /// [`ReplicaLocation`] in order, resolving its `replica` id to a substrate
+    /// handle; on failure move to the next. A dead `replica-0` is served from
+    /// `replica-1`. Records a `read_fallbacks` metric whenever a non-primary
+    /// replica is used. Errors only if the part is local-only or *every* replica
+    /// fails.
+    fn read_across_replicas<F>(&self, part: &PartMeta, read: F) -> Result<Vec<u8>>
+    where
+        F: Fn(&Arc<dyn DurableSubstrate>, &str) -> Result<Vec<u8>>,
+    {
+        if part.replicas.is_empty() {
+            return Err(EhdbError::InvalidState(format!(
+                "part {} has neither a local_path nor a durable replica",
+                part.part_id
+            )));
+        }
+        let mut last_err: Option<EhdbError> = None;
+        for (attempt, loc) in part.replicas.iter().enumerate() {
+            let Some(target) = self.replicas.iter().find(|t| t.id == loc.replica) else {
+                // A replica id the current engine doesn't know (e.g. cold-loaded
+                // with a different replica set) — skip it.
+                continue;
+            };
+            match read(&target.substrate, &loc.key) {
+                Ok(bytes) => {
+                    if attempt > 0 {
+                        self.metrics.record_read_fallback();
+                    }
+                    return Ok(bytes);
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            EhdbError::Storage(format!(
+                "part {}: no reachable replica ({} listed)",
+                part.part_id,
+                part.replicas.len()
+            ))
+        }))
     }
 
     /// **The D1 read path** (RFC §2.5 worked example + L0.2 index-first pruning):
@@ -722,17 +825,14 @@ impl L0EventLogEngine {
             if len == 0 {
                 continue;
             }
-            // Prefer the local hot tier (no substrate I/O); fall back to a
-            // ranged GET against the durable substrate (the primary replica).
+            // Prefer the local hot tier (no substrate I/O); else a ranged GET
+            // across the durable replicas with fallback (L0.6).
             let block = if let Some(local_path) = &part.local_path {
                 read_local_range(local_path, block_start, len)?
-            } else if let Some(replica) = part.primary_replica() {
-                self.substrate.get_range(replica, block_start, len)?
             } else {
-                return Err(EhdbError::InvalidState(format!(
-                    "part {} has neither a local_path nor a durable replica",
-                    part.part_id
-                )));
+                self.read_across_replicas(part, |substrate, key| {
+                    substrate.get_range(key, block_start, len)
+                })?
             };
             for frame in iter_frames_from(&block, 0)? {
                 let rec: EventRecord = serde_json::from_slice(frame.body).map_err(|err| {
@@ -774,16 +874,7 @@ impl L0EventLogEngine {
             ps
         };
         for part in &parts {
-            let bytes = if let Some(local_path) = &part.local_path {
-                fs::read(local_path).map_err(|err| EhdbError::Storage(err.to_string()))?
-            } else if let Some(replica) = part.primary_replica() {
-                self.substrate.get_all(replica)?
-            } else {
-                return Err(EhdbError::InvalidState(format!(
-                    "replay_all: part {} has no location",
-                    part.part_id
-                )));
-            };
+            let bytes = self.read_whole_part(part)?;
             for frame in iter_frames_from(&bytes, 0)? {
                 let rec: EventRecord = serde_json::from_slice(frame.body)
                     .map_err(|err| EhdbError::Storage(format!("decode l0 record: {err}")))?;
@@ -867,16 +958,66 @@ fn manifest_version_key(dataset: &str, version: u64) -> String {
     format!("manifest/{dataset}/manifest-v{version:020}.json")
 }
 
-fn load_durable_manifest(
-    substrate: &dyn DurableSubstrate,
-    dataset: &str,
-) -> Result<Option<Manifest>> {
-    let key = manifest_latest_key(dataset);
-    if !substrate.exists(&key)? {
-        return Ok(None);
+/// **Write-once copy immutable `bytes` to every replica** under `key` (L0.6),
+/// returning a [`ReplicaLocation`] for each replica that accepted the write.
+/// Parts are immutable so `put_if_absent` is idempotent — a replica that already
+/// holds the part still counts (it is durable there). Records a `replica_write`
+/// metric per successful copy.
+fn replicate_bytes(
+    replicas: &[ReplicaTarget],
+    key: &str,
+    bytes: &[u8],
+    metrics: &L0Metrics,
+) -> Vec<ReplicaLocation> {
+    let mut locations = Vec::with_capacity(replicas.len());
+    for target in replicas {
+        match target.substrate.put_if_absent(key, bytes) {
+            Ok(_) => {
+                metrics.record_replica_write();
+                locations.push(ReplicaLocation {
+                    replica: target.id.clone(),
+                    key: key.to_string(),
+                });
+            }
+            Err(_) => { /* this replica is down; the others still give durability */ }
+        }
     }
-    let bytes = substrate.get_all(&key)?;
-    let manifest: Manifest = serde_json::from_slice(&bytes)
-        .map_err(|err| EhdbError::Storage(format!("decode durable manifest: {err}")))?;
-    Ok(Some(manifest))
+    locations
+}
+
+/// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
+/// replica, so any one of them can serve a cold-load alone. Best-effort per
+/// replica (a down replica is skipped; the survivors carry the manifest).
+fn write_manifest_to_all(replicas: &[ReplicaTarget], dataset: &str, durable: &Manifest) {
+    let Ok(ser) = serde_json::to_vec(durable) else {
+        return;
+    };
+    for target in replicas {
+        let _ = target
+            .substrate
+            .put_overwrite(&manifest_latest_key(dataset), &ser);
+        let _ = target
+            .substrate
+            .put_if_absent(&manifest_version_key(dataset, durable.version), &ser);
+    }
+}
+
+/// Load the durable manifest from the **first replica that has it** (L0.6): a
+/// dead `replica-0` does not stop recovery — the manifest is replicated, so any
+/// survivor serves it.
+fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Option<Manifest>> {
+    let key = manifest_latest_key(dataset);
+    for target in replicas {
+        match target.substrate.exists(&key) {
+            Ok(true) => {}
+            _ => continue,
+        }
+        let Ok(bytes) = target.substrate.get_all(&key) else {
+            continue;
+        };
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|err| EhdbError::Storage(format!("decode durable manifest: {err}")))?;
+        return Ok(Some(manifest));
+    }
+    Ok(None)
 }
