@@ -316,6 +316,91 @@ fn build_execution_blooms(
     (part_bloom, granule_blooms)
 }
 
+/// Build one immutable **merged** part (the L0.3 compaction output) from an
+/// already-sorted (ascending `global_sequence`) record set, writing it into
+/// `dest_dir` as a `<part_id>.eslog` file. Produces the same immutable-part
+/// shape a fresh seal would — CRC-framed records, sparse index, per-part +
+/// per-granule blooms — so a merged part is indistinguishable from a sealed one
+/// to the read path. The records preserve their original global sequences, so
+/// the merged part covers the contiguous sort-key range of its inputs.
+///
+/// `records` must be non-empty and ascending by `global_sequence` (the caller —
+/// the merge engine — sorts the source parts' records before calling).
+pub fn build_merged_part(
+    partition: u32,
+    granule_size: u32,
+    dest_dir: &Path,
+    records: &[EventRecord],
+) -> Result<SealedPart> {
+    if records.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "build_merged_part: empty record set".into(),
+        ));
+    }
+    let gsize = granule_size.max(1);
+    fs::create_dir_all(dest_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
+
+    let min_sequence = records[0].global_sequence;
+    let max_sequence = records[records.len() - 1].global_sequence;
+    let part_id = format!("shard-{partition}-seq-{min_sequence:020}-{max_sequence:020}");
+    let tmp_path = dest_dir.join(format!("{part_id}.merge-tmp"));
+    let final_path = dest_dir.join(format!("{part_id}.eslog"));
+
+    let mut marks: Vec<GranuleMark> = Vec::new();
+    let mut byte_len: u64 = 0;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        for (i, record) in records.iter().enumerate() {
+            let body = serde_json::to_vec(record)
+                .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
+            let frame = encode_frame(&body)?;
+            if i as u64 % gsize as u64 == 0 {
+                marks.push(GranuleMark {
+                    first_sequence: record.global_sequence,
+                    byte_offset: byte_len,
+                    record_count: 0,
+                });
+            }
+            file.write_all(&frame)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            byte_len += frame.len() as u64;
+            if let Some(last) = marks.last_mut() {
+                last.record_count += 1;
+            }
+        }
+        file.sync_data()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    }
+    fs::rename(&tmp_path, &final_path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+
+    let (execution_bloom, granule_blooms) = build_execution_blooms(records, &marks, gsize);
+    let meta = PartMeta {
+        part_id,
+        partition,
+        min_sequence,
+        max_sequence,
+        record_count: records.len() as u64,
+        byte_size: byte_len,
+        replicas: Vec::new(),
+        local_path: Some(final_path.to_string_lossy().to_string()),
+        sparse_index: SparseIndex {
+            granule_size: gsize,
+            marks,
+        },
+        execution_bloom: Some(execution_bloom),
+        granule_blooms,
+    };
+    Ok(SealedPart {
+        meta,
+        records: records.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
