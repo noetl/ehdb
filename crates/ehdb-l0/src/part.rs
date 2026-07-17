@@ -26,7 +26,7 @@ use ehdb_core::{EhdbError, Result};
 
 use crate::bloom::Bloom;
 use crate::catalog::{GranuleMark, PartMeta, SparseIndex};
-use crate::dataset::EventRecord;
+use crate::dataset::Dataset;
 use crate::frame::encode_frame;
 
 /// Durability-window posture (RFC §2.3). D1's event log uses [`Self::EveryAppend`].
@@ -42,20 +42,20 @@ pub enum FlushPolicy {
 }
 
 /// A sealed, immutable part ready for the manifest + the async uploader.
-#[derive(Debug, Clone)]
-pub struct SealedPart {
+/// Generic over the [`Dataset`] whose records it holds.
+pub struct SealedPart<D: Dataset> {
     /// The catalog row for this part (`local_path` set, `replicas` still empty
-    /// `None` until the upload lands).
+    /// until the upload lands).
     pub meta: PartMeta,
     /// The exact records this part holds, in sort-key order — returned so the
     /// engine can serve reads of a just-sealed part without re-reading disk, and
     /// so the proof can assert the sealed content.
-    pub records: Vec<EventRecord>,
+    pub records: Vec<D::Record>,
 }
 
-/// The active-part writer for one partition. One per shard in the engine.
-#[derive(Debug)]
-pub struct PartWriter {
+/// The active-part writer for one partition of one [`Dataset`]. One per shard in
+/// the engine.
+pub struct PartWriter<D: Dataset> {
     dataset: String,
     partition: u32,
     /// Directory holding this partition's part files.
@@ -71,7 +71,7 @@ pub struct PartWriter {
     // --- active part state ---
     active_path: PathBuf,
     file: Option<File>,
-    records: Vec<EventRecord>,
+    records: Vec<D::Record>,
     marks: Vec<GranuleMark>,
     min_sequence: u64,
     max_sequence: u64,
@@ -80,7 +80,7 @@ pub struct PartWriter {
     unflushed_since_fsync: u32,
 }
 
-impl PartWriter {
+impl<D: Dataset> PartWriter<D> {
     /// Open a writer for `partition` under `part_dir`
     /// (`.../parts/<dataset>/shard-<partition>/`).
     pub fn open(
@@ -142,7 +142,8 @@ impl PartWriter {
     /// Append one record to the active part (hot tier). Never touches the object
     /// store — durability rides the async uploader on seal. Returns the byte
     /// offset the frame was written at (its mark).
-    pub fn append(&mut self, record: EventRecord) -> Result<u64> {
+    pub fn append(&mut self, record: D::Record) -> Result<u64> {
+        let sort_key = D::sort_key(&record);
         let body = serde_json::to_vec(&record)
             .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
         let frame = encode_frame(&body)?;
@@ -151,7 +152,7 @@ impl PartWriter {
         // Start-of-granule mark: first record of each granule.
         if self.record_count % self.granule_size as u64 == 0 {
             self.marks.push(GranuleMark {
-                first_sequence: record.global_sequence,
+                first_sequence: sort_key,
                 byte_offset: mark_offset,
                 record_count: 0,
             });
@@ -180,9 +181,9 @@ impl PartWriter {
         }
 
         if self.record_count == 0 {
-            self.min_sequence = record.global_sequence;
+            self.min_sequence = sort_key;
         }
-        self.max_sequence = record.global_sequence;
+        self.max_sequence = sort_key;
         self.byte_len += frame.len() as u64;
         self.record_count += 1;
         // Grow the current granule's count.
@@ -205,7 +206,7 @@ impl PartWriter {
     }
 
     /// The active (unsealed) records, for serving the hot tail.
-    pub fn pending_records(&self) -> &[EventRecord] {
+    pub fn pending_records(&self) -> &[D::Record] {
         &self.records
     }
 
@@ -227,7 +228,7 @@ impl PartWriter {
     /// Seal the active part into an immutable `.eslog` file and return its
     /// [`SealedPart`]. `fsync`s, renames the active file to its durable name, and
     /// opens a fresh active part. Returns `None` if there is nothing to seal.
-    pub fn seal(&mut self) -> Result<Option<SealedPart>> {
+    pub fn seal(&mut self) -> Result<Option<SealedPart<D>>> {
         if self.record_count == 0 {
             return Ok(None);
         }
@@ -251,10 +252,10 @@ impl PartWriter {
         let records = std::mem::take(&mut self.records);
 
         // L0.2 fixed inverted index: build the per-part + per-granule blooms over
-        // `execution_id` from the sealed records. A record's granule index is
-        // `record_position / granule_size` (the same partitioning the marks use).
+        // the dataset's index dimension (D1: `execution_id`) from the sealed
+        // records. A record's granule index is `record_position / granule_size`.
         let (execution_bloom, granule_blooms) =
-            build_execution_blooms(&records, &marks, self.granule_size);
+            build_index_blooms::<D>(&records, &marks, self.granule_size);
 
         let meta = PartMeta {
             part_id: part_id.clone(),
@@ -292,11 +293,10 @@ pub fn substrate_key_for(dataset: &str, partition: u32, part_id: &str) -> String
 }
 
 /// Build the L0.2 fixed inverted index for a sealed part: one part-level bloom
-/// over every `execution_id`, and one bloom per granule (parallel to `marks`)
-/// over that granule's execution ids. Record `i` belongs to granule
-/// `i / granule_size`.
-fn build_execution_blooms(
-    records: &[EventRecord],
+/// over every record's index key (D1: `execution_id`), and one bloom per granule
+/// (parallel to `marks`). Record `i` belongs to granule `i / granule_size`.
+fn build_index_blooms<D: Dataset>(
+    records: &[D::Record],
     marks: &[GranuleMark],
     granule_size: u32,
 ) -> (Bloom, Vec<Bloom>) {
@@ -307,10 +307,11 @@ fn build_execution_blooms(
         .collect();
     let gsize = granule_size.max(1) as usize;
     for (i, record) in records.iter().enumerate() {
-        part_bloom.insert(&record.execution_id);
+        let key = D::index_key(record);
+        part_bloom.insert(key);
         let g = i / gsize;
         if let Some(bloom) = granule_blooms.get_mut(g) {
-            bloom.insert(&record.execution_id);
+            bloom.insert(key);
         }
     }
     (part_bloom, granule_blooms)
@@ -326,12 +327,12 @@ fn build_execution_blooms(
 ///
 /// `records` must be non-empty and ascending by `global_sequence` (the caller —
 /// the merge engine — sorts the source parts' records before calling).
-pub fn build_merged_part(
+pub fn build_merged_part<D: Dataset>(
     partition: u32,
     granule_size: u32,
     dest_dir: &Path,
-    records: &[EventRecord],
-) -> Result<SealedPart> {
+    records: &[D::Record],
+) -> Result<SealedPart<D>> {
     if records.is_empty() {
         return Err(EhdbError::InvalidState(
             "build_merged_part: empty record set".into(),
@@ -340,8 +341,8 @@ pub fn build_merged_part(
     let gsize = granule_size.max(1);
     fs::create_dir_all(dest_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
 
-    let min_sequence = records[0].global_sequence;
-    let max_sequence = records[records.len() - 1].global_sequence;
+    let min_sequence = D::sort_key(&records[0]);
+    let max_sequence = D::sort_key(&records[records.len() - 1]);
     let part_id = format!("shard-{partition}-seq-{min_sequence:020}-{max_sequence:020}");
     let tmp_path = dest_dir.join(format!("{part_id}.merge-tmp"));
     let final_path = dest_dir.join(format!("{part_id}.eslog"));
@@ -361,7 +362,7 @@ pub fn build_merged_part(
             let frame = encode_frame(&body)?;
             if i as u64 % gsize as u64 == 0 {
                 marks.push(GranuleMark {
-                    first_sequence: record.global_sequence,
+                    first_sequence: D::sort_key(record),
                     byte_offset: byte_len,
                     record_count: 0,
                 });
@@ -378,7 +379,7 @@ pub fn build_merged_part(
     }
     fs::rename(&tmp_path, &final_path).map_err(|err| EhdbError::Storage(err.to_string()))?;
 
-    let (execution_bloom, granule_blooms) = build_execution_blooms(records, &marks, gsize);
+    let (execution_bloom, granule_blooms) = build_index_blooms::<D>(records, &marks, gsize);
     let meta = PartMeta {
         part_id,
         partition,
@@ -404,6 +405,7 @@ pub fn build_merged_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{D1EventLog, EventRecord};
     use crate::frame::iter_frames_from;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -423,7 +425,7 @@ mod tests {
     #[test]
     fn seals_on_record_count_and_builds_sparse_index() {
         let dir = tmp();
-        let mut w = PartWriter::open(
+        let mut w = PartWriter::<D1EventLog>::open(
             "d1_event_log",
             0,
             dir.join("parts/d1/shard-0"),
@@ -461,7 +463,7 @@ mod tests {
     #[test]
     fn sparse_index_mark_offsets_point_at_frame_starts() {
         let dir = tmp();
-        let mut w = PartWriter::open(
+        let mut w = PartWriter::<D1EventLog>::open(
             "d1_event_log",
             2,
             dir.join("parts/d1/shard-2"),
@@ -491,7 +493,7 @@ mod tests {
     #[test]
     fn buffered_posture_still_durable_on_seal() {
         let dir = tmp();
-        let mut w = PartWriter::open(
+        let mut w = PartWriter::<D1EventLog>::open(
             "d1_event_log",
             0,
             dir.join("parts/d1/shard-0"),

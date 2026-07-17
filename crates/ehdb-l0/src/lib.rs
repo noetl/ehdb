@@ -116,8 +116,18 @@
 //! - **L0.5** — [`retention`] as drop-partition + orphan reclaim/GC (vacuums the
 //!   superseded merge sources + dropped parts).
 //!
-//! Still OUT (later work): wiring the columnar codec in as the on-disk part
-//! encoding + the Phase-8 blob shape (D5); generalizing beyond D1; and **all** of
+//! - **L0.6** — N-way replication of immutable parts (`ReplicaTarget`s +
+//!   [`catalog::ReplicaLocation`]); write-once copy to N replicas, read fallback,
+//!   no consensus.
+//! - **L0.7** — the engine is **dataset-generic**: [`dataset::Dataset`] captures
+//!   a dataset's fixed record schema + sort key + partition + index dimension,
+//!   and [`engine::L0Engine`]`<D>` runs the shared part/catalog/merge/replication
+//!   engine over any of them. [`engine::L0EventLogEngine`] is the D1 alias with
+//!   the ergonomic `append(exec,txn,payload)` API. D1 is the first `impl
+//!   Dataset`; more datasets (D2 command-queue, …) are new impls.
+//!
+//! Still OUT (later work): the D2…D10 dataset impls; wiring the columnar codec in
+//! as the on-disk part encoding + the Phase-8 blob shape (D5); and **all** of
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
 
@@ -136,8 +146,11 @@ pub mod substrate;
 pub use bloom::Bloom;
 pub use catalog::{Manifest, PartMeta, ReplicaLocation, SparseIndex};
 pub use columnar::{decode_columnar, encode_columnar, project_column, Column, Field};
-pub use dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
-pub use engine::{L0Config, L0EventLogEngine, ReplicaTarget};
+pub use dataset::{
+    shard_for_execution, D1EventLog, Dataset, EventRecord, DATASET_D1_EVENT_LOG,
+    DEFAULT_SHARD_COUNT,
+};
+pub use engine::{L0Config, L0Engine, L0EventLogEngine, ReplicaTarget};
 pub use merge::{MergePlan, MergePolicy};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};
