@@ -1,26 +1,26 @@
 //! [`L0EventLogEngine`] — the hot-local / durable-async composite (RFC §2.3) for
 //! dataset D1, tying [`crate::part`] (the write engine), [`crate::catalog`] (the
-//! meta-catalog), and [`crate::object_store`] (the durability tier) together.
+//! meta-catalog), and [`crate::substrate`] (the durability tier) together.
 //!
 //! ```text
 //!   append(exec, txn, payload)
 //!     └─ hot: route to shard_for(exec) → PartWriter.append (fsync-per-append, posture A)
 //!           └─ on seal trigger → immutable part + manifest row (local-only) + enqueue upload
 //!   [background uploader thread]
-//!     └─ read sealed part bytes → object_store.put_if_absent → set object_uri → rewrite durable manifest
+//!     └─ read sealed part bytes → substrate.put_if_absent → record a replica → rewrite durable manifest
 //!   read_execution_after(exec, seq)
 //!     └─ manifest.prune(shard, seq)  ← MinMax skip: non-matching parts = zero I/O
 //!        └─ per part: sparse_index.locate(seq) → ranged read [mark, end)  ← only the needed block
-//!           └─ prefer local_path (hot); else object_store.get_range (durable)
+//!           └─ prefer local_path (hot); else substrate.get_range (durable)
 //!        └─ + the active (unsealed) hot buffer
-//!   cold_load(object_store)  ← fresh node, empty local dir
-//!     └─ read durable manifest → serve reads entirely from the object store
+//!   cold_load(substrate)  ← fresh node, empty local dir
+//!     └─ read durable manifest → serve reads entirely from the substrate
 //!        (reproduces the exact record set + global sequence — the fungible-writer property, RFC §2.7)
 //! ```
 //!
-//! The append path **never** calls the object store; only the background
+//! The append path **never** calls the substrate; only the background
 //! uploader does. That is the §2.3 claim the L0.1 proof exercises with an
-//! injected object-store latency: appends do not regress when uploads are slow.
+//! injected substrate latency: appends do not regress when uploads are slow.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -37,8 +37,8 @@ use crate::catalog::Manifest;
 use crate::dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 use crate::frame::iter_frames_from;
 use crate::metrics::L0Metrics;
-use crate::object_store::L0ObjectStore;
-use crate::part::{object_key_for, FlushPolicy, PartWriter, SealedPart};
+use crate::part::{substrate_key_for, FlushPolicy, PartWriter, SealedPart};
+use crate::substrate::DurableSubstrate;
 
 /// Default granule size (records per sparse-index entry).
 pub const DEFAULT_GRANULE_SIZE: u32 = 16;
@@ -115,7 +115,7 @@ impl L0Config {
 
 /// A unit of upload work handed to the background uploader thread.
 struct UploadJob {
-    object_key: String,
+    substrate_key: String,
     local_path: String,
     part_id: String,
     sealed_at: Instant,
@@ -125,10 +125,10 @@ struct UploadJob {
 /// shard owner, matching #254's single-writer assumption).
 pub struct L0EventLogEngine {
     config: L0Config,
-    object_store: Arc<dyn L0ObjectStore>,
+    substrate: Arc<dyn DurableSubstrate>,
     metrics: Arc<L0Metrics>,
     /// In-RAM catalog — local-only + durable parts. Shared with the uploader
-    /// thread, which sets `object_uri` on upload.
+    /// thread, which records a replica on upload.
     manifest: Arc<Mutex<Manifest>>,
     /// Per-shard active writers (engine-owned single writer).
     writers: HashMap<u32, PartWriter>,
@@ -142,75 +142,74 @@ pub struct L0EventLogEngine {
 }
 
 impl L0EventLogEngine {
-    /// Open a writer engine over `object_store`, reusing any manifest already in
-    /// the object store (so a restart of the owner resumes its catalog). The
+    /// Open a writer engine over `substrate`, reusing any manifest already in
+    /// the substrate (so a restart of the owner resumes its catalog). The
     /// local hot tier is `config.local_root`.
-    pub fn open(config: L0Config, object_store: Arc<dyn L0ObjectStore>) -> Result<Self> {
+    pub fn open(config: L0Config, substrate: Arc<dyn DurableSubstrate>) -> Result<Self> {
         let metrics = L0Metrics::new();
-        Self::open_with_metrics(config, object_store, metrics)
+        Self::open_with_metrics(config, substrate, metrics)
     }
 
     /// Open sharing an existing [`L0Metrics`] handle (so a caller can read
     /// counters).
     pub fn open_with_metrics(
         config: L0Config,
-        object_store: Arc<dyn L0ObjectStore>,
+        substrate: Arc<dyn DurableSubstrate>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
         fs::create_dir_all(&config.local_root)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
         // Resume the durable catalog if present (owner restart), else start empty.
-        let manifest = load_durable_manifest(&*object_store, &config.dataset)?
+        let manifest = load_durable_manifest(&*substrate, &config.dataset)?
             .unwrap_or_else(|| Manifest::empty(&config.dataset));
         let global_sequence = manifest.max_sequence();
-        let mut engine = Self::assemble(config, object_store, metrics, manifest, global_sequence);
+        let mut engine = Self::assemble(config, substrate, metrics, manifest, global_sequence);
         engine.start_uploader();
         Ok(engine)
     }
 
-    /// **Cold-load** a fresh node (empty local dir) from the object store: read
-    /// the durable manifest and serve reads entirely from object-store parts.
+    /// **Cold-load** a fresh node (empty local dir) from the substrate: read
+    /// the durable manifest and serve reads entirely from substrate-replica parts.
     /// Reproduces the exact record set + global sequence of the origin — the
     /// fungible-writer property that retires the per-shard-Raft "T-RF" plan
     /// (RFC §2.7). The returned engine can also *resume writing* (new parts
     /// continue from the recovered `global_sequence`).
-    pub fn cold_load(config: L0Config, object_store: Arc<dyn L0ObjectStore>) -> Result<Self> {
+    pub fn cold_load(config: L0Config, substrate: Arc<dyn DurableSubstrate>) -> Result<Self> {
         let metrics = L0Metrics::new();
-        Self::cold_load_with_metrics(config, object_store, metrics)
+        Self::cold_load_with_metrics(config, substrate, metrics)
     }
 
     /// Cold-load sharing a metrics handle.
     pub fn cold_load_with_metrics(
         config: L0Config,
-        object_store: Arc<dyn L0ObjectStore>,
+        substrate: Arc<dyn DurableSubstrate>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
         fs::create_dir_all(&config.local_root)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
-        let manifest =
-            load_durable_manifest(&*object_store, &config.dataset)?.ok_or_else(|| {
-                EhdbError::InvalidState(format!(
-                    "cold-load: no durable manifest for dataset {}",
-                    config.dataset
-                ))
-            })?;
+        let manifest = load_durable_manifest(&*substrate, &config.dataset)?.ok_or_else(|| {
+            EhdbError::InvalidState(format!(
+                "cold-load: no durable manifest for dataset {}",
+                config.dataset
+            ))
+        })?;
         let global_sequence = manifest.max_sequence();
         metrics.incr_cold_loads();
-        let mut engine = Self::assemble(config, object_store, metrics, manifest, global_sequence);
+        let mut engine = Self::assemble(config, substrate, metrics, manifest, global_sequence);
         engine.start_uploader();
         Ok(engine)
     }
 
     fn assemble(
         config: L0Config,
-        object_store: Arc<dyn L0ObjectStore>,
+        substrate: Arc<dyn DurableSubstrate>,
         metrics: Arc<L0Metrics>,
         manifest: Manifest,
         global_sequence: u64,
     ) -> Self {
         Self {
             config,
-            object_store,
+            substrate,
             metrics,
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
@@ -223,7 +222,7 @@ impl L0EventLogEngine {
 
     fn start_uploader(&mut self) {
         let (tx, rx) = mpsc::channel::<UploadJob>();
-        let object_store = Arc::clone(&self.object_store);
+        let substrate = Arc::clone(&self.substrate);
         let manifest = Arc::clone(&self.manifest);
         let metrics = Arc::clone(&self.metrics);
         let outstanding = Arc::clone(&self.outstanding);
@@ -238,7 +237,7 @@ impl L0EventLogEngine {
                     let upload_result = (|| -> Result<u64> {
                         let bytes = fs::read(&job.local_path)
                             .map_err(|err| EhdbError::Storage(err.to_string()))?;
-                        object_store.put_if_absent(&job.object_key, &bytes)?;
+                        substrate.put_if_absent(&job.substrate_key, &bytes)?;
                         Ok(bytes.len() as u64)
                     })();
 
@@ -246,7 +245,7 @@ impl L0EventLogEngine {
                         Ok(n) => n,
                         Err(_) => {
                             // On upload failure the part stays local-only (its
-                            // manifest row keeps object_uri = None); a later
+                            // manifest row keeps `replicas` empty); a later
                             // retry slice re-drives it. Still decrement so a
                             // waiter isn't wedged.
                             decrement(&outstanding);
@@ -254,20 +253,23 @@ impl L0EventLogEngine {
                         }
                     };
 
-                    // Set object_uri on the part and snapshot the durable view
-                    // — under the lock, but the object-store write happens
+                    // Record the replica on the part and snapshot the durable view
+                    // — under the lock, but the substrate write happens
                     // OUTSIDE the lock so a slow store never blocks appends/reads.
                     let durable = {
                         let mut m = manifest.lock().unwrap();
                         if let Some(p) = m.parts.iter_mut().find(|p| p.part_id == job.part_id) {
-                            p.object_uri = Some(job.object_key.clone());
+                            // Single-replica write now; N-way copy appends more
+                            // keys here (the replication seam — parts are
+                            // immutable, so no consensus is needed).
+                            p.replicas = vec![job.substrate_key.clone()];
                         }
                         m.version += 1;
                         m.durable_view()
                     };
                     if let Ok(ser) = serde_json::to_vec(&durable) {
-                        let _ = object_store.put_overwrite(&manifest_latest_key(&dataset), &ser);
-                        let _ = object_store
+                        let _ = substrate.put_overwrite(&manifest_latest_key(&dataset), &ser);
+                        let _ = substrate
                             .put_if_absent(&manifest_version_key(&dataset, durable.version), &ser);
                     }
 
@@ -282,7 +284,7 @@ impl L0EventLogEngine {
     }
 
     /// Append one D1 event to the hot tier, assigning the next global sequence.
-    /// Never touches the object store. Returns the assigned global sequence.
+    /// Never touches the substrate. Returns the assigned global sequence.
     pub fn append(
         &mut self,
         execution_id: &str,
@@ -332,7 +334,7 @@ impl L0EventLogEngine {
     /// Register a sealed part in the manifest (local-only) and enqueue its async
     /// upload.
     fn register_and_upload(&mut self, sealed: SealedPart) -> Result<()> {
-        let object_key = object_key_for(
+        let substrate_key = substrate_key_for(
             &self.config.dataset,
             sealed.meta.partition,
             &sealed.meta.part_id,
@@ -357,7 +359,7 @@ impl L0EventLogEngine {
         }
         if let Some(tx) = &self.upload_tx {
             let job = UploadJob {
-                object_key,
+                substrate_key,
                 local_path,
                 part_id,
                 sealed_at: Instant::now(),
@@ -373,7 +375,7 @@ impl L0EventLogEngine {
     }
 
     /// Seal every pending active part and block until the uploader has shipped
-    /// all outstanding parts to the object store (a graceful handoff / durability
+    /// all outstanding parts to the substrate (a graceful handoff / durability
     /// barrier — used before a cold-load equality check).
     pub fn flush_and_wait_uploads(&mut self) -> Result<()> {
         let shards: Vec<u32> = self.writers.keys().copied().collect();
@@ -406,7 +408,7 @@ impl L0EventLogEngine {
     /// 2. Sparse index binary search: locate the granule containing `after_seq+1`.
     /// 3. Ranged read from that granule's mark to the part's end — **only the
     ///    needed block**, from the local hot tier if resident, else a ranged GET
-    ///    against the object store.
+    ///    against the substrate.
     /// 4. Decode + filter (`> after_seq`, matching execution) + the active hot
     ///    buffer.
     pub fn read_execution_after(
@@ -421,7 +423,7 @@ impl L0EventLogEngine {
             let m = self.manifest.lock().unwrap();
             let total_parts = m.parts.len();
             // Clone the matched PartMeta so we drop the manifest lock before any
-            // (possibly slow) object-store read.
+            // (possibly slow) substrate read.
             let hits: Vec<_> = m.prune(shard, after_seq).into_iter().cloned().collect();
             // Every non-matching part — a different partition, or a range wholly
             // at/below the cursor — is skipped here with ZERO part I/O (pointer
@@ -436,15 +438,15 @@ impl L0EventLogEngine {
             if len == 0 {
                 continue;
             }
-            // Prefer the local hot tier (no object-store I/O); fall back to a
-            // ranged GET against the durable tier.
+            // Prefer the local hot tier (no substrate I/O); fall back to a
+            // ranged GET against the durable substrate (the primary replica).
             let block = if let Some(local_path) = &part.local_path {
                 read_local_range(local_path, start, len)?
-            } else if let Some(uri) = &part.object_uri {
-                self.object_store.get_range(uri, start, len)?
+            } else if let Some(replica) = part.primary_replica() {
+                self.substrate.get_range(replica, start, len)?
             } else {
                 return Err(EhdbError::InvalidState(format!(
-                    "part {} has neither local_path nor object_uri",
+                    "part {} has neither a local_path nor a durable replica",
                     part.part_id
                 )));
             };
@@ -475,7 +477,7 @@ impl L0EventLogEngine {
 
     /// Reproduce the **entire** record set across all partitions in global-
     /// sequence order — the cold-load correctness helper. Reads each part fully
-    /// (local if resident, else the object store) plus the active hot buffers.
+    /// (local if resident, else the substrate) plus the active hot buffers.
     pub fn replay_all(&self) -> Result<Vec<EventRecord>> {
         let mut out = Vec::new();
         let parts: Vec<_> = {
@@ -487,8 +489,8 @@ impl L0EventLogEngine {
         for part in &parts {
             let bytes = if let Some(local_path) = &part.local_path {
                 fs::read(local_path).map_err(|err| EhdbError::Storage(err.to_string()))?
-            } else if let Some(uri) = &part.object_uri {
-                self.object_store.get_all(uri)?
+            } else if let Some(replica) = part.primary_replica() {
+                self.substrate.get_all(replica)?
             } else {
                 return Err(EhdbError::InvalidState(format!(
                     "replay_all: part {} has no location",
@@ -562,14 +564,14 @@ fn manifest_version_key(dataset: &str, version: u64) -> String {
 }
 
 fn load_durable_manifest(
-    object_store: &dyn L0ObjectStore,
+    substrate: &dyn DurableSubstrate,
     dataset: &str,
 ) -> Result<Option<Manifest>> {
     let key = manifest_latest_key(dataset);
-    if !object_store.exists(&key)? {
+    if !substrate.exists(&key)? {
         return Ok(None);
     }
-    let bytes = object_store.get_all(&key)?;
+    let bytes = substrate.get_all(&key)?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|err| EhdbError::Storage(format!("decode durable manifest: {err}")))?;
     Ok(Some(manifest))

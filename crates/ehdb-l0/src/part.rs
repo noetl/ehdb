@@ -43,7 +43,7 @@ pub enum FlushPolicy {
 /// A sealed, immutable part ready for the manifest + the async uploader.
 #[derive(Debug, Clone)]
 pub struct SealedPart {
-    /// The catalog row for this part (`local_path` set, `object_uri` still
+    /// The catalog row for this part (`local_path` set, `replicas` still empty
     /// `None` until the upload lands).
     pub meta: PartMeta,
     /// The exact records this part holds, in sort-key order — returned so the
@@ -253,7 +253,7 @@ impl PartWriter {
             max_sequence: self.max_sequence,
             record_count: self.record_count,
             byte_size: self.byte_len,
-            object_uri: None,
+            replicas: Vec::new(),
             local_path: Some(final_path.to_string_lossy().to_string()),
             sparse_index: SparseIndex {
                 granule_size: self.granule_size,
@@ -265,9 +265,9 @@ impl PartWriter {
         self.next_local_id += 1;
         self.open_active()?;
 
-        // The part is local-only (`object_uri: None`) until the async uploader
+        // The part is local-only (`replicas` empty) until the async uploader
         // ships it; the destination key is deterministic
-        // ([`object_key_for`]), so the engine/uploader/cold-load all agree
+        // ([`substrate_key_for`]), so the engine/uploader/cold-load all agree
         // without threading it through state.
         Ok(Some(SealedPart { meta, records }))
     }
@@ -276,7 +276,7 @@ impl PartWriter {
 /// The deterministic object-store key for a part: recomputed anywhere from
 /// `(dataset, partition, part_id)`, so the writer, the uploader, and a cold-load
 /// all agree without threading the key through state.
-pub fn object_key_for(dataset: &str, partition: u32, part_id: &str) -> String {
+pub fn substrate_key_for(dataset: &str, partition: u32, part_id: &str) -> String {
     format!("parts/{dataset}/shard-{partition}/{part_id}.eslog")
 }
 

@@ -1,5 +1,5 @@
 //! L0.1 selfcheck — runs the hot-local/durable-async composite for D1 over a
-//! local-filesystem object store and prints the real proof numbers (append
+//! local-filesystem substrate and prints the real proof numbers (append
 //! latency hot vs slow-store, upload lag, prune counts, ranged-block bytes vs
 //! whole-dataset bytes, cold-load equality). This is the runnable companion to
 //! the `tests/roundtrip.rs` assertions — same behavior, human-readable output.
@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ehdb_l0::object_store::{CountingObjectStore, L0ObjectStore};
-use ehdb_l0::{shard_for_execution, L0Config, L0EventLogEngine, LocalFsObjectStore};
+use ehdb_l0::substrate::{CountingSubstrate, DurableSubstrate};
+use ehdb_l0::{shard_for_execution, L0Config, L0EventLogEngine, LocalFsSubstrate};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ehdb-l0-selfcheck-{}-{tag}", std::process::id()))
@@ -35,10 +35,10 @@ fn main() {
     println!("== EHDB L0.1 selfcheck (D1 event log, hot-local/durable-async) ==\n");
 
     // --- origin: write across 4 shards ---
-    let inner = LocalFsObjectStore::new(&object_dir).unwrap();
-    let counting = CountingObjectStore::new(inner);
+    let inner = LocalFsSubstrate::new(&object_dir).unwrap();
+    let counting = CountingSubstrate::new(inner);
     let origin_counters = counting.counters();
-    let origin_store: Arc<dyn L0ObjectStore> = Arc::new(counting);
+    let origin_store: Arc<dyn DurableSubstrate> = Arc::new(counting);
     let mut origin = L0EventLogEngine::open(cfg(&origin_local), origin_store).unwrap();
 
     let executions = [
@@ -60,12 +60,12 @@ fn main() {
         4
     );
 
-    // Hot read (local parts) — zero object-store range GETs.
+    // Hot read (local parts) — zero substrate range GETs.
     let before = origin_counters.get_range_calls.load(Ordering::Relaxed);
     let hot = origin.read_execution_after("1001", 0).unwrap();
     let after = origin_counters.get_range_calls.load(Ordering::Relaxed);
     println!(
-        "hot read exec 1001: {} events, object-store range GETs during read = {} (expect 0)",
+        "hot read exec 1001: {} events, substrate range GETs during read = {} (expect 0)",
         hot.len(),
         after - before
     );
@@ -80,12 +80,12 @@ fn main() {
         m.mean_upload_lag_micros()
     );
 
-    // --- cold node: reconstruct from the object store only ---
-    let cold_inner = LocalFsObjectStore::new(&object_dir).unwrap();
-    let cold_counting = CountingObjectStore::new(cold_inner);
+    // --- cold node: reconstruct from the substrate only ---
+    let cold_inner = LocalFsSubstrate::new(&object_dir).unwrap();
+    let cold_counting = CountingSubstrate::new(cold_inner);
     let cold_counters = cold_counting.counters();
     let cold_read_keys = cold_counting.read_keys();
-    let cold_store: Arc<dyn L0ObjectStore> = Arc::new(cold_counting);
+    let cold_store: Arc<dyn DurableSubstrate> = Arc::new(cold_counting);
     let cold = L0EventLogEngine::cold_load(cfg(&cold_local), cold_store).unwrap();
 
     let origin_all = origin.replay_all().unwrap();
@@ -139,7 +139,7 @@ fn main() {
     );
 
     // --- hot-path isolation: append latency, fast store vs slow store ---
-    println!("\n-- hot-path isolation (append not blocked by slow object store) --");
+    println!("\n-- hot-path isolation (append not blocked by slow substrate) --");
     let latency = Duration::from_millis(40);
     let n = 200u64;
 
@@ -147,8 +147,8 @@ fn main() {
     let base_local = tmp("hp-base-local");
     let _ = std::fs::remove_dir_all(&base_obj);
     let _ = std::fs::remove_dir_all(&base_local);
-    let base_store: Arc<dyn L0ObjectStore> = Arc::new(CountingObjectStore::new(
-        LocalFsObjectStore::new(&base_obj).unwrap(),
+    let base_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+        LocalFsSubstrate::new(&base_obj).unwrap(),
     ));
     let mut base = L0EventLogEngine::open(
         L0Config::d1(&base_local)
@@ -171,8 +171,8 @@ fn main() {
     let slow_local = tmp("hp-slow-local");
     let _ = std::fs::remove_dir_all(&slow_obj);
     let _ = std::fs::remove_dir_all(&slow_local);
-    let slow_store: Arc<dyn L0ObjectStore> = Arc::new(CountingObjectStore::with_put_latency(
-        LocalFsObjectStore::new(&slow_obj).unwrap(),
+    let slow_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::with_put_latency(
+        LocalFsSubstrate::new(&slow_obj).unwrap(),
         latency,
     ));
     let mut slow = L0EventLogEngine::open(

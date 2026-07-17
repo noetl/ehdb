@@ -4,8 +4,8 @@
 //!   index recorded → a lookup prunes via the manifest, binary-searches the
 //!   sparse index, ranged-GETs only the needed block, decodes correctly.
 //! - **Hot vs durable split:** an origin node serves recent reads from local
-//!   parts with **zero object-store I/O**; a cold-loaded node serves the same
-//!   reads entirely from the object store.
+//!   parts with **zero substrate I/O**; a cold-loaded node serves the same
+//!   reads entirely from the substrate.
 //! - **Zero-I/O pruning:** a lookup for execution E on shard s touches only
 //!   shard-s part objects — parts of other shards are fetched **zero** times.
 //! - **Only the needed block:** a lookup after a high sequence ranged-GETs fewer
@@ -13,41 +13,41 @@
 //! - **Cold-load correctness:** a fresh node with an empty local dir reproduces
 //!   the **exact** record set + global sequence of the origin (the fungible-
 //!   writer property that retires the per-shard-Raft "T-RF" plan, RFC §2.7).
-//! - **Hot-path isolation:** appends do not slow down when the object store is
+//! - **Hot-path isolation:** appends do not slow down when the substrate is
 //!   slow (the async-durability §2.3 claim).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ehdb_l0::object_store::L0ObjectStore;
+use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{
-    shard_for_execution, CountingObjectStore, EventRecord, L0Config, L0EventLogEngine,
-    LocalFsObjectStore,
+    shard_for_execution, CountingSubstrate, EventRecord, L0Config, L0EventLogEngine,
+    LocalFsSubstrate,
 };
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     // PID makes the path unique across separate `cargo test` process runs (so a
-    // prior run's leftover object store is never resumed); the counter makes it
+    // prior run's leftover substrate is never resumed); the counter makes it
     // unique within a run.
     std::env::temp_dir().join(format!("ehdb-l0-it-{tag}-{}-{n}", std::process::id()))
 }
 
-/// A counting object store handle: the shared store, its counters, its read-key
+/// A counting substrate handle: the shared store, its counters, its read-key
 /// log.
 type CountingStore = (
-    Arc<dyn L0ObjectStore>,
-    Arc<ehdb_l0::object_store::ObjectStoreCounters>,
+    Arc<dyn DurableSubstrate>,
+    Arc<ehdb_l0::substrate::SubstrateCounters>,
     Arc<std::sync::Mutex<Vec<String>>>,
 );
 
-/// Build a counting object store over a shared local dir, returning the Arc, its
+/// Build a counting substrate over a shared local dir, returning the Arc, its
 /// counters, and its read-key log.
 fn counting_store(object_dir: &std::path::Path) -> CountingStore {
-    let inner = LocalFsObjectStore::new(object_dir).unwrap();
-    let counting = CountingObjectStore::new(inner);
+    let inner = LocalFsSubstrate::new(object_dir).unwrap();
+    let counting = CountingSubstrate::new(inner);
     let counters = counting.counters();
     let read_keys = counting.read_keys();
     (Arc::new(counting), counters, read_keys)
@@ -119,14 +119,14 @@ fn round_trip_prune_sparse_ranged_get_and_cold_load() {
     let origin_tip = origin.global_sequence();
     assert_eq!(origin_tip, expected.len() as u64);
 
-    // A hot read on the origin (local parts resident) touches the object store
+    // A hot read on the origin (local parts resident) touches the substrate
     // ZERO times for range reads.
     let range_reads_before = origin_counters.get_range_calls.load(Ordering::Relaxed);
     let hot = origin.read_execution_after("1001", 0).unwrap();
     let range_reads_after = origin_counters.get_range_calls.load(Ordering::Relaxed);
     assert_eq!(
         range_reads_before, range_reads_after,
-        "hot-path read must not issue any object-store range GETs"
+        "hot-path read must not issue any substrate range GETs"
     );
     let expected_1001: Vec<_> = expected
         .iter()
@@ -138,7 +138,7 @@ fn round_trip_prune_sparse_ranged_get_and_cold_load() {
         "hot read must return exactly execution 1001's events"
     );
 
-    // Flush all sealed parts to the durable object store.
+    // Flush all sealed parts to the durable substrate.
     origin.flush_and_wait_uploads().unwrap();
     let m = origin.metrics().snapshot();
     assert!(
@@ -147,7 +147,7 @@ fn round_trip_prune_sparse_ranged_get_and_cold_load() {
     );
     assert!(m.upload_bytes > 0);
 
-    // --- cold node: fresh, empty local dir, only the object store ---
+    // --- cold node: fresh, empty local dir, only the substrate ---
     let (cold_store, _cold_counters, cold_read_keys) = counting_store(&object_dir);
     let cold = L0EventLogEngine::cold_load(make_config(&cold_local), cold_store).unwrap();
 
@@ -187,7 +187,7 @@ fn round_trip_prune_sparse_ranged_get_and_cold_load() {
     let touched = cold_read_keys.lock().unwrap().clone();
     assert!(
         !touched.is_empty(),
-        "cold read must fetch from the object store"
+        "cold read must fetch from the substrate"
     );
     let want_prefix = format!("shard-{target_shard}/");
     for key in &touched {
@@ -227,12 +227,12 @@ fn round_trip_prune_sparse_ranged_get_and_cold_load() {
 }
 
 #[test]
-fn hot_path_not_blocked_by_slow_object_store() {
-    // Baseline: fast object store.
+fn hot_path_not_blocked_by_slow_substrate() {
+    // Baseline: fast substrate.
     let base_obj = unique_dir("hp-base-obj");
     let base_local = unique_dir("hp-base-local");
-    let base_store: Arc<dyn L0ObjectStore> = Arc::new(CountingObjectStore::new(
-        LocalFsObjectStore::new(&base_obj).unwrap(),
+    let base_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+        LocalFsSubstrate::new(&base_obj).unwrap(),
     ));
     let cfg = |root: &std::path::Path| {
         L0Config::d1(root)
@@ -251,13 +251,13 @@ fn hot_path_not_blocked_by_slow_object_store() {
     let base_uploads_expected = base.metrics().snapshot().seals;
     drop(base); // joins uploader (fast)
 
-    // Slow object store: 40ms injected latency per upload.
+    // Slow substrate: 40ms injected latency per upload.
     let latency = Duration::from_millis(40);
     let slow_obj = unique_dir("hp-slow-obj");
     let slow_local = unique_dir("hp-slow-local");
     let slow_counting =
-        CountingObjectStore::with_put_latency(LocalFsObjectStore::new(&slow_obj).unwrap(), latency);
-    let slow_store: Arc<dyn L0ObjectStore> = Arc::new(slow_counting);
+        CountingSubstrate::with_put_latency(LocalFsSubstrate::new(&slow_obj).unwrap(), latency);
+    let slow_store: Arc<dyn DurableSubstrate> = Arc::new(slow_counting);
     let mut slow = L0EventLogEngine::open(cfg(&slow_local), slow_store).unwrap();
     let t1 = Instant::now();
     for i in 0..n {
@@ -295,8 +295,8 @@ fn hot_path_not_blocked_by_slow_object_store() {
 }
 
 #[test]
-fn owner_restart_resumes_catalog_from_object_store() {
-    // An owner that restarts (same local dir gone, object store intact) resumes
+fn owner_restart_resumes_catalog_from_substrate() {
+    // An owner that restarts (same local dir gone, substrate intact) resumes
     // its catalog + global sequence from the durable manifest — the same
     // mechanism cold-load uses, but for the original writer.
     let object_dir = unique_dir("restart-obj");
@@ -317,7 +317,7 @@ fn owner_restart_resumes_catalog_from_object_store() {
     let all_a = a.replay_all().unwrap();
     drop(a);
 
-    // Restart as a fresh engine over the same object store (new empty local dir).
+    // Restart as a fresh engine over the same substrate (new empty local dir).
     let local_b = unique_dir("restart-b");
     let (store2, _c2, _k2) = counting_store(&object_dir);
     let b = L0EventLogEngine::open(cfg(&local_b), store2).unwrap();

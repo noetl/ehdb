@@ -27,20 +27,28 @@
 //! event log**, on the VictoriaMetrics/VictoriaLogs write-engine model plus a
 //! ClickHouse-MergeTree-style meta-catalog (RFC §2.5):
 //!
+//! **The L0 object store is noetl-native — EHDB implements it itself** (the
+//! parts, manifest, sparse index, and N-way replication all live in this crate,
+//! extending the #254 native segment store). It writes its own immutable parts
+//! onto a pluggable **durable substrate** (a raw byte-sink; the local filesystem
+//! now — noetl's own store on disk / a PVC / a block device). It does **not**
+//! delegate the object-store logic to MinIO or an external S3 server.
+//!
 //! ```text
 //! append → in-memory buffer / active local part  (hot tier — served immediately, fsync per append)
 //!        → sealed immutable part on LOCAL disk    (page-cache-friendly hot tier)
-//!        → async uploader ships the sealed part to the pluggable OBJECT STORE   (durable / replicated tier)
-//! read   → merge across { active part, local sealed parts, object-store parts }, pruned by the manifest
+//!        → async replicator writes the sealed part to N durable-SUBSTRATE replicas (durable / replicated tier)
+//! read   → merge across { active part, local sealed parts, substrate-replica parts }, pruned by the manifest
 //! ```
 //!
-//! - [`object_store`] — the pluggable [`object_store::L0ObjectStore`] trait with
-//!   a local-filesystem impl ([`object_store::LocalFsObjectStore`]) for kind/dev
-//!   and an instrumenting [`object_store::CountingObjectStore`] wrapper that
-//!   records per-key I/O (the "zero-I/O on pruned parts" proof) and can inject
-//!   latency (the "hot path never blocks on the object store" proof). The prod
-//!   backend (real S3 / GCS / in-cluster MinIO) is deferred (RFC §6.2) and does
-//!   **not** block L0 — everything here codes to the trait.
+//! - [`substrate`] — the pluggable [`substrate::DurableSubstrate`] trait (the
+//!   raw durable byte-sink UNDER noetl's object-store logic) with a
+//!   local-filesystem impl ([`substrate::LocalFsSubstrate`], noetl's own on-disk
+//!   store) for kind/dev and an instrumenting [`substrate::CountingSubstrate`]
+//!   wrapper that records per-key I/O (the "zero-I/O on pruned parts" proof) and
+//!   can inject latency (the "hot path never blocks on the substrate" proof). A
+//!   raw cloud block/blob byte-sink could slot in UNDER this trait later
+//!   (RFC §6.2); noetl's object-store logic above it is unchanged.
 //! - [`frame`] — the immutable-part record codec, byte-identical to the #254
 //!   durable-segment frame (`magic(4) + body_len(4) + crc32(4) + body`), so an
 //!   L0 part is a #254 segment the meta-catalog can prune and range-read.
@@ -50,9 +58,9 @@
 //!   pruning. Fixed, compiled-in for D1 (sort key = `global_sequence`, partition
 //!   = `shard_for(execution_id)`); NOT a general IndexDB (RFC §2.6).
 //! - [`engine`] — [`engine::L0EventLogEngine`]: the append path (hot local part,
-//!   never blocks on the object store), the background async uploader, the
+//!   never blocks on the substrate), the background async replicator, the
 //!   pruned/ranged read path, and **cold-load** (a fresh node with no local data
-//!   reproduces the exact record set + global sequence from the object store —
+//!   reproduces the exact record set + global sequence from the durable substrate —
 //!   the fungible-writer property that retires the per-shard-Raft "T-RF" plan,
 //!   RFC §2.7).
 //! - [`metrics`] — secret-free counters (appends, seals, uploads, upload lag,
@@ -62,11 +70,25 @@
 //!
 //! D1 is the source-of-truth event log, so L0 defaults to **posture A —
 //! fsync-per-append to the local part** ([`engine::FlushPolicy::EveryAppend`]):
-//! the local part is durable before the append returns; the object-store upload
-//! adds geo-replication asynchronously. This reuses #254's fsync-per-append
+//! the local part is durable before the append returns; the substrate replication
+//! adds N-way durability asynchronously. This reuses #254's fsync-per-append
 //! strength. Posture B (VM-style buffered flush, larger crash window —
 //! [`engine::FlushPolicy::Buffered`]) is offered for derived/metrics tiers only,
 //! never for the event log.
+//!
+//! ## Replication is noetl-native — N-way copy, no consensus (RFC §2.7)
+//!
+//! Replication is noetl's own, and it stays simple **because parts are
+//! immutable**: an immutable part is written **write-once to N durable-substrate
+//! replicas** and the [`catalog::PartMeta::replicas`] list records where each
+//! copy lives. Immutable objects never conflict, so N-way copy needs **no
+//! consensus / no Raft** — the HDFS / block-replication model, not a replicated
+//! log. The manifest is the replica-location catalog. **L0.1 writes a single
+//! replica** and designs the seam in (the `replicas` list + a per-part write
+//! loop); N-way copy is the additive later step that appends more replica
+//! entries. This is what lets a writer be fungible: on writer death another node
+//! cold-loads the sealed parts from a surviving replica and resumes — retiring
+//! the per-shard-Raft "T-RF" plan.
 //!
 //! ## Reuse of #254 (durable segments) and Phase-8 (object tier)
 //!
@@ -92,12 +114,12 @@ pub mod dataset;
 pub mod engine;
 pub mod frame;
 pub mod metrics;
-pub mod object_store;
 pub mod part;
+pub mod substrate;
 
 pub use catalog::{Manifest, PartMeta, SparseIndex};
 pub use dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 pub use engine::{L0Config, L0EventLogEngine};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
-pub use object_store::{CountingObjectStore, L0ObjectStore, LocalFsObjectStore};
 pub use part::{FlushPolicy, PartWriter, SealedPart};
+pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};

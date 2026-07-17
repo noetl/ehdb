@@ -7,7 +7,7 @@
 //! durable objects in the object store:
 //!
 //! 1. [`Manifest`] — one [`PartMeta`] row per immutable part: where it is
-//!    (`object_uri` / `local_path`), its partition, its `[min_sequence,
+//!    (`replicas` / `local_path`), its partition, its `[min_sequence,
 //!    max_sequence]` sort-key range (ClickHouse MinMax skip index), and its
 //!    record count + byte size. The Iceberg-manifest / ClickHouse `system.parts`
 //!    analog — the pointer catalog VM does not provide. Versioned so readers see
@@ -87,14 +87,15 @@ impl SparseIndex {
     }
 }
 
-/// One immutable part's metadata — a row in the [`Manifest`]. A part is durable
-/// once it has an `object_uri`; before the async upload lands it is local-only
-/// (`local_path` set, `object_uri` `None`), served from the hot tier.
+/// One immutable part's metadata — a row in the [`Manifest`]. A part is
+/// **durable** once it has at least one entry in [`replicas`](Self::replicas);
+/// before the async replicator lands it is local-only (`local_path` set,
+/// `replicas` empty), served from the hot tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartMeta {
     /// Deterministic part id: `shard-<partition>-seq-<min>-<max>`. Stable from
-    /// content, so a re-upload lands the same object key (idempotent).
+    /// content, so a re-write lands the same substrate key (idempotent).
     pub part_id: String,
     /// The partition this part belongs to (D1: `shard_for(execution_id)`).
     pub partition: u32,
@@ -107,11 +108,17 @@ pub struct PartMeta {
     pub record_count: u64,
     /// On-disk byte size of the part (frame bytes).
     pub byte_size: u64,
-    /// Object-store key once the async uploader has shipped the part
-    /// (`None` while local-only). A cold-load reads only parts with this set.
-    pub object_uri: Option<String>,
+    /// **The N-way replication seam.** The durable-substrate key(s) where this
+    /// immutable part is stored — **one entry per replica**. noetl writes each
+    /// immutable part write-once to N substrate replicas and records their
+    /// locations here; because parts are **immutable**, replicas never conflict,
+    /// so replication is a plain N-way copy (the HDFS / block-replication model)
+    /// with **no consensus / no Raft**. Empty while the part is local-only (not
+    /// yet replicated). L0.1 writes a **single** replica; N-way copy is the
+    /// additive later step that simply appends more entries here.
+    pub replicas: Vec<String>,
     /// Local hot-tier file path while the part is resident on this node
-    /// (`None` on a cold-loaded node). Reads prefer this (no object-store I/O).
+    /// (`None` on a cold-loaded node). Reads prefer this (no substrate I/O).
     pub local_path: Option<String>,
     /// The part's sparse primary index (granule marks).
     pub sparse_index: SparseIndex,
@@ -123,6 +130,17 @@ impl PartMeta {
     /// means the whole part is below the cursor and is skipped with zero I/O.
     pub fn overlaps_after(&self, after_seq: u64) -> bool {
         self.max_sequence > after_seq
+    }
+
+    /// Whether the part is durable (has at least one substrate replica).
+    pub fn is_durable(&self) -> bool {
+        !self.replicas.is_empty()
+    }
+
+    /// The primary (first) substrate replica key, if any — the replica a read
+    /// fetches from (a failover slice would try the rest in order).
+    pub fn primary_replica(&self) -> Option<&String> {
+        self.replicas.first()
     }
 }
 
@@ -182,9 +200,10 @@ impl Manifest {
         hits
     }
 
-    /// The **durable view** written to the object store: only parts that have an
-    /// `object_uri` (a cold-load must never point at a part that isn't uploaded
-    /// yet), with `local_path` cleared (it is meaningless on another node).
+    /// The **durable view** written to the substrate: only parts that are
+    /// durable (`is_durable()` — at least one replica; a cold-load must never
+    /// point at a part that isn't replicated yet), with `local_path` cleared (it
+    /// is meaningless on another node).
     pub fn durable_view(&self) -> Manifest {
         Manifest {
             dataset: self.dataset.clone(),
@@ -192,7 +211,7 @@ impl Manifest {
             parts: self
                 .parts
                 .iter()
-                .filter(|p| p.object_uri.is_some())
+                .filter(|p| p.is_durable())
                 .map(|p| PartMeta {
                     local_path: None,
                     ..p.clone()
@@ -258,7 +277,7 @@ mod tests {
             max_sequence,
             record_count: (max_sequence - min_sequence + 1),
             byte_size: 100,
-            object_uri: Some(format!("parts/{part_id}")),
+            replicas: vec![format!("parts/{part_id}")],
             local_path: None,
             sparse_index: idx(&[(min_sequence, 0)], 8),
         };
@@ -288,7 +307,7 @@ mod tests {
             max_sequence: 5,
             record_count: 5,
             byte_size: 50,
-            object_uri: Some("parts/uploaded".into()),
+            replicas: vec!["parts/uploaded".into()],
             local_path: Some("/local/uploaded".into()),
             sparse_index: idx(&[(1, 0)], 8),
         });
@@ -299,7 +318,7 @@ mod tests {
             max_sequence: 9,
             record_count: 4,
             byte_size: 40,
-            object_uri: None,
+            replicas: Vec::new(),
             local_path: Some("/local/local_only".into()),
             sparse_index: idx(&[(6, 0)], 8),
         });
