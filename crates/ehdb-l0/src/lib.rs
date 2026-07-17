@@ -109,6 +109,7 @@
 //! retention-as-drop-partition (L0.5), and **all** of L1/L2/L3. L0.1 touches no
 //! NATS, cuts nothing over, and is kind/local shadow only.
 
+pub mod bloom;
 pub mod catalog;
 pub mod dataset;
 pub mod engine;
@@ -117,6 +118,7 @@ pub mod metrics;
 pub mod part;
 pub mod substrate;
 
+pub use bloom::Bloom;
 pub use catalog::{Manifest, PartMeta, SparseIndex};
 pub use dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 pub use engine::{L0Config, L0EventLogEngine};

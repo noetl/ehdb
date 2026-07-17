@@ -399,18 +399,22 @@ impl L0EventLogEngine {
         Ok(())
     }
 
-    /// **The D1 read path** (RFC §2.5 worked example): events for `execution_id`
-    /// with `global_sequence > after_seq`, in sequence order.
+    /// **The D1 read path** (RFC §2.5 worked example + L0.2 index-first pruning):
+    /// events for `execution_id` with `global_sequence > after_seq`, in sequence
+    /// order.
     ///
-    /// 1. Manifest prune (MinMax skip): only parts of `shard_for(execution_id)`
-    ///    whose range can hold a record after `after_seq`. Non-matching parts are
-    ///    skipped with **zero I/O**.
-    /// 2. Sparse index binary search: locate the granule containing `after_seq+1`.
-    /// 3. Ranged read from that granule's mark to the part's end — **only the
-    ///    needed block**, from the local hot tier if resident, else a ranged GET
-    ///    against the substrate.
-    /// 4. Decode + filter (`> after_seq`, matching execution) + the active hot
-    ///    buffer.
+    /// 1. Manifest prune (MinMax + partition skip): only parts of
+    ///    `shard_for(execution_id)` whose range can hold a record after
+    ///    `after_seq`. Non-matching parts are skipped with **zero I/O**.
+    /// 2. **L0.2 bloom prune (index-first):** among the surviving parts, skip any
+    ///    whose per-part `execution_id` bloom says the execution is definitely
+    ///    absent — the primary prune when everything is in one partition.
+    /// 3. Sparse index binary search: locate the granule containing `after_seq+1`.
+    /// 4. **L0.2 granule bloom narrowing:** trim the ranged block to the
+    ///    contiguous granule span whose blooms admit the execution.
+    /// 5. Ranged read of only that block, from the local hot tier if resident,
+    ///    else a ranged GET against the durable substrate; decode + filter + the
+    ///    active hot buffer.
     pub fn read_execution_after(
         &self,
         execution_id: &str,
@@ -419,31 +423,61 @@ impl L0EventLogEngine {
         let shard = shard_for_execution(execution_id, self.config.shard_count);
         let mut out = Vec::new();
 
-        let (hits_meta, pruned_count) = {
+        let (candidate_parts, pruned_count, bloom_pruned_count) = {
             let m = self.manifest.lock().unwrap();
             let total_parts = m.parts.len();
-            // Clone the matched PartMeta so we drop the manifest lock before any
-            // (possibly slow) substrate read.
-            let hits: Vec<_> = m.prune(shard, after_seq).into_iter().cloned().collect();
-            // Every non-matching part — a different partition, or a range wholly
-            // at/below the cursor — is skipped here with ZERO part I/O (pointer
-            // catalog only). This is the full RFC §2.5 manifest prune.
+            // Step 1: partition/MinMax prune. Clone the matched PartMeta so we
+            // drop the manifest lock before any (possibly slow) substrate read.
+            let partition_survivors: Vec<_> =
+                m.prune(shard, after_seq).into_iter().cloned().collect();
+            let after_partition = partition_survivors.len();
+            // Step 2 (L0.2, index-first): the execution bloom rejects parts the
+            // execution is definitely absent from — skipped with ZERO part I/O.
+            let hits: Vec<_> = partition_survivors
+                .into_iter()
+                .filter(|p| p.execution_maybe_present(execution_id))
+                .collect();
+            let bloom_pruned = after_partition - hits.len();
+            // Every skipped part (wrong partition, below cursor, or bloom-
+            // rejected) costs zero part I/O — pointer catalog + bloom only.
             let pruned = total_parts - hits.len();
-            (hits, pruned)
+            (hits, pruned, bloom_pruned)
         };
 
-        for part in &hits_meta {
-            let start = part.sparse_index.locate(after_seq + 1);
-            let len = part.byte_size.saturating_sub(start);
+        for part in &candidate_parts {
+            // Sparse-index start granule for the cursor.
+            let start_offset = part.sparse_index.locate(after_seq + 1);
+            let start_granule = part
+                .sparse_index
+                .marks
+                .partition_point(|mark| mark.byte_offset < start_offset);
+            // Granule-bloom narrowing: the contiguous granule span that may hold
+            // the execution, starting no earlier than the cursor's granule.
+            let (block_start, block_end) = match part.granule_span_for(execution_id, start_granule)
+            {
+                Some((lo, hi)) => {
+                    let block_start = part.granule_offset(lo);
+                    // End = the next granule's mark, or the part end for the last.
+                    let block_end = if hi < part.sparse_index.marks.len() {
+                        part.granule_offset(hi)
+                    } else {
+                        part.byte_size
+                    };
+                    (block_start, block_end)
+                }
+                // No granule in range admits the execution (all bloom-rejected).
+                None => continue,
+            };
+            let len = block_end.saturating_sub(block_start);
             if len == 0 {
                 continue;
             }
             // Prefer the local hot tier (no substrate I/O); fall back to a
             // ranged GET against the durable substrate (the primary replica).
             let block = if let Some(local_path) = &part.local_path {
-                read_local_range(local_path, start, len)?
+                read_local_range(local_path, block_start, len)?
             } else if let Some(replica) = part.primary_replica() {
-                self.substrate.get_range(replica, start, len)?
+                self.substrate.get_range(replica, block_start, len)?
             } else {
                 return Err(EhdbError::InvalidState(format!(
                     "part {} has neither a local_path nor a durable replica",
@@ -470,8 +504,11 @@ impl L0EventLogEngine {
         }
 
         out.sort_by_key(|r| r.global_sequence);
-        self.metrics
-            .record_read(pruned_count as u64, hits_meta.len() as u64);
+        self.metrics.record_read(
+            pruned_count as u64,
+            bloom_pruned_count as u64,
+            candidate_parts.len() as u64,
+        );
         Ok(out)
     }
 

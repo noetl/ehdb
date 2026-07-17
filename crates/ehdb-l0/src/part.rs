@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use ehdb_core::{EhdbError, Result};
 
+use crate::bloom::Bloom;
 use crate::catalog::{GranuleMark, PartMeta, SparseIndex};
 use crate::dataset::EventRecord;
 use crate::frame::encode_frame;
@@ -246,6 +247,15 @@ impl PartWriter {
         fs::rename(&self.active_path, &final_path)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
 
+        let marks = std::mem::take(&mut self.marks);
+        let records = std::mem::take(&mut self.records);
+
+        // L0.2 fixed inverted index: build the per-part + per-granule blooms over
+        // `execution_id` from the sealed records. A record's granule index is
+        // `record_position / granule_size` (the same partitioning the marks use).
+        let (execution_bloom, granule_blooms) =
+            build_execution_blooms(&records, &marks, self.granule_size);
+
         let meta = PartMeta {
             part_id: part_id.clone(),
             partition: self.partition,
@@ -257,10 +267,11 @@ impl PartWriter {
             local_path: Some(final_path.to_string_lossy().to_string()),
             sparse_index: SparseIndex {
                 granule_size: self.granule_size,
-                marks: std::mem::take(&mut self.marks),
+                marks,
             },
+            execution_bloom: Some(execution_bloom),
+            granule_blooms,
         };
-        let records = std::mem::take(&mut self.records);
 
         self.next_local_id += 1;
         self.open_active()?;
@@ -278,6 +289,31 @@ impl PartWriter {
 /// all agree without threading the key through state.
 pub fn substrate_key_for(dataset: &str, partition: u32, part_id: &str) -> String {
     format!("parts/{dataset}/shard-{partition}/{part_id}.eslog")
+}
+
+/// Build the L0.2 fixed inverted index for a sealed part: one part-level bloom
+/// over every `execution_id`, and one bloom per granule (parallel to `marks`)
+/// over that granule's execution ids. Record `i` belongs to granule
+/// `i / granule_size`.
+fn build_execution_blooms(
+    records: &[EventRecord],
+    marks: &[GranuleMark],
+    granule_size: u32,
+) -> (Bloom, Vec<Bloom>) {
+    let mut part_bloom = Bloom::for_expected(records.len());
+    let mut granule_blooms: Vec<Bloom> = marks
+        .iter()
+        .map(|m| Bloom::for_expected(m.record_count as usize))
+        .collect();
+    let gsize = granule_size.max(1) as usize;
+    for (i, record) in records.iter().enumerate() {
+        part_bloom.insert(&record.execution_id);
+        let g = i / gsize;
+        if let Some(bloom) = granule_blooms.get_mut(g) {
+            bloom.insert(&record.execution_id);
+        }
+    }
+    (part_bloom, granule_blooms)
 }
 
 #[cfg(test)]
