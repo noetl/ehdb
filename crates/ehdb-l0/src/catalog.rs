@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bloom::Bloom;
+
 /// One entry in a part's [`SparseIndex`]: the start of a granule (a block of
 /// consecutive frames) — the granule's first sort-key value and the byte offset
 /// (the "mark") of that frame's magic within the part.
@@ -122,6 +124,22 @@ pub struct PartMeta {
     pub local_path: Option<String>,
     /// The part's sparse primary index (granule marks).
     pub sparse_index: SparseIndex,
+    /// **L0.2 fixed inverted index:** a bloom over this part's `execution_id`s.
+    /// A per-execution lookup skips the whole part when the bloom says the
+    /// execution is definitely absent — the primary pruning mechanism when
+    /// everything lives in one partition (`shard_count == 1`, the prod default),
+    /// where the MinMax/partition prune does nothing. `None` on an
+    /// L0.1-generated manifest (no bloom → the part is scanned, never wrongly
+    /// skipped). NOT a general index — only the fixed D1 dim (RFC §2.6).
+    #[serde(default)]
+    pub execution_bloom: Option<Bloom>,
+    /// Per-granule blooms over `execution_id`, parallel to
+    /// `sparse_index.marks`. Lets a read narrow the ranged block to the
+    /// contiguous granule span that can hold the execution. Empty on an
+    /// L0.1-generated manifest (no granule pruning → the whole
+    /// sparse-index-derived block is read).
+    #[serde(default)]
+    pub granule_blooms: Vec<Bloom>,
 }
 
 impl PartMeta {
@@ -142,6 +160,53 @@ impl PartMeta {
     pub fn primary_replica(&self) -> Option<&String> {
         self.replicas.first()
     }
+
+    /// Whether this part **may** contain `execution_id` per its bloom. `true`
+    /// when no bloom is present (an L0.1 manifest — never wrongly skip). A
+    /// `false` is definitive (zero false negatives), so the read path can skip
+    /// the part with zero I/O.
+    pub fn execution_maybe_present(&self, execution_id: &str) -> bool {
+        match &self.execution_bloom {
+            Some(bloom) => bloom.maybe_contains(execution_id),
+            None => true,
+        }
+    }
+
+    /// The contiguous granule index span `[lo, hi)` that may hold `execution_id`,
+    /// starting no earlier than `from_granule` (the sparse-index start). Uses the
+    /// per-granule blooms to trim leading/trailing granules the execution is
+    /// absent from. Returns the full `[from_granule, marks.len())` when granule
+    /// blooms are absent. `None` means no granule in range can hold it.
+    pub fn granule_span_for(
+        &self,
+        execution_id: &str,
+        from_granule: usize,
+    ) -> Option<(usize, usize)> {
+        let n = self.sparse_index.marks.len();
+        if from_granule >= n {
+            return None;
+        }
+        if self.granule_blooms.len() != n {
+            // No (or mismatched) granule blooms → read the whole tail.
+            return Some((from_granule, n));
+        }
+        let mut lo = None;
+        let mut hi = from_granule;
+        for g in from_granule..n {
+            if self.granule_blooms[g].maybe_contains(execution_id) {
+                if lo.is_none() {
+                    lo = Some(g);
+                }
+                hi = g + 1;
+            }
+        }
+        lo.map(|lo| (lo, hi))
+    }
+
+    /// The byte offset of granule `g`'s mark.
+    pub fn granule_offset(&self, g: usize) -> u64 {
+        self.sparse_index.marks[g].byte_offset
+    }
 }
 
 /// The per-dataset manifest: the list of parts that exist and where. Versioned
@@ -155,6 +220,12 @@ pub struct Manifest {
     pub version: u64,
     /// One row per immutable part, insertion-ordered.
     pub parts: Vec<PartMeta>,
+    /// **L0.5 retention floor:** the highest sort-key value dropped by
+    /// retention. Every sequence `<= reclaimed_through` is gone (its whole part
+    /// was dropped); a read below it simply finds nothing, never an error. `0`
+    /// (the default, and any L0.1–L0.3 manifest) means nothing reclaimed.
+    #[serde(default)]
+    pub reclaimed_through: u64,
 }
 
 impl Manifest {
@@ -164,6 +235,7 @@ impl Manifest {
             dataset: dataset.into(),
             version: 0,
             parts: Vec::new(),
+            reclaimed_through: 0,
         }
     }
 
@@ -217,6 +289,7 @@ impl Manifest {
                     ..p.clone()
                 })
                 .collect(),
+            reclaimed_through: self.reclaimed_through,
         }
     }
 
@@ -280,6 +353,8 @@ mod tests {
             replicas: vec![format!("parts/{part_id}")],
             local_path: None,
             sparse_index: idx(&[(min_sequence, 0)], 8),
+            execution_bloom: None,
+            granule_blooms: Vec::new(),
         };
         m.push_part(mk("p0a", 0, 1, 10));
         m.push_part(mk("p0b", 0, 11, 20));
@@ -310,6 +385,8 @@ mod tests {
             replicas: vec!["parts/uploaded".into()],
             local_path: Some("/local/uploaded".into()),
             sparse_index: idx(&[(1, 0)], 8),
+            execution_bloom: None,
+            granule_blooms: Vec::new(),
         });
         m.push_part(PartMeta {
             part_id: "local_only".into(),
@@ -321,6 +398,8 @@ mod tests {
             replicas: Vec::new(),
             local_path: Some("/local/local_only".into()),
             sparse_index: idx(&[(6, 0)], 8),
+            execution_bloom: None,
+            granule_blooms: Vec::new(),
         });
         let durable = m.durable_view();
         assert_eq!(durable.parts.len(), 1);

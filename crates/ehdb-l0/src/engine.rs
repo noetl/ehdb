@@ -33,11 +33,12 @@ use std::time::Instant;
 
 use ehdb_core::{EhdbError, Result};
 
-use crate::catalog::Manifest;
+use crate::catalog::{Manifest, PartMeta};
 use crate::dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 use crate::frame::iter_frames_from;
+use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
-use crate::part::{substrate_key_for, FlushPolicy, PartWriter, SealedPart};
+use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
 use crate::substrate::DurableSubstrate;
 
 /// Default granule size (records per sparse-index entry).
@@ -64,11 +65,13 @@ pub struct L0Config {
     pub seal_max_records: u64,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
+    /// L0.3 background merge/compaction policy.
+    pub merge_policy: MergePolicy,
 }
 
 impl L0Config {
     /// D1 defaults rooted at `local_root`: single owner, posture A, 8 MiB /
-    /// 1024-record seal, 16-record granules.
+    /// 1024-record seal, 16-record granules, D1 merge policy.
     pub fn d1(local_root: impl Into<PathBuf>) -> Self {
         Self {
             dataset: DATASET_D1_EVENT_LOG.to_string(),
@@ -78,6 +81,7 @@ impl L0Config {
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             flush: FlushPolicy::EveryAppend,
+            merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
         }
     }
 
@@ -91,9 +95,18 @@ impl L0Config {
         self.granule_size = granule_size;
         self
     }
-    /// Set the record-count seal threshold.
+    /// Set the record-count seal threshold. Also updates the merge policy's
+    /// "small part" threshold to match, so a freshly-sealed part is a merge
+    /// candidate and a merge output is not.
     pub fn with_seal_max_records(mut self, seal_max_records: u64) -> Self {
         self.seal_max_records = seal_max_records;
+        self.merge_policy.small_part_max_records = seal_max_records;
+        self
+    }
+
+    /// Set the L0.3 merge policy explicitly.
+    pub fn with_merge_policy(mut self, merge_policy: MergePolicy) -> Self {
+        self.merge_policy = merge_policy;
         self
     }
     /// Set the byte-size seal threshold.
@@ -399,18 +412,259 @@ impl L0EventLogEngine {
         Ok(())
     }
 
-    /// **The D1 read path** (RFC §2.5 worked example): events for `execution_id`
-    /// with `global_sequence > after_seq`, in sequence order.
+    /// **L0.3 background merge/compaction.** Repeatedly plan + perform merges
+    /// until no partition has a long-enough contiguous run of small durable parts
+    /// ([`crate::merge`]). Returns the number of merges performed. Each merge
+    /// reads a contiguous run of small parts, writes one bigger immutable part
+    /// (rebuilt sparse index + blooms), uploads it, and atomically swaps the
+    /// manifest (remove sources, add merged) — so a cold-load after a merge sees
+    /// the compacted catalog and reproduces the identical record set.
     ///
-    /// 1. Manifest prune (MinMax skip): only parts of `shard_for(execution_id)`
-    ///    whose range can hold a record after `after_seq`. Non-matching parts are
-    ///    skipped with **zero I/O**.
-    /// 2. Sparse index binary search: locate the granule containing `after_seq+1`.
-    /// 3. Ranged read from that granule's mark to the part's end — **only the
-    ///    needed block**, from the local hot tier if resident, else a ranged GET
-    ///    against the substrate.
-    /// 4. Decode + filter (`> after_seq`, matching execution) + the active hot
-    ///    buffer.
+    /// The superseded source objects are left in place for the retention/GC slice
+    /// (L0.5) to reclaim; the manifest no longer references them, so reads never
+    /// touch them.
+    pub fn run_pending_merges(&mut self) -> Result<usize> {
+        let mut count = 0;
+        loop {
+            let plan = {
+                let m = self.manifest.lock().unwrap();
+                plan_next_merge(&m, &self.config.merge_policy)
+            };
+            let Some(plan) = plan else { break };
+            self.merge_once(plan)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn merge_once(&mut self, plan: MergePlan) -> Result<()> {
+        // Snapshot the source part metas (clone) so we drop the lock before I/O.
+        let sources: Vec<PartMeta> = {
+            let m = self.manifest.lock().unwrap();
+            plan.source_ids
+                .iter()
+                .filter_map(|id| m.parts.iter().find(|p| &p.part_id == id).cloned())
+                .collect()
+        };
+        if sources.len() < 2 {
+            return Ok(()); // nothing to merge (raced away)
+        }
+
+        // Read every source part's records (local hot tier if resident, else the
+        // object store) and order them by the sort key.
+        let mut records: Vec<EventRecord> = Vec::new();
+        for src in &sources {
+            let bytes = self.read_whole_part(src)?;
+            for frame in iter_frames_from(&bytes, 0)? {
+                let rec: EventRecord = serde_json::from_slice(frame.body).map_err(|err| {
+                    EhdbError::Storage(format!("decode l0 record on merge: {err}"))
+                })?;
+                records.push(rec);
+            }
+        }
+        records.sort_by_key(|r| r.global_sequence);
+
+        // Build the merged immutable part (in a per-partition `merged/` subdir so
+        // its active-file name can never collide with the append-path writer).
+        let merged_dir = self.config.local_root.join(format!(
+            "parts/{}/shard-{}/merged",
+            self.config.dataset, plan.partition
+        ));
+        let sealed = build_merged_part(
+            plan.partition,
+            self.config.granule_size,
+            &merged_dir,
+            &records,
+        )?;
+
+        // Upload the merged part synchronously so the manifest swap that removes
+        // the sources is durable-consistent for a cold-load.
+        let substrate_key =
+            substrate_key_for(&self.config.dataset, plan.partition, &sealed.meta.part_id);
+        let local_path = sealed
+            .meta
+            .local_path
+            .clone()
+            .ok_or_else(|| EhdbError::InvalidState("merged part missing local_path".into()))?;
+        let bytes = fs::read(&local_path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        self.substrate.put_if_absent(&substrate_key, &bytes)?;
+
+        // Atomic manifest swap: remove the sources, add the merged part (durable).
+        let durable = {
+            let mut m = self.manifest.lock().unwrap();
+            let source_set: std::collections::HashSet<&String> = plan.source_ids.iter().collect();
+            m.parts.retain(|p| !source_set.contains(&p.part_id));
+            let mut merged = sealed.meta.clone();
+            merged.replicas = vec![substrate_key.clone()];
+            m.parts.push(merged);
+            m.version += 1;
+            m.durable_view()
+        };
+        if let Ok(ser) = serde_json::to_vec(&durable) {
+            self.substrate
+                .put_overwrite(&manifest_latest_key(&self.config.dataset), &ser)?;
+            let _ = self.substrate.put_if_absent(
+                &manifest_version_key(&self.config.dataset, durable.version),
+                &ser,
+            );
+        }
+
+        self.metrics
+            .record_merge(sources.len() as u64, bytes.len() as u64);
+        Ok(())
+    }
+
+    /// **L0.5 orphan reclaim (GC).** Delete every part object + local part file
+    /// the current manifest no longer references — chiefly the superseded source
+    /// parts a merge (L0.3) leaves behind, and parts dropped by
+    /// [`apply_retention`](Self::apply_retention). Idempotent (deleting a missing
+    /// object is a no-op). Returns the number of objects/files reclaimed.
+    ///
+    /// Single-writer assumption: the caller is the shard owner, so no concurrent
+    /// appender is racing an object into existence as GC lists.
+    pub fn reclaim_orphans(&mut self) -> Result<usize> {
+        let (referenced_objects, referenced_locals) = {
+            let m = self.manifest.lock().unwrap();
+            // Every substrate key referenced by any part's replica list — a
+            // part may have N replicas, all of which must be kept.
+            let objs: std::collections::HashSet<String> =
+                m.parts.iter().flat_map(|p| p.replicas.clone()).collect();
+            let locals: std::collections::HashSet<String> = m
+                .parts
+                .iter()
+                .filter_map(|p| p.local_path.clone())
+                .collect();
+            (objs, locals)
+        };
+
+        let mut reclaimed = 0usize;
+
+        // Object-store orphans under this dataset's parts prefix.
+        let prefix = format!("parts/{}/", self.config.dataset);
+        for key in self.substrate.list_prefix(&prefix)? {
+            if !referenced_objects.contains(&key) {
+                let bytes = self
+                    .substrate
+                    .get_all(&key)
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0);
+                self.substrate.delete(&key)?;
+                self.metrics.record_orphan_reclaim(bytes);
+                reclaimed += 1;
+            }
+        }
+
+        // Local hot-tier orphan part files.
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let mut local_files = Vec::new();
+        collect_eslog_files(&parts_root, &mut local_files)?;
+        for path in local_files {
+            let path_str = path.to_string_lossy().to_string();
+            if !referenced_locals.contains(&path_str) {
+                let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+                self.metrics.record_orphan_reclaim(bytes);
+                reclaimed += 1;
+            }
+        }
+
+        Ok(reclaimed)
+    }
+
+    /// **L0.5 retention (drop-partition).** Drop every part entirely below
+    /// `keep_from_sequence` (a part straddling the floor is kept whole — never a
+    /// row-level delete), advance the manifest's `reclaimed_through`, rewrite the
+    /// durable manifest, and reclaim the dropped parts' objects. A read below the
+    /// floor afterward simply finds nothing (the records are gone), never an
+    /// error. Returns the number of parts dropped.
+    pub fn apply_retention(&mut self, keep_from_sequence: u64) -> Result<usize> {
+        let plan = {
+            let m = self.manifest.lock().unwrap();
+            crate::retention::plan_retention(&m, keep_from_sequence)
+        };
+        if plan.is_empty() {
+            return Ok(0);
+        }
+
+        // Manifest swap: drop the parts, advance the floor.
+        let durable = {
+            let mut m = self.manifest.lock().unwrap();
+            let drop_set: std::collections::HashSet<&String> = plan.drop_ids.iter().collect();
+            m.parts.retain(|p| !drop_set.contains(&p.part_id));
+            if plan.reclaimed_through > m.reclaimed_through {
+                m.reclaimed_through = plan.reclaimed_through;
+            }
+            m.version += 1;
+            m.durable_view()
+        };
+        if let Ok(ser) = serde_json::to_vec(&durable) {
+            self.substrate
+                .put_overwrite(&manifest_latest_key(&self.config.dataset), &ser)?;
+            let _ = self.substrate.put_if_absent(
+                &manifest_version_key(&self.config.dataset, durable.version),
+                &ser,
+            );
+        }
+
+        let dropped = plan.drop_ids.len();
+        self.metrics.record_parts_dropped(dropped as u64);
+        // Reclaim the now-unreferenced dropped part objects + files.
+        self.reclaim_orphans()?;
+        Ok(dropped)
+    }
+
+    /// Convenience: retain at least the last `keep_last_records` sort-key values,
+    /// dropping whole parts below that window.
+    pub fn apply_retention_keep_last(&mut self, keep_last_records: u64) -> Result<usize> {
+        let keep_from = {
+            let m = self.manifest.lock().unwrap();
+            m.max_sequence()
+                .saturating_sub(keep_last_records)
+                .saturating_add(1)
+        };
+        self.apply_retention(keep_from)
+    }
+
+    /// The retention floor — the highest sort-key value dropped by retention
+    /// (`0` if nothing reclaimed). Reads below it find nothing.
+    pub fn reclaimed_through(&self) -> u64 {
+        self.manifest.lock().unwrap().reclaimed_through
+    }
+
+    /// Read a whole part's bytes — local hot tier if resident, else the durable
+    /// substrate (primary replica).
+    fn read_whole_part(&self, part: &PartMeta) -> Result<Vec<u8>> {
+        if let Some(local_path) = &part.local_path {
+            fs::read(local_path).map_err(|err| EhdbError::Storage(err.to_string()))
+        } else if let Some(replica) = part.primary_replica() {
+            self.substrate.get_all(replica)
+        } else {
+            Err(EhdbError::InvalidState(format!(
+                "part {} has no location",
+                part.part_id
+            )))
+        }
+    }
+
+    /// **The D1 read path** (RFC §2.5 worked example + L0.2 index-first pruning):
+    /// events for `execution_id` with `global_sequence > after_seq`, in sequence
+    /// order.
+    ///
+    /// 1. Manifest prune (MinMax + partition skip): only parts of
+    ///    `shard_for(execution_id)` whose range can hold a record after
+    ///    `after_seq`. Non-matching parts are skipped with **zero I/O**.
+    /// 2. **L0.2 bloom prune (index-first):** among the surviving parts, skip any
+    ///    whose per-part `execution_id` bloom says the execution is definitely
+    ///    absent — the primary prune when everything is in one partition.
+    /// 3. Sparse index binary search: locate the granule containing `after_seq+1`.
+    /// 4. **L0.2 granule bloom narrowing:** trim the ranged block to the
+    ///    contiguous granule span whose blooms admit the execution.
+    /// 5. Ranged read of only that block, from the local hot tier if resident,
+    ///    else a ranged GET against the durable substrate; decode + filter + the
+    ///    active hot buffer.
     pub fn read_execution_after(
         &self,
         execution_id: &str,
@@ -419,31 +673,61 @@ impl L0EventLogEngine {
         let shard = shard_for_execution(execution_id, self.config.shard_count);
         let mut out = Vec::new();
 
-        let (hits_meta, pruned_count) = {
+        let (candidate_parts, pruned_count, bloom_pruned_count) = {
             let m = self.manifest.lock().unwrap();
             let total_parts = m.parts.len();
-            // Clone the matched PartMeta so we drop the manifest lock before any
-            // (possibly slow) substrate read.
-            let hits: Vec<_> = m.prune(shard, after_seq).into_iter().cloned().collect();
-            // Every non-matching part — a different partition, or a range wholly
-            // at/below the cursor — is skipped here with ZERO part I/O (pointer
-            // catalog only). This is the full RFC §2.5 manifest prune.
+            // Step 1: partition/MinMax prune. Clone the matched PartMeta so we
+            // drop the manifest lock before any (possibly slow) substrate read.
+            let partition_survivors: Vec<_> =
+                m.prune(shard, after_seq).into_iter().cloned().collect();
+            let after_partition = partition_survivors.len();
+            // Step 2 (L0.2, index-first): the execution bloom rejects parts the
+            // execution is definitely absent from — skipped with ZERO part I/O.
+            let hits: Vec<_> = partition_survivors
+                .into_iter()
+                .filter(|p| p.execution_maybe_present(execution_id))
+                .collect();
+            let bloom_pruned = after_partition - hits.len();
+            // Every skipped part (wrong partition, below cursor, or bloom-
+            // rejected) costs zero part I/O — pointer catalog + bloom only.
             let pruned = total_parts - hits.len();
-            (hits, pruned)
+            (hits, pruned, bloom_pruned)
         };
 
-        for part in &hits_meta {
-            let start = part.sparse_index.locate(after_seq + 1);
-            let len = part.byte_size.saturating_sub(start);
+        for part in &candidate_parts {
+            // Sparse-index start granule for the cursor.
+            let start_offset = part.sparse_index.locate(after_seq + 1);
+            let start_granule = part
+                .sparse_index
+                .marks
+                .partition_point(|mark| mark.byte_offset < start_offset);
+            // Granule-bloom narrowing: the contiguous granule span that may hold
+            // the execution, starting no earlier than the cursor's granule.
+            let (block_start, block_end) = match part.granule_span_for(execution_id, start_granule)
+            {
+                Some((lo, hi)) => {
+                    let block_start = part.granule_offset(lo);
+                    // End = the next granule's mark, or the part end for the last.
+                    let block_end = if hi < part.sparse_index.marks.len() {
+                        part.granule_offset(hi)
+                    } else {
+                        part.byte_size
+                    };
+                    (block_start, block_end)
+                }
+                // No granule in range admits the execution (all bloom-rejected).
+                None => continue,
+            };
+            let len = block_end.saturating_sub(block_start);
             if len == 0 {
                 continue;
             }
             // Prefer the local hot tier (no substrate I/O); fall back to a
             // ranged GET against the durable substrate (the primary replica).
             let block = if let Some(local_path) = &part.local_path {
-                read_local_range(local_path, start, len)?
+                read_local_range(local_path, block_start, len)?
             } else if let Some(replica) = part.primary_replica() {
-                self.substrate.get_range(replica, start, len)?
+                self.substrate.get_range(replica, block_start, len)?
             } else {
                 return Err(EhdbError::InvalidState(format!(
                     "part {} has neither a local_path nor a durable replica",
@@ -470,8 +754,11 @@ impl L0EventLogEngine {
         }
 
         out.sort_by_key(|r| r.global_sequence);
-        self.metrics
-            .record_read(pruned_count as u64, hits_meta.len() as u64);
+        self.metrics.record_read(
+            pruned_count as u64,
+            bloom_pruned_count as u64,
+            candidate_parts.len() as u64,
+        );
         Ok(out)
     }
 
@@ -543,6 +830,23 @@ fn decrement(outstanding: &Arc<(Mutex<usize>, Condvar)>) {
         *n -= 1;
     }
     cvar.notify_all();
+}
+
+/// Recursively collect `*.eslog` part files under `dir` (for orphan reclaim).
+fn collect_eslog_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).map_err(|err| EhdbError::Storage(err.to_string()))? {
+        let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_eslog_files(&path, out)?;
+        } else if path.extension().map(|e| e == "eslog").unwrap_or(false) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn read_local_range(path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {

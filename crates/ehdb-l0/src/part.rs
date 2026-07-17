@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use ehdb_core::{EhdbError, Result};
 
+use crate::bloom::Bloom;
 use crate::catalog::{GranuleMark, PartMeta, SparseIndex};
 use crate::dataset::EventRecord;
 use crate::frame::encode_frame;
@@ -246,6 +247,15 @@ impl PartWriter {
         fs::rename(&self.active_path, &final_path)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
 
+        let marks = std::mem::take(&mut self.marks);
+        let records = std::mem::take(&mut self.records);
+
+        // L0.2 fixed inverted index: build the per-part + per-granule blooms over
+        // `execution_id` from the sealed records. A record's granule index is
+        // `record_position / granule_size` (the same partitioning the marks use).
+        let (execution_bloom, granule_blooms) =
+            build_execution_blooms(&records, &marks, self.granule_size);
+
         let meta = PartMeta {
             part_id: part_id.clone(),
             partition: self.partition,
@@ -257,10 +267,11 @@ impl PartWriter {
             local_path: Some(final_path.to_string_lossy().to_string()),
             sparse_index: SparseIndex {
                 granule_size: self.granule_size,
-                marks: std::mem::take(&mut self.marks),
+                marks,
             },
+            execution_bloom: Some(execution_bloom),
+            granule_blooms,
         };
-        let records = std::mem::take(&mut self.records);
 
         self.next_local_id += 1;
         self.open_active()?;
@@ -278,6 +289,116 @@ impl PartWriter {
 /// all agree without threading the key through state.
 pub fn substrate_key_for(dataset: &str, partition: u32, part_id: &str) -> String {
     format!("parts/{dataset}/shard-{partition}/{part_id}.eslog")
+}
+
+/// Build the L0.2 fixed inverted index for a sealed part: one part-level bloom
+/// over every `execution_id`, and one bloom per granule (parallel to `marks`)
+/// over that granule's execution ids. Record `i` belongs to granule
+/// `i / granule_size`.
+fn build_execution_blooms(
+    records: &[EventRecord],
+    marks: &[GranuleMark],
+    granule_size: u32,
+) -> (Bloom, Vec<Bloom>) {
+    let mut part_bloom = Bloom::for_expected(records.len());
+    let mut granule_blooms: Vec<Bloom> = marks
+        .iter()
+        .map(|m| Bloom::for_expected(m.record_count as usize))
+        .collect();
+    let gsize = granule_size.max(1) as usize;
+    for (i, record) in records.iter().enumerate() {
+        part_bloom.insert(&record.execution_id);
+        let g = i / gsize;
+        if let Some(bloom) = granule_blooms.get_mut(g) {
+            bloom.insert(&record.execution_id);
+        }
+    }
+    (part_bloom, granule_blooms)
+}
+
+/// Build one immutable **merged** part (the L0.3 compaction output) from an
+/// already-sorted (ascending `global_sequence`) record set, writing it into
+/// `dest_dir` as a `<part_id>.eslog` file. Produces the same immutable-part
+/// shape a fresh seal would — CRC-framed records, sparse index, per-part +
+/// per-granule blooms — so a merged part is indistinguishable from a sealed one
+/// to the read path. The records preserve their original global sequences, so
+/// the merged part covers the contiguous sort-key range of its inputs.
+///
+/// `records` must be non-empty and ascending by `global_sequence` (the caller —
+/// the merge engine — sorts the source parts' records before calling).
+pub fn build_merged_part(
+    partition: u32,
+    granule_size: u32,
+    dest_dir: &Path,
+    records: &[EventRecord],
+) -> Result<SealedPart> {
+    if records.is_empty() {
+        return Err(EhdbError::InvalidState(
+            "build_merged_part: empty record set".into(),
+        ));
+    }
+    let gsize = granule_size.max(1);
+    fs::create_dir_all(dest_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
+
+    let min_sequence = records[0].global_sequence;
+    let max_sequence = records[records.len() - 1].global_sequence;
+    let part_id = format!("shard-{partition}-seq-{min_sequence:020}-{max_sequence:020}");
+    let tmp_path = dest_dir.join(format!("{part_id}.merge-tmp"));
+    let final_path = dest_dir.join(format!("{part_id}.eslog"));
+
+    let mut marks: Vec<GranuleMark> = Vec::new();
+    let mut byte_len: u64 = 0;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        for (i, record) in records.iter().enumerate() {
+            let body = serde_json::to_vec(record)
+                .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
+            let frame = encode_frame(&body)?;
+            if i as u64 % gsize as u64 == 0 {
+                marks.push(GranuleMark {
+                    first_sequence: record.global_sequence,
+                    byte_offset: byte_len,
+                    record_count: 0,
+                });
+            }
+            file.write_all(&frame)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            byte_len += frame.len() as u64;
+            if let Some(last) = marks.last_mut() {
+                last.record_count += 1;
+            }
+        }
+        file.sync_data()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+    }
+    fs::rename(&tmp_path, &final_path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+
+    let (execution_bloom, granule_blooms) = build_execution_blooms(records, &marks, gsize);
+    let meta = PartMeta {
+        part_id,
+        partition,
+        min_sequence,
+        max_sequence,
+        record_count: records.len() as u64,
+        byte_size: byte_len,
+        replicas: Vec::new(),
+        local_path: Some(final_path.to_string_lossy().to_string()),
+        sparse_index: SparseIndex {
+            granule_size: gsize,
+            marks,
+        },
+        execution_bloom: Some(execution_bloom),
+        granule_blooms,
+    };
+    Ok(SealedPart {
+        meta,
+        records: records.to_vec(),
+    })
 }
 
 #[cfg(test)]

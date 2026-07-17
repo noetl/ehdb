@@ -110,12 +110,61 @@ fn main() {
         .all(|k| k.contains(&format!("shard-{target_shard}/")));
     println!(
         "\ncold read exec {target} (shard {target_shard}): {} events; parts touched={}, \
-         parts_pruned (zero I/O)={}, all-touched-are-target-shard={}",
+         parts_pruned (zero I/O)={} (of which bloom-pruned={}), all-touched-are-target-shard={}",
         hits.len(),
         touched.len(),
         read_metrics.parts_pruned,
+        read_metrics.parts_bloom_pruned,
         only_target_shard
     );
+
+    // L0.2 index-first pruning in a SINGLE partition (worst case for the
+    // partition/MinMax prune) — the bloom is the only mechanism.
+    {
+        let ii_obj = tmp("ii-obj");
+        let ii_local = tmp("ii-local");
+        let ii_cold = tmp("ii-cold");
+        for d in [&ii_obj, &ii_local, &ii_cold] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let one_shard = |root: &std::path::Path| {
+            L0Config::d1(root)
+                .with_shard_count(1)
+                .with_granule_size(4)
+                .with_seal_max_records(8)
+        };
+        let store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+            LocalFsSubstrate::new(&ii_obj).unwrap(),
+        ));
+        let mut w = L0EventLogEngine::open(one_shard(&ii_local), store).unwrap();
+        for e in 0..6 {
+            for i in 0..16u64 {
+                w.append(&format!("e{e}"), &format!("t{i}"), format!("p{i}"))
+                    .unwrap();
+            }
+        }
+        w.flush_and_wait_uploads().unwrap();
+        let cold_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+            LocalFsSubstrate::new(&ii_obj).unwrap(),
+        ));
+        let cold = L0EventLogEngine::cold_load(one_shard(&ii_cold), cold_store).unwrap();
+        let parts = cold.manifest_snapshot().parts.len();
+        let got = cold.read_execution_after("e3", 0).unwrap();
+        let s = cold.metrics().snapshot();
+        println!(
+            "\nL0.2 single-partition read exec e3: {} events (correct); {} parts total, \
+             bloom-pruned={} parts, scanned={} parts (partition prune powerless here)",
+            got.len(),
+            parts,
+            s.parts_bloom_pruned,
+            s.parts_scanned
+        );
+        drop(cold);
+        drop(w);
+        for d in [&ii_obj, &ii_local, &ii_cold] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 
     // Ranged-block skip: read after a high sequence fetches only the tail block.
     let manifest = cold.manifest_snapshot();
@@ -137,6 +186,57 @@ fn main() {
         last_part.byte_size,
         total_bytes.checked_div(block).unwrap_or(0)
     );
+
+    // --- L0.3 merge/compaction: small parts -> fewer big parts, records preserved ---
+    {
+        let mg_obj = tmp("mg-obj");
+        let mg_local = tmp("mg-cold");
+        for d in [&mg_obj, &mg_local] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let mg_cfg = |root: &std::path::Path| {
+            L0Config::d1(root)
+                .with_shard_count(1)
+                .with_granule_size(4)
+                .with_seal_max_records(8)
+                .with_merge_policy(ehdb_l0::MergePolicy {
+                    small_part_max_records: 8,
+                    trigger_run_len: 3,
+                    max_merge_parts: 8,
+                })
+        };
+        let mg_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+            LocalFsSubstrate::new(&mg_obj).unwrap(),
+        ));
+        let mut mg = L0EventLogEngine::open(mg_cfg(&mg_local), mg_store).unwrap();
+        for e in 0..3 {
+            for i in 0..16u64 {
+                mg.append(
+                    &format!("e{e}"),
+                    &format!("t{i}"),
+                    format!("payload-{e}-{i}"),
+                )
+                .unwrap();
+            }
+        }
+        mg.flush_and_wait_uploads().unwrap();
+        let before = mg.manifest_snapshot().parts.len();
+        let records_before = mg.replay_all().unwrap().len();
+        let merges = mg.run_pending_merges().unwrap();
+        let after = mg.manifest_snapshot().parts.len();
+        let records_after = mg.replay_all().unwrap().len();
+        let s = mg.metrics().snapshot();
+        println!(
+            "\nL0.3 merge: {before} small parts -> {after} parts ({merges} merges, {} sources \
+             consumed); records {records_before} -> {records_after} (preserved={})",
+            s.parts_merged,
+            records_before == records_after
+        );
+        drop(mg);
+        for d in [&mg_obj, &mg_local] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 
     // --- hot-path isolation: append latency, fast store vs slow store ---
     println!("\n-- hot-path isolation (append not blocked by slow substrate) --");
