@@ -514,6 +514,126 @@ impl L0EventLogEngine {
         Ok(())
     }
 
+    /// **L0.5 orphan reclaim (GC).** Delete every part object + local part file
+    /// the current manifest no longer references — chiefly the superseded source
+    /// parts a merge (L0.3) leaves behind, and parts dropped by
+    /// [`apply_retention`](Self::apply_retention). Idempotent (deleting a missing
+    /// object is a no-op). Returns the number of objects/files reclaimed.
+    ///
+    /// Single-writer assumption: the caller is the shard owner, so no concurrent
+    /// appender is racing an object into existence as GC lists.
+    pub fn reclaim_orphans(&mut self) -> Result<usize> {
+        let (referenced_objects, referenced_locals) = {
+            let m = self.manifest.lock().unwrap();
+            // Every substrate key referenced by any part's replica list — a
+            // part may have N replicas, all of which must be kept.
+            let objs: std::collections::HashSet<String> =
+                m.parts.iter().flat_map(|p| p.replicas.clone()).collect();
+            let locals: std::collections::HashSet<String> = m
+                .parts
+                .iter()
+                .filter_map(|p| p.local_path.clone())
+                .collect();
+            (objs, locals)
+        };
+
+        let mut reclaimed = 0usize;
+
+        // Object-store orphans under this dataset's parts prefix.
+        let prefix = format!("parts/{}/", self.config.dataset);
+        for key in self.substrate.list_prefix(&prefix)? {
+            if !referenced_objects.contains(&key) {
+                let bytes = self
+                    .substrate
+                    .get_all(&key)
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0);
+                self.substrate.delete(&key)?;
+                self.metrics.record_orphan_reclaim(bytes);
+                reclaimed += 1;
+            }
+        }
+
+        // Local hot-tier orphan part files.
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let mut local_files = Vec::new();
+        collect_eslog_files(&parts_root, &mut local_files)?;
+        for path in local_files {
+            let path_str = path.to_string_lossy().to_string();
+            if !referenced_locals.contains(&path_str) {
+                let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+                self.metrics.record_orphan_reclaim(bytes);
+                reclaimed += 1;
+            }
+        }
+
+        Ok(reclaimed)
+    }
+
+    /// **L0.5 retention (drop-partition).** Drop every part entirely below
+    /// `keep_from_sequence` (a part straddling the floor is kept whole — never a
+    /// row-level delete), advance the manifest's `reclaimed_through`, rewrite the
+    /// durable manifest, and reclaim the dropped parts' objects. A read below the
+    /// floor afterward simply finds nothing (the records are gone), never an
+    /// error. Returns the number of parts dropped.
+    pub fn apply_retention(&mut self, keep_from_sequence: u64) -> Result<usize> {
+        let plan = {
+            let m = self.manifest.lock().unwrap();
+            crate::retention::plan_retention(&m, keep_from_sequence)
+        };
+        if plan.is_empty() {
+            return Ok(0);
+        }
+
+        // Manifest swap: drop the parts, advance the floor.
+        let durable = {
+            let mut m = self.manifest.lock().unwrap();
+            let drop_set: std::collections::HashSet<&String> = plan.drop_ids.iter().collect();
+            m.parts.retain(|p| !drop_set.contains(&p.part_id));
+            if plan.reclaimed_through > m.reclaimed_through {
+                m.reclaimed_through = plan.reclaimed_through;
+            }
+            m.version += 1;
+            m.durable_view()
+        };
+        if let Ok(ser) = serde_json::to_vec(&durable) {
+            self.substrate
+                .put_overwrite(&manifest_latest_key(&self.config.dataset), &ser)?;
+            let _ = self.substrate.put_if_absent(
+                &manifest_version_key(&self.config.dataset, durable.version),
+                &ser,
+            );
+        }
+
+        let dropped = plan.drop_ids.len();
+        self.metrics.record_parts_dropped(dropped as u64);
+        // Reclaim the now-unreferenced dropped part objects + files.
+        self.reclaim_orphans()?;
+        Ok(dropped)
+    }
+
+    /// Convenience: retain at least the last `keep_last_records` sort-key values,
+    /// dropping whole parts below that window.
+    pub fn apply_retention_keep_last(&mut self, keep_last_records: u64) -> Result<usize> {
+        let keep_from = {
+            let m = self.manifest.lock().unwrap();
+            m.max_sequence()
+                .saturating_sub(keep_last_records)
+                .saturating_add(1)
+        };
+        self.apply_retention(keep_from)
+    }
+
+    /// The retention floor — the highest sort-key value dropped by retention
+    /// (`0` if nothing reclaimed). Reads below it find nothing.
+    pub fn reclaimed_through(&self) -> u64 {
+        self.manifest.lock().unwrap().reclaimed_through
+    }
+
     /// Read a whole part's bytes — local hot tier if resident, else the durable
     /// substrate (primary replica).
     fn read_whole_part(&self, part: &PartMeta) -> Result<Vec<u8>> {
@@ -710,6 +830,23 @@ fn decrement(outstanding: &Arc<(Mutex<usize>, Condvar)>) {
         *n -= 1;
     }
     cvar.notify_all();
+}
+
+/// Recursively collect `*.eslog` part files under `dir` (for orphan reclaim).
+fn collect_eslog_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).map_err(|err| EhdbError::Storage(err.to_string()))? {
+        let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_eslog_files(&path, out)?;
+        } else if path.extension().map(|e| e == "eslog").unwrap_or(false) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn read_local_range(path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {

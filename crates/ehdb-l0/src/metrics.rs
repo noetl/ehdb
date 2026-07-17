@@ -31,6 +31,13 @@ pub struct L0Metrics {
     pub parts_merged: AtomicU64,
     /// Bytes written by merges (merged-part sizes summed).
     pub merged_bytes: AtomicU64,
+    /// Orphan objects/files reclaimed by GC (L0.5) — superseded merge sources +
+    /// dropped-partition parts.
+    pub orphans_reclaimed: AtomicU64,
+    /// Bytes freed by orphan reclaim.
+    pub orphan_bytes: AtomicU64,
+    /// Whole parts dropped by retention (L0.5).
+    pub parts_dropped: AtomicU64,
     /// Cold-load operations (a fresh node reconstructing from the object store).
     pub cold_loads: AtomicU64,
     /// Read lookups served.
@@ -71,6 +78,13 @@ impl L0Metrics {
         self.parts_merged.fetch_add(source_parts, Ordering::Relaxed);
         self.merged_bytes.fetch_add(merged_bytes, Ordering::Relaxed);
     }
+    pub(crate) fn record_orphan_reclaim(&self, bytes: u64) {
+        self.orphans_reclaimed.fetch_add(1, Ordering::Relaxed);
+        self.orphan_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn record_parts_dropped(&self, parts: u64) {
+        self.parts_dropped.fetch_add(parts, Ordering::Relaxed);
+    }
     pub(crate) fn record_read(&self, pruned: u64, bloom_pruned: u64, scanned: u64) {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.parts_pruned.fetch_add(pruned, Ordering::Relaxed);
@@ -90,6 +104,9 @@ impl L0Metrics {
             merges: self.merges.load(Ordering::Relaxed),
             parts_merged: self.parts_merged.load(Ordering::Relaxed),
             merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
+            orphans_reclaimed: self.orphans_reclaimed.load(Ordering::Relaxed),
+            orphan_bytes: self.orphan_bytes.load(Ordering::Relaxed),
+            parts_dropped: self.parts_dropped.load(Ordering::Relaxed),
             cold_loads: self.cold_loads.load(Ordering::Relaxed),
             reads: self.reads.load(Ordering::Relaxed),
             parts_pruned: self.parts_pruned.load(Ordering::Relaxed),
@@ -110,6 +127,9 @@ pub struct L0MetricsSnapshot {
     pub merges: u64,
     pub parts_merged: u64,
     pub merged_bytes: u64,
+    pub orphans_reclaimed: u64,
+    pub orphan_bytes: u64,
+    pub parts_dropped: u64,
     pub cold_loads: u64,
     pub reads: u64,
     pub parts_pruned: u64,

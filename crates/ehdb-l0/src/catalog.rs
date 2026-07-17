@@ -220,6 +220,12 @@ pub struct Manifest {
     pub version: u64,
     /// One row per immutable part, insertion-ordered.
     pub parts: Vec<PartMeta>,
+    /// **L0.5 retention floor:** the highest sort-key value dropped by
+    /// retention. Every sequence `<= reclaimed_through` is gone (its whole part
+    /// was dropped); a read below it simply finds nothing, never an error. `0`
+    /// (the default, and any L0.1–L0.3 manifest) means nothing reclaimed.
+    #[serde(default)]
+    pub reclaimed_through: u64,
 }
 
 impl Manifest {
@@ -229,6 +235,7 @@ impl Manifest {
             dataset: dataset.into(),
             version: 0,
             parts: Vec::new(),
+            reclaimed_through: 0,
         }
     }
 
@@ -282,6 +289,7 @@ impl Manifest {
                     ..p.clone()
                 })
                 .collect(),
+            reclaimed_through: self.reclaimed_through,
         }
     }
 
