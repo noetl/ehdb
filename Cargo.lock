@@ -606,6 +606,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-l0"
+version = "0.1.0"
+dependencies = [
+ "ehdb-core",
+ "serde",
+ "serde_json",
+ "twox-hash",
+]
+
+[[package]]
 name = "ehdb-reference"
 version = "0.1.0"
 dependencies = [
