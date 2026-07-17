@@ -2,6 +2,7 @@
 members = [
     "crates/ehdb-catalog",
     "crates/ehdb-core",
+    "crates/ehdb-l0",
     "crates/ehdb-reference",
     "crates/ehdb-retrieval",
     "crates/ehdb-service",
@@ -28,6 +29,7 @@ prost = "0.13"
 sqlparser = "0.51"
 ehdb-catalog = { path = "crates/ehdb-catalog" }
 ehdb-core = { path = "crates/ehdb-core" }
+ehdb-l0 = { path = "crates/ehdb-l0" }
 ehdb-reference = { path = "crates/ehdb-reference" }
 ehdb-retrieval = { path = "crates/ehdb-retrieval" }
 ehdb-service = { path = "crates/ehdb-service" }
