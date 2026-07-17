@@ -29,9 +29,12 @@ pub struct L0Metrics {
     pub cold_loads: AtomicU64,
     /// Read lookups served.
     pub reads: AtomicU64,
-    /// Parts pruned away by the manifest (MinMax skip) across all reads — the
+    /// Parts pruned away across all reads (partition + MinMax + L0.2 bloom) — the
     /// "zero I/O on non-matching parts" measure.
     pub parts_pruned: AtomicU64,
+    /// Of `parts_pruned`, those skipped specifically by the L0.2 execution-id
+    /// bloom (survived the partition/MinMax prune, then the bloom rejected them).
+    pub parts_bloom_pruned: AtomicU64,
     /// Parts actually opened (local or object-store) across all reads.
     pub parts_scanned: AtomicU64,
 }
@@ -57,9 +60,11 @@ impl L0Metrics {
     pub(crate) fn incr_cold_loads(&self) {
         self.cold_loads.fetch_add(1, Ordering::Relaxed);
     }
-    pub(crate) fn record_read(&self, pruned: u64, scanned: u64) {
+    pub(crate) fn record_read(&self, pruned: u64, bloom_pruned: u64, scanned: u64) {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.parts_pruned.fetch_add(pruned, Ordering::Relaxed);
+        self.parts_bloom_pruned
+            .fetch_add(bloom_pruned, Ordering::Relaxed);
         self.parts_scanned.fetch_add(scanned, Ordering::Relaxed);
     }
 
@@ -74,6 +79,7 @@ impl L0Metrics {
             cold_loads: self.cold_loads.load(Ordering::Relaxed),
             reads: self.reads.load(Ordering::Relaxed),
             parts_pruned: self.parts_pruned.load(Ordering::Relaxed),
+            parts_bloom_pruned: self.parts_bloom_pruned.load(Ordering::Relaxed),
             parts_scanned: self.parts_scanned.load(Ordering::Relaxed),
         }
     }
@@ -90,6 +96,7 @@ pub struct L0MetricsSnapshot {
     pub cold_loads: u64,
     pub reads: u64,
     pub parts_pruned: u64,
+    pub parts_bloom_pruned: u64,
     pub parts_scanned: u64,
 }
 

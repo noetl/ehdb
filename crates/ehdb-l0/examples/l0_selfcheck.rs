@@ -110,12 +110,61 @@ fn main() {
         .all(|k| k.contains(&format!("shard-{target_shard}/")));
     println!(
         "\ncold read exec {target} (shard {target_shard}): {} events; parts touched={}, \
-         parts_pruned (zero I/O)={}, all-touched-are-target-shard={}",
+         parts_pruned (zero I/O)={} (of which bloom-pruned={}), all-touched-are-target-shard={}",
         hits.len(),
         touched.len(),
         read_metrics.parts_pruned,
+        read_metrics.parts_bloom_pruned,
         only_target_shard
     );
+
+    // L0.2 index-first pruning in a SINGLE partition (worst case for the
+    // partition/MinMax prune) — the bloom is the only mechanism.
+    {
+        let ii_obj = tmp("ii-obj");
+        let ii_local = tmp("ii-local");
+        let ii_cold = tmp("ii-cold");
+        for d in [&ii_obj, &ii_local, &ii_cold] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let one_shard = |root: &std::path::Path| {
+            L0Config::d1(root)
+                .with_shard_count(1)
+                .with_granule_size(4)
+                .with_seal_max_records(8)
+        };
+        let store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+            LocalFsSubstrate::new(&ii_obj).unwrap(),
+        ));
+        let mut w = L0EventLogEngine::open(one_shard(&ii_local), store).unwrap();
+        for e in 0..6 {
+            for i in 0..16u64 {
+                w.append(&format!("e{e}"), &format!("t{i}"), format!("p{i}"))
+                    .unwrap();
+            }
+        }
+        w.flush_and_wait_uploads().unwrap();
+        let cold_store: Arc<dyn DurableSubstrate> = Arc::new(CountingSubstrate::new(
+            LocalFsSubstrate::new(&ii_obj).unwrap(),
+        ));
+        let cold = L0EventLogEngine::cold_load(one_shard(&ii_cold), cold_store).unwrap();
+        let parts = cold.manifest_snapshot().parts.len();
+        let got = cold.read_execution_after("e3", 0).unwrap();
+        let s = cold.metrics().snapshot();
+        println!(
+            "\nL0.2 single-partition read exec e3: {} events (correct); {} parts total, \
+             bloom-pruned={} parts, scanned={} parts (partition prune powerless here)",
+            got.len(),
+            parts,
+            s.parts_bloom_pruned,
+            s.parts_scanned
+        );
+        drop(cold);
+        drop(w);
+        for d in [&ii_obj, &ii_local, &ii_cold] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 
     // Ranged-block skip: read after a high sequence fetches only the tail block.
     let manifest = cold.manifest_snapshot();
