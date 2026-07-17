@@ -96,10 +96,9 @@ pub struct L0MetricsSnapshot {
 impl L0MetricsSnapshot {
     /// Mean upload lag in microseconds (0 if no uploads yet).
     pub fn mean_upload_lag_micros(&self) -> u64 {
-        if self.uploads == 0 {
-            0
-        } else {
-            self.upload_lag_micros_total / self.uploads
-        }
+        // `checked_div` returns `None` on a zero divisor (no uploads yet) → 0.
+        self.upload_lag_micros_total
+            .checked_div(self.uploads)
+            .unwrap_or(0)
     }
 }

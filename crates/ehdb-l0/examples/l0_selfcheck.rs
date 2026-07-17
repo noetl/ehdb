@@ -135,7 +135,7 @@ fn main() {
         "ranged GET after seq {cursor}: fetched {block} bytes of last part ({} bytes); \
          whole dataset = {total_bytes} bytes  → sparse-index skip factor ~{}x",
         last_part.byte_size,
-        if block > 0 { total_bytes / block } else { 0 }
+        total_bytes.checked_div(block).unwrap_or(0)
     );
 
     // --- hot-path isolation: append latency, fast store vs slow store ---
