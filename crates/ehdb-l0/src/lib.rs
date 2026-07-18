@@ -148,6 +148,7 @@ pub mod part;
 pub mod projection;
 pub mod registry;
 pub mod retention;
+pub mod runtime;
 pub mod substrate;
 pub mod vector;
 
@@ -175,5 +176,8 @@ pub use registry::{
     CatalogDataset, CatalogEntry, CatalogKind, CatalogOp, CatalogStore, DATASET_D7_CATALOG,
 };
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
+pub use runtime::{
+    RuntimeDataset, RuntimeEvent, RuntimeOp, RuntimeState, RuntimeStore, DATASET_D8_RUNTIME,
+};
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
