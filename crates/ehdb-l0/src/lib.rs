@@ -143,6 +143,7 @@ pub mod frame;
 pub mod merge;
 pub mod metrics;
 pub mod part;
+pub mod projection;
 pub mod retention;
 pub mod substrate;
 
@@ -161,5 +162,8 @@ pub use engine::{L0Config, L0Engine, L0EventLogEngine, ReplicaTarget};
 pub use merge::{MergePlan, MergePolicy};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};
+pub use projection::{
+    ExecutionProjection, ExecutionState, ProjectionOp, ProjectionStore, DATASET_D3_PROJECTION,
+};
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
