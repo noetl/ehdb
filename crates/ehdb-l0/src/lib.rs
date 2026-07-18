@@ -122,11 +122,13 @@
 //! - **L0.7** — the engine is **dataset-generic**: [`dataset::Dataset`] captures
 //!   a dataset's fixed record schema + sort key + partition + index dimension,
 //!   and [`engine::L0Engine`]`<D>` runs the shared part/catalog/merge/replication
-//!   engine over any of them. [`engine::L0EventLogEngine`] is the D1 alias with
-//!   the ergonomic `append(exec,txn,payload)` API. D1 is the first `impl
-//!   Dataset`; more datasets (D2 command-queue, …) are new impls.
+//!   engine over any of them. [`engine::L0EventLogEngine`] is the D1 alias.
+//! - **D2** — the [`command_queue`] (`noetl.command`): a second dataset on the
+//!   generic engine. The mutable queue is modeled as an **append-only op log
+//!   over immutable parts**; claim-state is a **fold/projection**
+//!   ([`command_queue::CommandQueue`]: enqueue / claim-by-id / unclaimed-scan).
 //!
-//! Still OUT (later work): the D2…D10 dataset impls; wiring the columnar codec in
+//! Still OUT (later work): the D3…D10 dataset impls; wiring the columnar codec in
 //! as the on-disk part encoding + the Phase-8 blob shape (D5); and **all** of
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
@@ -134,6 +136,7 @@
 pub mod bloom;
 pub mod catalog;
 pub mod columnar;
+pub mod command_queue;
 pub mod dataset;
 pub mod engine;
 pub mod frame;
@@ -146,6 +149,10 @@ pub mod substrate;
 pub use bloom::Bloom;
 pub use catalog::{Manifest, PartMeta, ReplicaLocation, SparseIndex};
 pub use columnar::{decode_columnar, encode_columnar, project_column, Column, Field};
+pub use command_queue::{
+    CommandOpKind, CommandOpRecord, CommandQueue, CommandState, D2CommandQueue,
+    DATASET_D2_COMMAND_QUEUE,
+};
 pub use dataset::{
     shard_for_execution, D1EventLog, Dataset, EventRecord, DATASET_D1_EVENT_LOG,
     DEFAULT_SHARD_COUNT,
