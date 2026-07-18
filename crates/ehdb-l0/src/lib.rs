@@ -148,6 +148,7 @@ pub mod part;
 pub mod projection;
 pub mod retention;
 pub mod substrate;
+pub mod vector;
 
 pub use blob::{content_digest, BlobOp, BlobRegistry, BlobStore, DATASET_D5_BLOB};
 pub use bloom::Bloom;
@@ -171,3 +172,4 @@ pub use projection::{
 };
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
+pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
