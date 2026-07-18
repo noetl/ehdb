@@ -151,6 +151,7 @@ pub mod retention;
 pub mod runtime;
 pub mod substrate;
 pub mod vector;
+pub mod wasm;
 
 pub use blob::{content_digest, BlobOp, BlobRegistry, BlobStore, DATASET_D5_BLOB};
 pub use bloom::Bloom;
@@ -181,3 +182,6 @@ pub use runtime::{
 };
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
+pub use wasm::{
+    wasm_key, WasmBinding, WasmDataset, WasmModule, WasmOp, WasmOpKind, WasmStore, DATASET_D9_WASM,
+};
