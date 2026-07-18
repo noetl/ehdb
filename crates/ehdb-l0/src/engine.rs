@@ -34,12 +34,17 @@ use std::time::Instant;
 use ehdb_core::{EhdbError, Result};
 
 use crate::catalog::{Manifest, PartMeta, ReplicaLocation};
-use crate::dataset::{shard_for_execution, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
+use crate::dataset::{D1EventLog, Dataset, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
 use crate::frame::iter_frames_from;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
 use crate::substrate::DurableSubstrate;
+
+/// Back-compat alias: the D1 event-log engine is the generic [`L0Engine`]
+/// specialized to [`D1EventLog`]. It carries the D1 convenience API
+/// (`append(exec, txn, payload)` / `read_execution_after`).
+pub type L0EventLogEngine = L0Engine<D1EventLog>;
 
 /// Default granule size (records per sparse-index entry).
 pub const DEFAULT_GRANULE_SIZE: u32 = 16;
@@ -82,6 +87,16 @@ impl L0Config {
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             flush: FlushPolicy::EveryAppend,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
+        }
+    }
+
+    /// Config for an arbitrary dataset id (used by non-D1 datasets). The engine
+    /// overrides `dataset` from `D::NAME` on open regardless, so this is mainly
+    /// for the merge policy defaults; the tuning knobs match [`d1`](Self::d1).
+    pub fn for_dataset(dataset: impl Into<String>, local_root: impl Into<PathBuf>) -> Self {
+        Self {
+            dataset: dataset.into(),
+            ..Self::d1(local_root)
         }
     }
 
@@ -157,9 +172,12 @@ struct UploadJob {
     sealed_at: Instant,
 }
 
-/// The L0 event-log engine (single writer per partition — the caller is the
-/// shard owner, matching #254's single-writer assumption).
-pub struct L0EventLogEngine {
+/// The generic L0 storage engine for one [`Dataset`] `D` (single writer per
+/// partition — the caller is the shard owner, matching #254's single-writer
+/// assumption). Parts / catalog / merge / replication are all `D`-agnostic; `D`
+/// supplies only the record schema + fixed sort key + fixed partition + fixed
+/// index dimension.
+pub struct L0Engine<D: Dataset> {
     config: L0Config,
     /// The **N-way replica set** (L0.6): every immutable part + the durable
     /// manifest is written to all of these; reads try them in order with
@@ -170,8 +188,8 @@ pub struct L0EventLogEngine {
     /// thread, which records a replica on upload.
     manifest: Arc<Mutex<Manifest>>,
     /// Per-shard active writers (engine-owned single writer).
-    writers: HashMap<u32, PartWriter>,
-    /// Monotonic global sequence assigned at append (the D1 sort key).
+    writers: HashMap<u32, PartWriter<D>>,
+    /// Highest sort key seen (D1: the global-sequence tip).
     global_sequence: u64,
     /// Sender to the uploader thread (dropped on close to stop it).
     upload_tx: Option<Sender<UploadJob>>,
@@ -180,7 +198,7 @@ pub struct L0EventLogEngine {
     outstanding: Arc<(Mutex<usize>, Condvar)>,
 }
 
-impl L0EventLogEngine {
+impl<D: Dataset> L0Engine<D> {
     /// Open a **single-replica** writer engine over `substrate` (`replica-0`),
     /// reusing any manifest already there. The local hot tier is
     /// `config.local_root`.
@@ -210,7 +228,7 @@ impl L0EventLogEngine {
 
     /// N-way open sharing a metrics handle.
     pub fn open_replicated_with_metrics(
-        config: L0Config,
+        mut config: L0Config,
         replicas: Vec<ReplicaTarget>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
@@ -219,6 +237,9 @@ impl L0EventLogEngine {
                 "L0 engine needs at least one replica target".into(),
             ));
         }
+        // The dataset id is authoritative from the type — keep the config in sync
+        // so a generic dataset's substrate keys / manifest keys are correct.
+        config.dataset = D::NAME.to_string();
         fs::create_dir_all(&config.local_root)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
         // Resume the durable catalog if present (owner restart) — from any
@@ -263,10 +284,11 @@ impl L0EventLogEngine {
 
     /// N-way cold-load sharing a metrics handle.
     pub fn cold_load_replicated_with_metrics(
-        config: L0Config,
+        mut config: L0Config,
         replicas: Vec<ReplicaTarget>,
         metrics: Arc<L0Metrics>,
     ) -> Result<Self> {
+        config.dataset = D::NAME.to_string();
         if replicas.is_empty() {
             return Err(EhdbError::InvalidState(
                 "L0 cold-load needs at least one replica target".into(),
@@ -366,22 +388,23 @@ impl L0EventLogEngine {
         self.upload_handle = Some(handle);
     }
 
-    /// Append one D1 event to the hot tier, assigning the next global sequence.
-    /// Never touches the substrate. Returns the assigned global sequence.
-    pub fn append(
-        &mut self,
-        execution_id: &str,
-        transaction_id: &str,
-        payload: impl Into<String>,
-    ) -> Result<u64> {
-        let seq = self.global_sequence + 1;
-        let shard = shard_for_execution(execution_id, self.config.shard_count);
+    /// **Append one record to the hot tier** (dataset-generic). Routes to the
+    /// record's partition ([`Dataset::partition`]), writes it, advances the
+    /// sort-key tip, and seals if the active part is full. The caller supplies a
+    /// fully-formed record whose sort key is `>=` every prior record in its
+    /// partition (the single-writer ascending-sort-key contract). Never touches
+    /// the substrate. Returns the record's sort key.
+    pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
+        let sort_key = D::sort_key(&record);
+        let shard = D::partition(&record, self.config.shard_count);
         self.ensure_writer(shard)?;
         {
             let writer = self.writers.get_mut(&shard).unwrap();
-            writer.append(EventRecord::new(seq, execution_id, transaction_id, payload))?;
+            writer.append(record)?;
         }
-        self.global_sequence = seq;
+        if sort_key > self.global_sequence {
+            self.global_sequence = sort_key;
+        }
         self.metrics.incr_appends();
 
         let sealed = {
@@ -395,12 +418,12 @@ impl L0EventLogEngine {
         if let Some(sealed) = sealed {
             self.register_and_upload(sealed)?;
         }
-        Ok(seq)
+        Ok(sort_key)
     }
 
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {
         if !self.writers.contains_key(&shard) {
-            let writer = PartWriter::open(
+            let writer = PartWriter::<D>::open(
                 self.config.dataset.clone(),
                 shard,
                 self.config.part_dir(shard),
@@ -416,7 +439,7 @@ impl L0EventLogEngine {
 
     /// Register a sealed part in the manifest (local-only) and enqueue its async
     /// upload.
-    fn register_and_upload(&mut self, sealed: SealedPart) -> Result<()> {
+    fn register_and_upload(&mut self, sealed: SealedPart<D>) -> Result<()> {
         let substrate_key = substrate_key_for(
             &self.config.dataset,
             sealed.meta.partition,
@@ -522,17 +545,17 @@ impl L0EventLogEngine {
 
         // Read every source part's records (local hot tier if resident, else the
         // object store) and order them by the sort key.
-        let mut records: Vec<EventRecord> = Vec::new();
+        let mut records: Vec<D::Record> = Vec::new();
         for src in &sources {
             let bytes = self.read_whole_part(src)?;
             for frame in iter_frames_from(&bytes, 0)? {
-                let rec: EventRecord = serde_json::from_slice(frame.body).map_err(|err| {
+                let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
                     EhdbError::Storage(format!("decode l0 record on merge: {err}"))
                 })?;
                 records.push(rec);
             }
         }
-        records.sort_by_key(|r| r.global_sequence);
+        records.sort_by_key(D::sort_key);
 
         // Build the merged immutable part (in a per-partition `merged/` subdir so
         // its active-file name can never collide with the append-path writer).
@@ -540,7 +563,7 @@ impl L0EventLogEngine {
             "parts/{}/shard-{}/merged",
             self.config.dataset, plan.partition
         ));
-        let sealed = build_merged_part(
+        let sealed = build_merged_part::<D>(
             plan.partition,
             self.config.granule_size,
             &merged_dir,
@@ -752,29 +775,24 @@ impl L0EventLogEngine {
         }))
     }
 
-    /// **The D1 read path** (RFC §2.5 worked example + L0.2 index-first pruning):
-    /// events for `execution_id` with `global_sequence > after_seq`, in sequence
-    /// order.
+    /// **The dataset-generic read path** (RFC §2.5 worked example + L0.2
+    /// index-first pruning): records whose [`Dataset::index_key`] equals
+    /// `index_value` with sort key `> after_seq`, in sort-key order.
     ///
     /// 1. Manifest prune (MinMax + partition skip): only parts of
-    ///    `shard_for(execution_id)` whose range can hold a record after
-    ///    `after_seq`. Non-matching parts are skipped with **zero I/O**.
+    ///    [`Dataset::read_partition`]`(index_value)` whose range can hold a record
+    ///    after `after_seq`. Non-matching parts are skipped with **zero I/O**.
     /// 2. **L0.2 bloom prune (index-first):** among the surviving parts, skip any
-    ///    whose per-part `execution_id` bloom says the execution is definitely
-    ///    absent — the primary prune when everything is in one partition.
+    ///    whose per-part index bloom says `index_value` is definitely absent.
     /// 3. Sparse index binary search: locate the granule containing `after_seq+1`.
     /// 4. **L0.2 granule bloom narrowing:** trim the ranged block to the
-    ///    contiguous granule span whose blooms admit the execution.
-    /// 5. Ranged read of only that block, from the local hot tier if resident,
-    ///    else a ranged GET against the durable substrate; decode + filter + the
-    ///    active hot buffer.
-    pub fn read_execution_after(
-        &self,
-        execution_id: &str,
-        after_seq: u64,
-    ) -> Result<Vec<EventRecord>> {
-        let shard = shard_for_execution(execution_id, self.config.shard_count);
-        let mut out = Vec::new();
+    ///    contiguous granule span whose blooms admit `index_value`.
+    /// 5. Ranged read of only that block (local hot tier if resident, else a
+    ///    ranged GET across replicas with fallback); decode + filter + the active
+    ///    hot buffer.
+    pub fn read_index_after(&self, index_value: &str, after_seq: u64) -> Result<Vec<D::Record>> {
+        let shard = D::read_partition(index_value, self.config.shard_count);
+        let mut out: Vec<D::Record> = Vec::new();
 
         let (candidate_parts, pruned_count, bloom_pruned_count) = {
             let m = self.manifest.lock().unwrap();
@@ -788,7 +806,7 @@ impl L0EventLogEngine {
             // execution is definitely absent from — skipped with ZERO part I/O.
             let hits: Vec<_> = partition_survivors
                 .into_iter()
-                .filter(|p| p.execution_maybe_present(execution_id))
+                .filter(|p| p.execution_maybe_present(index_value))
                 .collect();
             let bloom_pruned = after_partition - hits.len();
             // Every skipped part (wrong partition, below cursor, or bloom-
@@ -806,8 +824,7 @@ impl L0EventLogEngine {
                 .partition_point(|mark| mark.byte_offset < start_offset);
             // Granule-bloom narrowing: the contiguous granule span that may hold
             // the execution, starting no earlier than the cursor's granule.
-            let (block_start, block_end) = match part.granule_span_for(execution_id, start_granule)
-            {
+            let (block_start, block_end) = match part.granule_span_for(index_value, start_granule) {
                 Some((lo, hi)) => {
                     let block_start = part.granule_offset(lo);
                     // End = the next granule's mark, or the part end for the last.
@@ -835,10 +852,10 @@ impl L0EventLogEngine {
                 })?
             };
             for frame in iter_frames_from(&block, 0)? {
-                let rec: EventRecord = serde_json::from_slice(frame.body).map_err(|err| {
+                let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
                     EhdbError::Storage(format!("decode l0 record in part {}: {err}", part.part_id))
                 })?;
-                if rec.global_sequence > after_seq && rec.execution_id == execution_id {
+                if D::sort_key(&rec) > after_seq && D::index_key(&rec) == index_value {
                     out.push(rec);
                 }
             }
@@ -847,13 +864,13 @@ impl L0EventLogEngine {
         // The active (unsealed) hot buffer for this shard.
         if let Some(writer) = self.writers.get(&shard) {
             for rec in writer.pending_records() {
-                if rec.global_sequence > after_seq && rec.execution_id == execution_id {
+                if D::sort_key(rec) > after_seq && D::index_key(rec) == index_value {
                     out.push(rec.clone());
                 }
             }
         }
 
-        out.sort_by_key(|r| r.global_sequence);
+        out.sort_by_key(D::sort_key);
         self.metrics.record_read(
             pruned_count as u64,
             bloom_pruned_count as u64,
@@ -865,8 +882,8 @@ impl L0EventLogEngine {
     /// Reproduce the **entire** record set across all partitions in global-
     /// sequence order — the cold-load correctness helper. Reads each part fully
     /// (local if resident, else the substrate) plus the active hot buffers.
-    pub fn replay_all(&self) -> Result<Vec<EventRecord>> {
-        let mut out = Vec::new();
+    pub fn replay_all(&self) -> Result<Vec<D::Record>> {
+        let mut out: Vec<D::Record> = Vec::new();
         let parts: Vec<_> = {
             let m = self.manifest.lock().unwrap();
             let mut ps: Vec<_> = m.parts.to_vec();
@@ -876,7 +893,7 @@ impl L0EventLogEngine {
         for part in &parts {
             let bytes = self.read_whole_part(part)?;
             for frame in iter_frames_from(&bytes, 0)? {
-                let rec: EventRecord = serde_json::from_slice(frame.body)
+                let rec: D::Record = serde_json::from_slice(frame.body)
                     .map_err(|err| EhdbError::Storage(format!("decode l0 record: {err}")))?;
                 out.push(rec);
             }
@@ -884,7 +901,7 @@ impl L0EventLogEngine {
         for writer in self.writers.values() {
             out.extend(writer.pending_records().iter().cloned());
         }
-        out.sort_by_key(|r| r.global_sequence);
+        out.sort_by_key(D::sort_key);
         Ok(out)
     }
 
@@ -904,7 +921,32 @@ impl L0EventLogEngine {
     }
 }
 
-impl Drop for L0EventLogEngine {
+/// **D1 (event-log) convenience API** — the original ergonomic surface, now a
+/// thin wrapper over the generic engine so every existing caller is unchanged.
+impl L0Engine<D1EventLog> {
+    /// Append one D1 event, assigning the next `global_sequence`. Returns it.
+    pub fn append(
+        &mut self,
+        execution_id: &str,
+        transaction_id: &str,
+        payload: impl Into<String>,
+    ) -> Result<u64> {
+        let seq = self.global_sequence + 1;
+        self.append_record(EventRecord::new(seq, execution_id, transaction_id, payload))
+    }
+
+    /// Events for `execution_id` with `global_sequence > after_seq` (the D1 read
+    /// path; a thin alias for [`read_index_after`](Self::read_index_after)).
+    pub fn read_execution_after(
+        &self,
+        execution_id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<EventRecord>> {
+        self.read_index_after(execution_id, after_seq)
+    }
+}
+
+impl<D: Dataset> Drop for L0Engine<D> {
     fn drop(&mut self) {
         // Close the channel so the uploader thread exits, then join it.
         self.upload_tx = None;

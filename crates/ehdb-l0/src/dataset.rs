@@ -5,10 +5,71 @@
 //! be purpose-built (no runtime DDL, no discovered schema). Adding a dataset is
 //! a deliberate compiled-in change here, never a runtime operation.
 
+use std::fmt::Debug;
 use std::hash::Hasher;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash64;
+
+/// The **fixed, compiled-in shape of one L0 dataset** (RFC §0.1). The shared
+/// part / catalog / merge / replication engine ([`crate::engine::L0Engine`]) is
+/// generic over this trait: a dataset supplies its record schema, its fixed sort
+/// key, its fixed partition function, and its fixed inverted-index dimension —
+/// nothing else. There is no runtime schema, no DDL, no arbitrary index; a new
+/// dataset is a new `impl Dataset`, a deliberate compiled-in change.
+///
+/// **Contract:** records are appended in **ascending [`sort_key`](Dataset::sort_key)
+/// order within a partition** (the single writer guarantees this) — the sparse
+/// index, MinMax pruning, and merge all rely on it.
+pub trait Dataset: 'static {
+    /// The dataset's fixed record schema.
+    type Record: Serialize + DeserializeOwned + Clone + PartialEq + Debug + Send + 'static;
+
+    /// The dataset id, used in substrate keys + the manifest (e.g.
+    /// `d1_event_log`).
+    const NAME: &'static str;
+
+    /// The record's fixed sort key (D1: `global_sequence`). Ascending within a
+    /// partition.
+    fn sort_key(record: &Self::Record) -> u64;
+
+    /// The partition (shard) a record belongs to (D1: `shard_for(execution_id)`).
+    fn partition(record: &Self::Record, shard_count: u32) -> u32;
+
+    /// The record's fixed inverted-index dimension value — the key the per-part /
+    /// per-granule blooms filter on (D1: `execution_id`). Return `""` to opt out
+    /// of bloom indexing for the dataset.
+    fn index_key(record: &Self::Record) -> &str;
+
+    /// The partition a **read** targets, given the index value it filters on
+    /// (D1: `shard_for(execution_id)` — the read dimension is the partition
+    /// dimension). This is what lets a per-index lookup prune to one partition.
+    fn read_partition(index_value: &str, shard_count: u32) -> u32;
+}
+
+/// **D1 — the event log** (`noetl.event`). Sort key = `global_sequence`;
+/// partition = `shard_for(execution_id)`; index dim = `execution_id`.
+#[derive(Debug, Clone, Copy)]
+pub struct D1EventLog;
+
+impl Dataset for D1EventLog {
+    type Record = EventRecord;
+    const NAME: &'static str = DATASET_D1_EVENT_LOG;
+
+    fn sort_key(record: &EventRecord) -> u64 {
+        record.global_sequence
+    }
+    fn partition(record: &EventRecord, shard_count: u32) -> u32 {
+        shard_for_execution(&record.execution_id, shard_count)
+    }
+    fn index_key(record: &EventRecord) -> &str {
+        &record.execution_id
+    }
+    fn read_partition(execution_id: &str, shard_count: u32) -> u32 {
+        shard_for_execution(execution_id, shard_count)
+    }
+}
 
 /// Dataset id for D1, the append-only execution event log (`noetl.event`). Sort
 /// key = `global_sequence`; partition = `shard_for(execution_id)`; access
