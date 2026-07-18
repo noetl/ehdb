@@ -146,6 +146,7 @@ pub mod merge;
 pub mod metrics;
 pub mod part;
 pub mod projection;
+pub mod registry;
 pub mod retention;
 pub mod substrate;
 pub mod vector;
@@ -169,6 +170,9 @@ pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};
 pub use projection::{
     ExecutionProjection, ExecutionState, ProjectionOp, ProjectionStore, DATASET_D3_PROJECTION,
+};
+pub use registry::{
+    CatalogDataset, CatalogEntry, CatalogKind, CatalogOp, CatalogStore, DATASET_D7_CATALOG,
 };
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
