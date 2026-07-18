@@ -146,6 +146,7 @@ pub mod merge;
 pub mod metrics;
 pub mod part;
 pub mod projection;
+pub mod provider;
 pub mod registry;
 pub mod retention;
 pub mod runtime;
@@ -172,6 +173,10 @@ pub use metrics::{L0Metrics, L0MetricsSnapshot};
 pub use part::{build_merged_part, FlushPolicy, PartWriter, SealedPart};
 pub use projection::{
     ExecutionProjection, ExecutionState, ProjectionOp, ProjectionStore, DATASET_D3_PROJECTION,
+};
+pub use provider::{
+    provider_key, ProviderDataset, ProviderFact, ProviderFactOp, ProviderStore,
+    DATASET_D10_PROVIDER,
 };
 pub use registry::{
     CatalogDataset, CatalogEntry, CatalogKind, CatalogOp, CatalogStore, DATASET_D7_CATALOG,
