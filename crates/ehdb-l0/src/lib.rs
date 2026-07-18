@@ -133,6 +133,7 @@
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
 
+pub mod blob;
 pub mod bloom;
 pub mod catalog;
 pub mod columnar;
@@ -148,6 +149,7 @@ pub mod projection;
 pub mod retention;
 pub mod substrate;
 
+pub use blob::{content_digest, BlobOp, BlobRegistry, BlobStore, DATASET_D5_BLOB};
 pub use bloom::Bloom;
 pub use catalog::{Manifest, PartMeta, ReplicaLocation, SparseIndex};
 pub use columnar::{decode_columnar, encode_columnar, project_column, Column, Field};
