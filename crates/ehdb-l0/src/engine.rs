@@ -879,6 +879,76 @@ impl<D: Dataset> L0Engine<D> {
         Ok(out)
     }
 
+    /// **L1 shard-scoped change-feed read** — every record in `shard` with sort
+    /// key `> after_seq`, in sort-key order. Unlike [`read_index_after`], this is
+    /// **not** index-filtered: it returns the shard's whole tail past the cursor,
+    /// the read behind the `Watch(shard, cursor)` primitive ([`crate::feed`]).
+    ///
+    /// Manifest prune skips parts in other partitions or entirely at/below the
+    /// cursor with **zero I/O**; each surviving part is read **ranged from the
+    /// cursor's granule to the part end** (local hot tier if resident, else a
+    /// ranged GET across replicas with fallback, L0.6), so a repeatedly-polling
+    /// follower never re-reads the parts it has already drained. The active
+    /// (unsealed) hot buffer for the shard is included, so a just-appended record
+    /// is visible to a follower immediately (the shadow-feed / delivery path).
+    pub fn read_partition_after(&self, shard: u32, after_seq: u64) -> Result<Vec<D::Record>> {
+        let mut out: Vec<D::Record> = Vec::new();
+
+        let candidate_parts: Vec<_> = {
+            let m = self.manifest.lock().unwrap();
+            // Clone the matched PartMeta so the manifest lock drops before any
+            // (possibly slow) substrate read.
+            m.prune(shard, after_seq).into_iter().cloned().collect()
+        };
+
+        for part in &candidate_parts {
+            // Sparse-index start offset for the cursor; read from there to the
+            // part end (the feed wants the shard's whole tail, no index narrowing).
+            let start_offset = part.sparse_index.locate(after_seq + 1);
+            let len = part.byte_size.saturating_sub(start_offset);
+            if len == 0 {
+                continue;
+            }
+            let block = if let Some(local_path) = &part.local_path {
+                read_local_range(local_path, start_offset, len)?
+            } else {
+                self.read_across_replicas(part, |substrate, key| {
+                    substrate.get_range(key, start_offset, len)
+                })?
+            };
+            for frame in iter_frames_from(&block, 0)? {
+                let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
+                    EhdbError::Storage(format!("decode l0 record in part {}: {err}", part.part_id))
+                })?;
+                if D::sort_key(&rec) > after_seq {
+                    out.push(rec);
+                }
+            }
+        }
+
+        // The active (unsealed) hot buffer for this shard.
+        if let Some(writer) = self.writers.get(&shard) {
+            for rec in writer.pending_records() {
+                if D::sort_key(rec) > after_seq {
+                    out.push(rec.clone());
+                }
+            }
+        }
+
+        out.sort_by_key(D::sort_key);
+        Ok(out)
+    }
+
+    /// The configured shard (partition) count.
+    pub fn shard_count(&self) -> u32 {
+        self.config.shard_count
+    }
+
+    /// The shard a dataset key routes to (delegates to [`Dataset::read_partition`]).
+    pub fn shard_for(&self, index_value: &str) -> u32 {
+        D::read_partition(index_value, self.config.shard_count)
+    }
+
     /// Reproduce the **entire** record set across all partitions in global-
     /// sequence order — the cold-load correctness helper. Reads each part fully
     /// (local if resident, else the substrate) plus the active hot buffers.

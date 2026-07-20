@@ -140,6 +140,7 @@ pub mod columnar;
 pub mod command_queue;
 pub mod dataset;
 pub mod engine;
+pub mod feed;
 pub mod frame;
 pub mod kv;
 pub mod merge;
@@ -167,6 +168,7 @@ pub use dataset::{
     DEFAULT_SHARD_COUNT,
 };
 pub use engine::{L0Config, L0Engine, L0EventLogEngine, ReplicaTarget};
+pub use feed::ChangeFeed;
 pub use kv::{KvDataset, KvEntry, KvOp, KvStore, DATASET_D4_KV};
 pub use merge::{MergePlan, MergePolicy};
 pub use metrics::{L0Metrics, L0MetricsSnapshot};
