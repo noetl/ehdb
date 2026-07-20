@@ -606,6 +606,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-feed"
+version = "0.1.0"
+dependencies = [
+ "ehdb-l0",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ehdb-l0"
 version = "0.1.0"
 dependencies = [
