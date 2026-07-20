@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "EHDB L1 — networked change-feed delivery over the L0 Watch(shard,cursor) primitive: the per-shard writer's push transport to subscribers. noetl-internal only."
 
 [dependencies]
+ehdb-core.workspace = true
 ehdb-l0.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
