@@ -27,7 +27,9 @@
 //! `global_sequence` as the cursor (the ack watermark T1 builds on).
 
 pub mod group;
+pub mod scaler;
 pub use group::{Delivery, MemberId, ShardConsumerGroup};
+pub use scaler::{render_prometheus, ShardLag};
 
 use std::io;
 use std::net::SocketAddr;

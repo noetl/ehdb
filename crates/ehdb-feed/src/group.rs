@@ -180,4 +180,15 @@ where
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
     }
+
+    /// **Consumer lag** — the number of shard records past the committed cursor
+    /// (undelivered + delivered-but-unacked). This is the KEDA autoscaler trigger
+    /// value (T2): the group's backlog, the analog of NATS JetStream consumer
+    /// `num_pending`. Reads the shard tail from the committed cursor, so it costs
+    /// O(backlog) — which is exactly the quantity being reported.
+    pub fn lag(&self, engine: &L0Engine<D>) -> Result<u64> {
+        Ok(engine
+            .read_partition_after(self.shard, self.committed_cursor())?
+            .len() as u64)
+    }
 }
