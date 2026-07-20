@@ -28,6 +28,7 @@
 
 pub mod group;
 pub mod scaler;
+pub mod sse;
 pub use group::{Delivery, MemberId, ShardConsumerGroup};
 pub use scaler::{render_prometheus, ShardLag};
 
@@ -50,7 +51,7 @@ pub struct SubscribeReq {
     pub cursor: u64,
 }
 
-fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
+pub(crate) fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
 
@@ -113,7 +114,7 @@ where
         Arc::clone(&self.engine)
     }
 
-    fn subscriber_handle(&self) -> (Arc<Mutex<L0Engine<D>>>, watch::Receiver<u64>) {
+    pub(crate) fn subscriber_handle(&self) -> (Arc<Mutex<L0Engine<D>>>, watch::Receiver<u64>) {
         (Arc::clone(&self.engine), self.tip_tx.subscribe())
     }
 }
