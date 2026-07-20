@@ -26,6 +26,9 @@
 //! wakeup). Resume/reconnect is exact: reconnect with the last-received
 //! `global_sequence` as the cursor (the ack watermark T1 builds on).
 
+pub mod group;
+pub use group::{Delivery, MemberId, ShardConsumerGroup};
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

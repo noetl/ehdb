@@ -609,6 +609,7 @@ dependencies = [
 name = "ehdb-feed"
 version = "0.1.0"
 dependencies = [
+ "ehdb-core",
  "ehdb-l0",
  "serde",
  "serde_json",
