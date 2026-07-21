@@ -26,10 +26,12 @@
 //! wakeup). Resume/reconnect is exact: reconnect with the last-received
 //! `global_sequence` as the cursor (the ack watermark T1 builds on).
 
+pub mod claim;
 pub mod group;
 pub mod publish;
 pub mod scaler;
 pub mod sse;
+pub use claim::{serve_claims, ClaimClient, ClaimCoordinator, Claimed};
 pub use group::{Delivery, MemberId, ShardConsumerGroup};
 pub use publish::{serve_ingest, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
