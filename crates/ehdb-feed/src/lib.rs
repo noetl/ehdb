@@ -119,6 +119,17 @@ where
         Arc::clone(&self.engine)
     }
 
+    /// A watch receiver that fires whenever a record is appended (the tip
+    /// advances). For an **in-process** consumer co-located with the writer —
+    /// the system-pool worker consuming its own shard's commands without a
+    /// network hop: await [`changed()`](watch::Receiver::changed) to block until
+    /// new records land, then drain via a [`ChangeFeed`] / `ShardConsumerGroup`
+    /// over [`engine`](Self::engine). Pairs the sync consumer model with an
+    /// async, no-poll-spin wait (the same signal the networked delivery uses).
+    pub fn tip_receiver(&self) -> watch::Receiver<u64> {
+        self.tip_tx.subscribe()
+    }
+
     pub(crate) fn subscriber_handle(&self) -> (Arc<Mutex<L0Engine<D>>>, watch::Receiver<u64>) {
         (Arc::clone(&self.engine), self.tip_tx.subscribe())
     }
