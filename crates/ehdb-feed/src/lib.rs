@@ -27,9 +27,11 @@
 //! `global_sequence` as the cursor (the ack watermark T1 builds on).
 
 pub mod group;
+pub mod publish;
 pub mod scaler;
 pub mod sse;
 pub use group::{Delivery, MemberId, ShardConsumerGroup};
+pub use publish::{serve_ingest, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
 
 use std::io;
@@ -55,7 +57,10 @@ pub(crate) fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
 
-async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+) -> io::Result<()> {
     let len = u32::try_from(bytes.len()).map_err(io_err)?;
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(bytes).await?;
@@ -63,7 +68,7 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8]) -> io::R
     Ok(())
 }
 
-async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
