@@ -20,22 +20,12 @@
 //! acked and no longer in flight. Persisting it and reconstructing a group from
 //! it resumes exactly where the group left off (the durable-progress seam).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
 
 use ehdb_core::Result;
 use ehdb_l0::{ChangeFeed, Dataset, L0Engine};
 
-/// A command's target pool segment (its `execution_pool`) — the routing key
-/// (`"shared"` / `"system"` / `"subscription"` / an override). The honest
-/// equivalent of the NATS subject segment `noetl.commands.<pool>.>`.
-pub type PoolTag = String;
-
-/// Extracts the target [`PoolTag`] from a record. Injected into the coordinator
-/// so `ehdb-feed` stays dataset-agnostic; the D1 command-bus route is
-/// [`crate::claim::d1_execution_pool_route`]. MUST be total (never a wildcard),
-/// so a record always lands in exactly one pool — strict isolation.
-pub type RouteFn<R> = Arc<dyn Fn(&R) -> PoolTag + Send + Sync>;
+use crate::subject::{Subject, SubjectFilter, SubjectFn};
 
 /// A consumer-group member id (a worker instance in the group).
 pub type MemberId = u32;
@@ -205,73 +195,68 @@ where
     }
 }
 
-/// One pool's competing-consumer state within a [`RoutedConsumerGroup`].
-struct PoolQueue<R> {
-    /// Records routed to this pool, not yet assigned (ascending sort key).
-    pending: VecDeque<R>,
-    /// This pool's delivered-but-unacked records, keyed by sort key.
-    inflight: BTreeMap<u64, InFlight<R>>,
+/// A delivered-but-unacked record in a [`SubjectConsumerGroup`], carrying its
+/// subject so redelivery can be scoped to a member's filter.
+struct SubjectInFlight<R> {
+    record: R,
+    subject: Subject,
+    member: MemberId,
+    deadline: u64,
+    redelivered: bool,
 }
 
-impl<R> PoolQueue<R> {
-    fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-            inflight: BTreeMap::new(),
-        }
-    }
-}
-
-/// A **pool-routed** competing-consumer group over one shard's change-feed —
-/// the isolation-preserving analog of NATS subject routing
-/// (`noetl.commands.<pool>.>`).
+/// A **subject-routed** competing-consumer group over one shard's change-feed —
+/// the general NATS-subject subscription mechanism on the EHDB command path
+/// (noetl/ai-meta#194, the RFC's G4 gap).
 ///
-/// A single feed cursor reads the shard once; each record is routed to its
-/// target pool's [`PoolQueue`] by [`RouteFn`]. A member claims **only within
-/// the pool it declares** ([`poll_assign`](Self::poll_assign) takes a `pool`),
-/// so a `system` command is never handed to a `shared` worker and vice-versa —
-/// strict bidirectional isolation, the HARD requirement of noetl/ai-meta#194.
-///
-/// Ack / `ack_wait` redelivery are per-pool (a slow pool never blocks another).
-/// The **single** global committed cursor advances only when *every* pool has
-/// acked through it, so [`lag`](Self::lag) counts the whole shard's backlog
-/// (including a pool that has no consumer connected yet) and a resumed group
-/// re-fans every not-fully-acked record.
-pub struct RoutedConsumerGroup<D: Dataset> {
+/// A single feed cursor reads the shard once; each record is tagged with its
+/// [`Subject`] by [`SubjectFn`] (`commands.<pool>.shard.<n>`). A member claims
+/// with a [`SubjectFilter`] ([`poll_assign`](Self::poll_assign) takes it) and is
+/// **only ever handed a record whose subject matches** — so pool isolation
+/// (`commands.system.>` vs `commands.shared.>`) and #166 shard routing
+/// (`…​.shard.0`) are just filter dimensions of one primitive, and a worker can
+/// never claim a command outside its subscribed subjects (the hard isolation
+/// guarantee). Members sharing a filter still compete exactly-once (a claimed
+/// record leaves `pending`); ack / `ack_wait` redelivery is unchanged and
+/// scoped to a matching filter. The single global committed cursor (lowest open
+/// across every subject) keeps whole-shard lag + resume correct.
+pub struct SubjectConsumerGroup<D: Dataset> {
     shard: u32,
     ack_wait_ticks: u64,
     feed: ChangeFeed,
-    /// Highest sort key ever pulled from the feed (across all pools).
+    /// Highest sort key ever pulled from the feed.
     delivered_frontier: u64,
-    route: RouteFn<D::Record>,
-    pools: HashMap<PoolTag, PoolQueue<D::Record>>,
-    /// In-flight sort key → owning pool, for O(1) ack routing.
-    inflight_pool: HashMap<u64, PoolTag>,
+    subject_of: SubjectFn<D::Record>,
+    /// `(subject, record)` pulled from the feed, not yet assigned — ascending
+    /// sort key (append order preserved through mid-queue removals).
+    pending: VecDeque<(Subject, D::Record)>,
+    /// Delivered-but-unacked, keyed by sort key (ascending).
+    inflight: BTreeMap<u64, SubjectInFlight<D::Record>>,
 }
 
-impl<D> RoutedConsumerGroup<D>
+impl<D> SubjectConsumerGroup<D>
 where
     D: Dataset,
     D::Record: Clone,
 {
-    /// A routed group over `shard`, redelivering per-pool records unacked after
-    /// `ack_wait_ticks`, resuming from `from_cursor` (`0` = the shard from the
-    /// beginning; a prior group's [`committed_cursor`](Self::committed_cursor)).
-    /// `route` maps each record to its target pool (total; never a wildcard).
+    /// A subject-routed group over `shard`, redelivering records unacked after
+    /// `ack_wait_ticks`, resuming from `from_cursor`. `subject_of` maps each
+    /// record to its routing subject (total; the D1 route is
+    /// [`crate::claim::d1_command_subject`]).
     pub fn new(
         shard: u32,
         ack_wait_ticks: u64,
         from_cursor: u64,
-        route: RouteFn<D::Record>,
+        subject_of: SubjectFn<D::Record>,
     ) -> Self {
         Self {
             shard,
             ack_wait_ticks,
             feed: ChangeFeed::new(shard, from_cursor),
             delivered_frontier: from_cursor,
-            route,
-            pools: HashMap::new(),
-            inflight_pool: HashMap::new(),
+            subject_of,
+            pending: VecDeque::new(),
+            inflight: BTreeMap::new(),
         }
     }
 
@@ -280,48 +265,39 @@ where
         self.shard
     }
 
-    /// Pull newly-appended records off the feed and fan each into its target
-    /// pool's queue. One feed read serves every pool.
+    /// Pull newly-appended records off the feed, tagging each with its subject.
     fn refill(&mut self, engine: &L0Engine<D>) -> Result<()> {
         for rec in self.feed.poll(engine)? {
             self.delivered_frontier = self.delivered_frontier.max(D::sort_key(&rec));
-            let pool = (self.route)(&rec);
-            self.pools
-                .entry(pool)
-                .or_insert_with(PoolQueue::new)
-                .pending
-                .push_back(rec);
+            let subject = (self.subject_of)(&rec);
+            self.pending.push_back((subject, rec));
         }
         Ok(())
     }
 
-    /// Assign the next record **for `pool`** to `member` at logical time `now`.
-    /// An `ack_wait`-expired in-flight record in that pool is redelivered before
-    /// any fresh one (at-least-once must not starve retries). Returns `None`
-    /// when this pool is caught up and nothing is due for redelivery — other
-    /// pools' backlog is invisible to this member (isolation).
+    /// Assign the next record **matching `filter`** to `member` at logical time
+    /// `now`. A `filter`-matching in-flight record past its `ack_wait` deadline
+    /// is redelivered before any fresh one (at-least-once must not starve
+    /// retries). Returns `None` when nothing matching is pending or due —
+    /// records for other subjects are invisible to this member (isolation).
     pub fn poll_assign(
         &mut self,
         engine: &L0Engine<D>,
-        pool: &str,
+        filter: &SubjectFilter,
         member: MemberId,
         now: u64,
     ) -> Result<Option<Delivery<D::Record>>> {
         self.refill(engine)?;
-        let q = self
-            .pools
-            .entry(pool.to_string())
-            .or_insert_with(PoolQueue::new);
 
-        // 1. Redelivery: the lowest-sort-key in-flight record in this pool past
-        //    its deadline.
-        let expired = q
+        // 1. Redelivery: the lowest-sort-key matching in-flight record past its
+        //    deadline.
+        let expired = self
             .inflight
             .iter()
-            .find(|(_, f)| f.deadline <= now)
+            .find(|(_, f)| f.deadline <= now && filter.matches(&f.subject))
             .map(|(&sk, _)| sk);
         if let Some(sk) = expired {
-            let f = q.inflight.get_mut(&sk).unwrap();
+            let f = self.inflight.get_mut(&sk).unwrap();
             f.member = member;
             f.deadline = now.saturating_add(self.ack_wait_ticks);
             f.redelivered = true;
@@ -333,19 +309,24 @@ where
             }));
         }
 
-        // 2. Fresh: the next never-delivered record for this pool.
-        if let Some(record) = q.pending.pop_front() {
+        // 2. Fresh: the first (lowest-sort-key) pending record matching `filter`.
+        if let Some(pos) = self
+            .pending
+            .iter()
+            .position(|(subj, _)| filter.matches(subj))
+        {
+            let (subject, record) = self.pending.remove(pos).expect("position in bounds");
             let sort_key = D::sort_key(&record);
-            q.inflight.insert(
+            self.inflight.insert(
                 sort_key,
-                InFlight {
+                SubjectInFlight {
                     record: record.clone(),
+                    subject,
                     member,
                     deadline: now.saturating_add(self.ack_wait_ticks),
                     redelivered: false,
                 },
             );
-            self.inflight_pool.insert(sort_key, pool.to_string());
             return Ok(Some(Delivery {
                 record,
                 sort_key,
@@ -357,48 +338,41 @@ where
         Ok(None)
     }
 
-    /// Ack a delivered record by its sort key (routing to its owning pool).
-    /// Returns `true` if it was in flight.
+    /// Ack a delivered record by its sort key. Returns `true` if it was
+    /// in flight.
     pub fn ack(&mut self, sort_key: u64) -> bool {
-        match self.inflight_pool.remove(&sort_key) {
-            Some(pool) => self
-                .pools
-                .get_mut(&pool)
-                .map(|q| q.inflight.remove(&sort_key).is_some())
-                .unwrap_or(false),
-            None => false,
-        }
+        self.inflight.remove(&sort_key).is_some()
     }
 
     /// The **global** contiguous acked-through cursor: the lowest still-open
-    /// (pending or in-flight) sort key across *all* pools, minus one; the
-    /// `delivered_frontier` when every pool is caught up. Advancing only when
-    /// every pool has acked through it keeps resume + lag whole-shard correct.
+    /// (pending or in-flight) sort key across *all* subjects, minus one; the
+    /// `delivered_frontier` when caught up. Advances only when every subject has
+    /// acked through it, so resume + lag stay whole-shard correct.
     pub fn committed_cursor(&self) -> u64 {
-        let mut lowest_open: Option<u64> = None;
-        for q in self.pools.values() {
-            if let Some(&sk) = q.inflight.keys().next() {
-                lowest_open = Some(lowest_open.map_or(sk, |m| m.min(sk)));
-            }
-            if let Some(sk) = q.pending.front().map(D::sort_key) {
-                lowest_open = Some(lowest_open.map_or(sk, |m| m.min(sk)));
-            }
-        }
+        // `pending` stays ascending (append-ascending; mid-queue removal keeps
+        // order), so its front is the lowest pending sort key.
+        let lowest_pending = self.pending.front().map(|(_, r)| D::sort_key(r));
+        let lowest_inflight = self.inflight.keys().next().copied();
+        let lowest_open = match (lowest_inflight, lowest_pending) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         match lowest_open {
             Some(open) => open.saturating_sub(1),
             None => self.delivered_frontier,
         }
     }
 
-    /// Total delivered-but-unacked records across all pools.
+    /// Total delivered-but-unacked records across all subjects.
     pub fn inflight_len(&self) -> usize {
-        self.inflight_pool.len()
+        self.inflight.len()
     }
 
     /// **Consumer lag** — the whole shard's backlog past the global committed
-    /// cursor (undelivered + delivered-but-unacked, every pool). The KEDA
-    /// autoscaler trigger value (T2); counts records for a pool that has no
-    /// consumer connected yet, so scaling that pool from zero is possible.
+    /// cursor (undelivered + delivered-but-unacked, every subject). The KEDA
+    /// trigger value (T2); counts records for a subject with no subscriber yet.
     pub fn lag(&self, engine: &L0Engine<D>) -> Result<u64> {
         Ok(engine
             .read_partition_after(self.shard, self.committed_cursor())?
