@@ -28,14 +28,13 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::marker::PhantomData;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ehdb_l0::Dataset;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::{io_err, read_frame, write_frame, FeedWriter};
 
@@ -81,8 +80,10 @@ pub struct PublishClient {
 }
 
 impl PublishClient {
-    /// Connect to a writer's ingest endpoint.
-    pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
+    /// Connect to a writer's ingest endpoint. `addr` accepts any
+    /// [`ToSocketAddrs`] — including a `host:port` **DNS name** (a Kubernetes
+    /// service name), resolved by `TcpStream::connect` (finding-#2 fix).
+    pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true)?;
         Ok(Self { sock })
@@ -112,8 +113,10 @@ where
     D::Record: Serialize,
 {
     /// Connect to every shard writer. `addrs` maps shard → the writer's ingest
-    /// address; `shard_count` is the routing modulus (must match the writers').
-    pub async fn connect(shard_count: u32, addrs: BTreeMap<u32, SocketAddr>) -> io::Result<Self> {
+    /// address as a `host:port` string (a DNS name or `ip:port`, resolved at
+    /// connect time — finding-#2 fix); `shard_count` is the routing modulus
+    /// (must match the writers').
+    pub async fn connect(shard_count: u32, addrs: BTreeMap<u32, String>) -> io::Result<Self> {
         let mut clients = BTreeMap::new();
         for (shard, addr) in addrs {
             clients.insert(shard, PublishClient::connect(addr).await?);

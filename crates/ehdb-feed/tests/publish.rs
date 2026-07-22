@@ -121,11 +121,11 @@ async fn router_publishes_to_the_owning_shard() {
     let shard_count = 2u32;
 
     let mut writers = Vec::new();
-    let mut addrs: BTreeMap<u32, std::net::SocketAddr> = BTreeMap::new();
+    let mut addrs: BTreeMap<u32, String> = BTreeMap::new();
     for (shard, (obj, local)) in dirs.iter().enumerate() {
         let w = writer(local, obj, shard_count);
         let ingest = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        addrs.insert(shard as u32, ingest.local_addr().unwrap());
+        addrs.insert(shard as u32, ingest.local_addr().unwrap().to_string());
         tokio::spawn(serve_ingest(ingest, w.clone()));
         writers.push(w);
     }

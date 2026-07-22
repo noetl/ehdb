@@ -31,8 +31,10 @@ pub mod group;
 pub mod publish;
 pub mod scaler;
 pub mod sse;
-pub use claim::{serve_claims, ClaimClient, ClaimCoordinator, Claimed};
-pub use group::{Delivery, MemberId, ShardConsumerGroup};
+pub use claim::{
+    d1_execution_pool_route, serve_claims, ClaimClient, ClaimCoordinator, Claimed, DEFAULT_POOL,
+};
+pub use group::{Delivery, MemberId, PoolTag, RouteFn, RoutedConsumerGroup, ShardConsumerGroup};
 pub use publish::{serve_ingest, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
 
