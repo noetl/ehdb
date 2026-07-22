@@ -22,14 +22,40 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ehdb_l0::Dataset;
+use ehdb_l0::{Dataset, EventRecord};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
 
-use crate::group::{MemberId, ShardConsumerGroup};
+use crate::group::{MemberId, PoolTag, RouteFn, RoutedConsumerGroup};
 use crate::{io_err, read_frame, write_frame, FeedWriter};
+
+/// The default pool tag — matches the server's default `execution_pool`
+/// (`shared`, the segment non-`system/`/`subscription/` playbooks land on).
+/// A record whose `execution_pool` is absent/blank, and a worker that declares
+/// no pool, both fall back here — never a wildcard, so isolation holds.
+pub const DEFAULT_POOL: &str = "shared";
+
+/// The D1 command-bus [`RouteFn`]: read `execution_pool` from the command
+/// notification JSON in an [`EventRecord`]'s payload, defaulting to
+/// [`DEFAULT_POOL`]. One source of truth for the routing key the server stamps
+/// (`execute.rs` → `"execution_pool": pool_segment`) and the pool a worker
+/// declares (its `NATS_FILTER_SUBJECT` segment) — the honest equivalent of the
+/// NATS subject `noetl.commands.<pool>.>`.
+pub fn d1_execution_pool_route() -> RouteFn<EventRecord> {
+    Arc::new(|rec: &EventRecord| -> PoolTag {
+        serde_json::from_str::<serde_json::Value>(&rec.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("execution_pool")
+                    .and_then(|p| p.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_POOL.to_string())
+    })
+}
 
 /// Default cap on how long `claim_next` parks before re-polling, so an
 /// `ack_wait` redelivery surfaces even with no new appends.
@@ -40,7 +66,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 /// through it, so a command is delivered to exactly one member.
 pub struct ClaimCoordinator<D: Dataset> {
     writer: Arc<FeedWriter<D>>,
-    group: Mutex<ShardConsumerGroup<D>>,
+    group: Mutex<RoutedConsumerGroup<D>>,
     clock: Instant,
     poll_interval: Duration,
 }
@@ -52,17 +78,26 @@ where
 {
     /// A coordinator over `writer`'s shard, redelivering unacked commands after
     /// `ack_wait`. `from_cursor = 0` replays the shard's undelivered tail.
+    /// `route` maps each record to its target pool so a member claims only
+    /// within the pool it declares (`system` ⇄ `shared` isolation,
+    /// noetl/ai-meta#194); use [`d1_execution_pool_route`] for the command bus.
     pub fn new(
         writer: Arc<FeedWriter<D>>,
         shard: u32,
         ack_wait: Duration,
         from_cursor: u64,
+        route: RouteFn<D::Record>,
     ) -> Self {
         let ack_wait_ticks = ack_wait.as_millis() as u64;
         let poll_interval =
             Duration::from_millis(DEFAULT_POLL_INTERVAL_MS.min(ack_wait_ticks.max(1)));
         Self {
-            group: Mutex::new(ShardConsumerGroup::new(shard, ack_wait_ticks, from_cursor)),
+            group: Mutex::new(RoutedConsumerGroup::new(
+                shard,
+                ack_wait_ticks,
+                from_cursor,
+                route,
+            )),
             writer,
             clock: Instant::now(),
             poll_interval,
@@ -73,10 +108,15 @@ where
         self.clock.elapsed().as_millis() as u64
     }
 
-    /// Claim the next command for `member`, **blocking** until one is available
-    /// (a fresh command or an `ack_wait`-expired redelivery). Exactly-one-member
-    /// delivery is enforced by the shared group.
-    pub async fn claim_next(&self, member: MemberId) -> crate::group::Delivery<D::Record> {
+    /// Claim the next command **for `pool`** for `member`, **blocking** until
+    /// one is available (a fresh command or an `ack_wait`-expired redelivery).
+    /// Exactly-one-member delivery within the pool is enforced by the shared
+    /// group; a command for another pool is never assigned here (isolation).
+    pub async fn claim_next(
+        &self,
+        pool: &str,
+        member: MemberId,
+    ) -> crate::group::Delivery<D::Record> {
         let mut tip_rx = self.writer.tip_receiver();
         loop {
             let assigned = {
@@ -85,7 +125,7 @@ where
                 let mut group = self.group.lock().await;
                 let engine = self.writer.engine();
                 let e = engine.lock().unwrap();
-                group.poll_assign(&e, member, self.now_ticks())
+                group.poll_assign(&e, pool, member, self.now_ticks())
             };
             match assigned {
                 Ok(Some(delivery)) => return delivery,
@@ -127,8 +167,10 @@ where
 /// A claim request on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ClaimReq {
-    /// Block until a command is assigned to `member`.
-    Next { member: MemberId },
+    /// Block until a command **for `pool`** is assigned to `member`. `pool` is
+    /// the member's declared pool segment; the coordinator only ever hands it a
+    /// command whose `execution_pool` matches (strict isolation).
+    Next { member: MemberId, pool: PoolTag },
     /// Ack a claimed command.
     Ack { sort_key: u64 },
     /// Nack a claimed command (redeliver after ack_wait).
@@ -169,8 +211,8 @@ where
                     Err(_) => return,
                 };
                 match req {
-                    ClaimReq::Next { member } => {
-                        let delivery = coordinator.claim_next(member).await;
+                    ClaimReq::Next { member, pool } => {
+                        let delivery = coordinator.claim_next(&pool, member).await;
                         let resp = ClaimResp {
                             sort_key: delivery.sort_key,
                             redelivered: delivery.redelivered,
@@ -215,20 +257,36 @@ pub struct Claimed<R> {
 pub struct ClaimClient {
     sock: TcpStream,
     member: MemberId,
+    pool: PoolTag,
 }
 
 impl ClaimClient {
-    /// Connect to a claim server as `member`.
-    pub async fn connect(addr: std::net::SocketAddr, member: MemberId) -> std::io::Result<Self> {
+    /// Connect to a claim server as `member` claiming for `pool`.
+    ///
+    /// `addr` accepts any [`ToSocketAddrs`] — including a `host:port`
+    /// **DNS name** (`noetl-cmdbus-writer.noetl.svc.cluster.local:9101`),
+    /// which `TcpStream::connect` resolves at connect time. This is the
+    /// finding-#2 fix: a Kubernetes service name works directly, so no
+    /// ClusterIP-only workaround and pod-IP changes are followed on reconnect.
+    pub async fn connect<A: ToSocketAddrs>(
+        addr: A,
+        member: MemberId,
+        pool: impl Into<PoolTag>,
+    ) -> std::io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true)?;
-        Ok(Self { sock, member })
+        Ok(Self {
+            sock,
+            member,
+            pool: pool.into(),
+        })
     }
 
     /// Claim the next command (blocks until one is assigned to this member).
     pub async fn claim_next<R: DeserializeOwned>(&mut self) -> std::io::Result<Claimed<R>> {
         let req = serde_json::to_vec(&ClaimReq::Next {
             member: self.member,
+            pool: self.pool.clone(),
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
