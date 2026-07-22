@@ -31,12 +31,14 @@ pub mod group;
 pub mod publish;
 pub mod scaler;
 pub mod sse;
+pub mod subject;
 pub use claim::{
-    d1_execution_pool_route, serve_claims, ClaimClient, ClaimCoordinator, Claimed, DEFAULT_POOL,
+    d1_command_subject, serve_claims, ClaimClient, ClaimCoordinator, Claimed, DEFAULT_POOL,
 };
-pub use group::{Delivery, MemberId, PoolTag, RouteFn, RoutedConsumerGroup, ShardConsumerGroup};
+pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
 pub use publish::{serve_ingest, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
+pub use subject::{Subject, SubjectFilter, SubjectFn};
 
 use std::io;
 use std::net::SocketAddr;

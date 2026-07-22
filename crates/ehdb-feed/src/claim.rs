@@ -22,30 +22,34 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ehdb_l0::{Dataset, EventRecord};
+use ehdb_l0::{shard_for_execution, Dataset, EventRecord};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
 
-use crate::group::{MemberId, PoolTag, RouteFn, RoutedConsumerGroup};
+use crate::group::{MemberId, SubjectConsumerGroup};
+use crate::subject::{Subject, SubjectFn};
 use crate::{io_err, read_frame, write_frame, FeedWriter};
 
-/// The default pool tag — matches the server's default `execution_pool`
-/// (`shared`, the segment non-`system/`/`subscription/` playbooks land on).
-/// A record whose `execution_pool` is absent/blank, and a worker that declares
-/// no pool, both fall back here — never a wildcard, so isolation holds.
+/// The default pool token — matches the server's default `execution_pool`
+/// (`shared`, the segment non-`system/`/`subscription/` playbooks land on). A
+/// record whose `execution_pool` is absent/blank falls back here — never a
+/// wildcard, so isolation holds.
 pub const DEFAULT_POOL: &str = "shared";
 
-/// The D1 command-bus [`RouteFn`]: read `execution_pool` from the command
-/// notification JSON in an [`EventRecord`]'s payload, defaulting to
-/// [`DEFAULT_POOL`]. One source of truth for the routing key the server stamps
-/// (`execute.rs` → `"execution_pool": pool_segment`) and the pool a worker
-/// declares (its `NATS_FILTER_SUBJECT` segment) — the honest equivalent of the
-/// NATS subject `noetl.commands.<pool>.>`.
-pub fn d1_execution_pool_route() -> RouteFn<EventRecord> {
-    Arc::new(|rec: &EventRecord| -> PoolTag {
-        serde_json::from_str::<serde_json::Value>(&rec.payload)
+/// The D1 command-bus [`SubjectFn`]: derive a record's routing
+/// [`Subject`](crate::subject::Subject) — `commands.<pool>.shard.<n>` — from the
+/// command notification. `<pool>` is `execution_pool` from the notification JSON
+/// the server stamps (`execute.rs` → `"execution_pool": pool_segment`, default
+/// [`DEFAULT_POOL`]); `<n>` is `shard_for_execution(execution_id, shard_count)`,
+/// byte-identical to the server/worker `shard_for`. One source of truth for the
+/// subject a worker's [`SubjectFilter`](crate::subject::SubjectFilter) matches —
+/// the honest equivalent of the NATS subject `noetl.commands.<pool>.shard.<n>`.
+pub fn d1_command_subject(shard_count: u32) -> SubjectFn<EventRecord> {
+    let shard_count = shard_count.max(1);
+    Arc::new(move |rec: &EventRecord| -> Subject {
+        let pool = serde_json::from_str::<serde_json::Value>(&rec.payload)
             .ok()
             .and_then(|v| {
                 v.get("execution_pool")
@@ -53,7 +57,9 @@ pub fn d1_execution_pool_route() -> RouteFn<EventRecord> {
                     .map(str::to_string)
             })
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_POOL.to_string())
+            .unwrap_or_else(|| DEFAULT_POOL.to_string());
+        let shard = shard_for_execution(&rec.execution_id, shard_count);
+        Subject::command(&pool, shard)
     })
 }
 
@@ -66,7 +72,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 /// through it, so a command is delivered to exactly one member.
 pub struct ClaimCoordinator<D: Dataset> {
     writer: Arc<FeedWriter<D>>,
-    group: Mutex<RoutedConsumerGroup<D>>,
+    group: Mutex<SubjectConsumerGroup<D>>,
     clock: Instant,
     poll_interval: Duration,
 }
@@ -78,25 +84,25 @@ where
 {
     /// A coordinator over `writer`'s shard, redelivering unacked commands after
     /// `ack_wait`. `from_cursor = 0` replays the shard's undelivered tail.
-    /// `route` maps each record to its target pool so a member claims only
-    /// within the pool it declares (`system` ⇄ `shared` isolation,
-    /// noetl/ai-meta#194); use [`d1_execution_pool_route`] for the command bus.
+    /// `subject_of` maps each record to its routing subject so a member claims
+    /// only within its subscribed subjects (pool + shard isolation,
+    /// noetl/ai-meta#194); use [`d1_command_subject`] for the command bus.
     pub fn new(
         writer: Arc<FeedWriter<D>>,
         shard: u32,
         ack_wait: Duration,
         from_cursor: u64,
-        route: RouteFn<D::Record>,
+        subject_of: SubjectFn<D::Record>,
     ) -> Self {
         let ack_wait_ticks = ack_wait.as_millis() as u64;
         let poll_interval =
             Duration::from_millis(DEFAULT_POLL_INTERVAL_MS.min(ack_wait_ticks.max(1)));
         Self {
-            group: Mutex::new(RoutedConsumerGroup::new(
+            group: Mutex::new(SubjectConsumerGroup::new(
                 shard,
                 ack_wait_ticks,
                 from_cursor,
-                route,
+                subject_of,
             )),
             writer,
             clock: Instant::now(),
@@ -108,15 +114,18 @@ where
         self.clock.elapsed().as_millis() as u64
     }
 
-    /// Claim the next command **for `pool`** for `member`, **blocking** until
-    /// one is available (a fresh command or an `ack_wait`-expired redelivery).
-    /// Exactly-one-member delivery within the pool is enforced by the shared
-    /// group; a command for another pool is never assigned here (isolation).
+    /// Claim the next command **matching `filter`** for `member`, **blocking**
+    /// until one is available (a fresh command or an `ack_wait`-expired
+    /// redelivery). `filter` is the member's subscription (a
+    /// [`SubjectFilter`](crate::subject::SubjectFilter) string, e.g.
+    /// `commands.shared.>`); a command outside it is never assigned here — the
+    /// isolation guarantee. Members sharing a filter compete exactly-once.
     pub async fn claim_next(
         &self,
-        pool: &str,
+        filter: &str,
         member: MemberId,
     ) -> crate::group::Delivery<D::Record> {
+        let filter = crate::subject::SubjectFilter::parse(filter);
         let mut tip_rx = self.writer.tip_receiver();
         loop {
             let assigned = {
@@ -125,7 +134,7 @@ where
                 let mut group = self.group.lock().await;
                 let engine = self.writer.engine();
                 let e = engine.lock().unwrap();
-                group.poll_assign(&e, pool, member, self.now_ticks())
+                group.poll_assign(&e, &filter, member, self.now_ticks())
             };
             match assigned {
                 Ok(Some(delivery)) => return delivery,
@@ -167,10 +176,11 @@ where
 /// A claim request on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ClaimReq {
-    /// Block until a command **for `pool`** is assigned to `member`. `pool` is
-    /// the member's declared pool segment; the coordinator only ever hands it a
-    /// command whose `execution_pool` matches (strict isolation).
-    Next { member: MemberId, pool: PoolTag },
+    /// Block until a command **matching `filter`** is assigned to `member`.
+    /// `filter` is the member's subscription (a `SubjectFilter` string, e.g.
+    /// `commands.shared.>`); the coordinator only ever hands it a command whose
+    /// subject matches (strict isolation).
+    Next { member: MemberId, filter: String },
     /// Ack a claimed command.
     Ack { sort_key: u64 },
     /// Nack a claimed command (redeliver after ack_wait).
@@ -211,8 +221,8 @@ where
                     Err(_) => return,
                 };
                 match req {
-                    ClaimReq::Next { member, pool } => {
-                        let delivery = coordinator.claim_next(&pool, member).await;
+                    ClaimReq::Next { member, filter } => {
+                        let delivery = coordinator.claim_next(&filter, member).await;
                         let resp = ClaimResp {
                             sort_key: delivery.sort_key,
                             redelivered: delivery.redelivered,
@@ -253,15 +263,17 @@ pub struct Claimed<R> {
 }
 
 /// A worker replica's connection to its shard's claim coordinator. One member
-/// competing with the pool's other replicas.
+/// competing with the other replicas sharing its subject filter.
 pub struct ClaimClient {
     sock: TcpStream,
     member: MemberId,
-    pool: PoolTag,
+    filter: String,
 }
 
 impl ClaimClient {
-    /// Connect to a claim server as `member` claiming for `pool`.
+    /// Connect to a claim server as `member` subscribing with `filter` (a
+    /// `SubjectFilter` string, e.g. `commands.shared.>` for the shared pool on
+    /// any shard, or `commands.system.shard.0` for the system pool on shard 0).
     ///
     /// `addr` accepts any [`ToSocketAddrs`] — including a `host:port`
     /// **DNS name** (`noetl-cmdbus-writer.noetl.svc.cluster.local:9101`),
@@ -271,22 +283,23 @@ impl ClaimClient {
     pub async fn connect<A: ToSocketAddrs>(
         addr: A,
         member: MemberId,
-        pool: impl Into<PoolTag>,
+        filter: impl Into<String>,
     ) -> std::io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true)?;
         Ok(Self {
             sock,
             member,
-            pool: pool.into(),
+            filter: filter.into(),
         })
     }
 
-    /// Claim the next command (blocks until one is assigned to this member).
+    /// Claim the next command (blocks until one matching this member's filter is
+    /// assigned).
     pub async fn claim_next<R: DeserializeOwned>(&mut self) -> std::io::Result<Claimed<R>> {
         let req = serde_json::to_vec(&ClaimReq::Next {
             member: self.member,
-            pool: self.pool.clone(),
+            filter: self.filter.clone(),
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
