@@ -191,6 +191,11 @@ pub struct L0Engine<D: Dataset> {
     writers: HashMap<u32, PartWriter<D>>,
     /// Highest sort key seen (D1: the global-sequence tip).
     global_sequence: u64,
+    /// Per-shard highest sort key ever appended (survives seals, unlike the
+    /// active writer's `max_sequence`). Only used to spot an append that does
+    /// not advance its shard's tail — the ascending-contract-violation canary
+    /// behind [`L0Metrics::out_of_order_appends`] (noetl/ai-meta#203).
+    shard_tail_max: HashMap<u32, u64>,
     /// Sender to the uploader thread (dropped on close to stop it).
     upload_tx: Option<Sender<UploadJob>>,
     upload_handle: Option<JoinHandle<()>>,
@@ -323,6 +328,7 @@ impl<D: Dataset> L0Engine<D> {
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
             global_sequence,
+            shard_tail_max: HashMap::new(),
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
@@ -397,6 +403,17 @@ impl<D: Dataset> L0Engine<D> {
     pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
         let sort_key = D::sort_key(&record);
         let shard = D::partition(&record, self.config.shard_count);
+        // Ascending-contract canary: an append that does not advance its shard's
+        // tail lands behind any follower cursor and is silently never delivered
+        // (noetl/ai-meta#203). Count it so the loss class is observable rather
+        // than silent. `append_writer_assigned` assigns a strictly-advancing key
+        // so it never trips this.
+        match self.shard_tail_max.get(&shard) {
+            Some(&prev) if sort_key <= prev => self.metrics.incr_out_of_order_appends(),
+            _ => {
+                self.shard_tail_max.insert(shard, sort_key);
+            }
+        }
         self.ensure_writer(shard)?;
         {
             let writer = self.writers.get_mut(&shard).unwrap();
@@ -419,6 +436,24 @@ impl<D: Dataset> L0Engine<D> {
             self.register_and_upload(sealed)?;
         }
         Ok(sort_key)
+    }
+
+    /// **Append letting the writer assign the sort key** — the next monotonic
+    /// `global_sequence + 1` — instead of trusting the caller's. Restores the
+    /// [`Dataset`] contract (*"appended in ascending sort_key order within a
+    /// partition"*) for a feed whose producer assigns keys that may reach the
+    /// single writer out of order, so every ingested record stays claimable
+    /// (noetl/ai-meta#203). The re-key is dataset-defined
+    /// ([`Dataset::assign_sort_key`]); datasets that keep the intrinsic key get
+    /// the default no-op re-key, making this identical to [`append_record`] for
+    /// them. Returns the assigned sort key.
+    ///
+    /// Because the single writer serializes appends and the assigned key strictly
+    /// increases, the shard log is ascending by construction: a follower cursor
+    /// never advances past an un-read record, and no append can land behind it.
+    pub fn append_writer_assigned(&mut self, record: D::Record) -> Result<u64> {
+        let seq = self.global_sequence + 1;
+        self.append_record(D::assign_sort_key(record, seq))
     }
 
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {

@@ -16,6 +16,19 @@ use std::sync::Arc;
 pub struct L0Metrics {
     /// Records appended to the hot tier.
     pub appends: AtomicU64,
+    /// Appends whose sort key did **not** advance the shard's tail — i.e. a
+    /// record inserted at/behind the current maximum sort key for its shard,
+    /// violating the ascending-within-a-partition contract the feed cursor and
+    /// range pruning depend on. Under the plain [`append_record`] path such a
+    /// record lands behind any follower cursor and is silently never delivered
+    /// (noetl/ai-meta#203). Writer-assigned appends
+    /// ([`append_writer_assigned`]) keep this at 0 by construction; a non-zero
+    /// value is the canary that some producer is appending out of order again,
+    /// so the loss class is observable instead of silent.
+    ///
+    /// [`append_record`]: crate::engine::L0Engine::append_record
+    /// [`append_writer_assigned`]: crate::engine::L0Engine::append_writer_assigned
+    pub out_of_order_appends: AtomicU64,
     /// Parts sealed (active → immutable).
     pub seals: AtomicU64,
     /// Parts durably uploaded to the object store.
@@ -67,6 +80,9 @@ impl L0Metrics {
     pub(crate) fn incr_appends(&self) {
         self.appends.fetch_add(1, Ordering::Relaxed);
     }
+    pub(crate) fn incr_out_of_order_appends(&self) {
+        self.out_of_order_appends.fetch_add(1, Ordering::Relaxed);
+    }
     pub(crate) fn incr_seals(&self) {
         self.seals.fetch_add(1, Ordering::Relaxed);
     }
@@ -109,6 +125,7 @@ impl L0Metrics {
     pub fn snapshot(&self) -> L0MetricsSnapshot {
         L0MetricsSnapshot {
             appends: self.appends.load(Ordering::Relaxed),
+            out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
             seals: self.seals.load(Ordering::Relaxed),
             uploads: self.uploads.load(Ordering::Relaxed),
             upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
@@ -134,6 +151,7 @@ impl L0Metrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L0MetricsSnapshot {
     pub appends: u64,
+    pub out_of_order_appends: u64,
     pub seals: u64,
     pub uploads: u64,
     pub upload_bytes: u64,

@@ -107,12 +107,23 @@ where
         }
     }
 
-    /// Append one record to the durable log and wake followers. Returns the sort
-    /// key. This is the server→writer publish seam (the control plane calls it).
+    /// Append one record to the durable log and wake followers. Returns the
+    /// **writer-assigned** sort key. This is the server→writer publish seam (the
+    /// control plane calls it).
+    ///
+    /// The key is assigned by the writer ([`L0Engine::append_writer_assigned`]),
+    /// not taken from the incoming record. The producer (noetl-server) assigns a
+    /// snowflake command id, but under concurrent publish a lower id can reach
+    /// this single writer *after* a higher one; trusting it would append behind
+    /// the shard tail, land behind every follower's cursor, and silently drop
+    /// the record (noetl/ai-meta#203). Letting the serialized writer assign a
+    /// strictly-increasing key keeps the shard log ascending, so the feed cursor
+    /// never skips an ingested record. The command's identity stays in its
+    /// payload; the returned key is the ack token followers commit against.
     pub fn append(&self, record: D::Record) -> io::Result<u64> {
         let seq = {
             let mut engine = self.engine.lock().unwrap();
-            engine.append_record(record).map_err(io_err)?
+            engine.append_writer_assigned(record).map_err(io_err)?
         };
         // Ignore send errors: no live subscribers is fine (shadow tier).
         let _ = self.tip_tx.send(seq);
