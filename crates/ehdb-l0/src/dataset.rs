@@ -46,6 +46,33 @@ pub trait Dataset: 'static {
     /// (D1: `shard_for(execution_id)` — the read dimension is the partition
     /// dimension). This is what lets a per-index lookup prune to one partition.
     fn read_partition(index_value: &str, shard_count: u32) -> u32;
+
+    /// Stamp a **writer-assigned** sort key onto a record at append time,
+    /// returning the re-keyed record. The default returns it unchanged — the
+    /// caller's sort key is authoritative (the intrinsic case: an op-log id, a
+    /// KV key, a vector id — keys the producer owns and that already arrive in
+    /// order).
+    ///
+    /// A dataset whose records may reach the single writer **out of sort-key
+    /// order** overrides this so the writer becomes the authority on ordering.
+    /// The command bus is the motivating case (noetl/ai-meta#203): D1 command
+    /// notifications carry a server-assigned snowflake `global_sequence`, and
+    /// under concurrent publish a lower id can be appended *after* a higher one.
+    /// Because the feed cursor / range pruning depend on the trait contract
+    /// (*"appended in ascending sort_key order within a partition"*), an
+    /// out-of-order append lands behind the cursor and is silently never
+    /// delivered. Letting the writer assign the key on append restores the
+    /// contract by construction, so every ingested record stays claimable. The
+    /// record's own identity (execution_id / command_id) lives in its payload,
+    /// unaffected by the re-key; only the ordering/ack key changes.
+    ///
+    /// Invoked by [`crate::engine::L0Engine::append_writer_assigned`] (which the
+    /// networked command-feed writer calls); the plain
+    /// [`append_record`](crate::engine::L0Engine::append_record) path never
+    /// re-keys.
+    fn assign_sort_key(record: Self::Record, _writer_seq: u64) -> Self::Record {
+        record
+    }
 }
 
 /// **D1 — the event log** (`noetl.event`). Sort key = `global_sequence`;
@@ -68,6 +95,16 @@ impl Dataset for D1EventLog {
     }
     fn read_partition(execution_id: &str, shard_count: u32) -> u32 {
         shard_for_execution(execution_id, shard_count)
+    }
+    /// The writer owns the ordering key: on a writer-assigned append the record's
+    /// `global_sequence` is overwritten with the writer's next monotonic sequence
+    /// so the shard log stays ascending even when the D1 command feed's producer
+    /// (noetl-server) assigned snowflake ids that raced out of order under
+    /// concurrent publish (noetl/ai-meta#203). The command's identity is carried
+    /// in `execution_id` / the payload, not in this key.
+    fn assign_sort_key(mut record: EventRecord, writer_seq: u64) -> EventRecord {
+        record.global_sequence = writer_seq;
+        record
     }
 }
 
