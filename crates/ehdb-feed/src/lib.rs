@@ -36,7 +36,7 @@ pub use claim::{
     d1_command_subject, serve_claims, ClaimClient, ClaimCoordinator, Claimed, DEFAULT_POOL,
 };
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
-pub use publish::{serve_ingest, PublishClient, PublishRouter};
+pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
 pub use subject::{Subject, SubjectFilter, SubjectFn};
 
@@ -44,7 +44,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use ehdb_l0::{ChangeFeed, Dataset, L0Engine};
+use ehdb_l0::{ChangeFeed, Dataset, FlushPolicy, L0Engine};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +61,17 @@ pub struct SubscribeReq {
 
 pub(crate) fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+/// Close the durability window over the handles taken from the engine, with the
+/// engine lock **released** (noetl/ai-meta#205). `fsync` is a blocking,
+/// millisecond-scale syscall and the consuming side needs the engine lock to poll
+/// its feed, so syncing under the lock stalls every claimer for its duration.
+fn commit(handles: &[std::fs::File]) -> io::Result<()> {
+    for handle in handles {
+        handle.sync_data()?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -98,8 +109,16 @@ where
 {
     /// Wrap an engine as a networked writer, seeding the tip signal at the
     /// engine's current global sequence.
-    pub fn new(engine: L0Engine<D>) -> Self {
+    ///
+    /// Takes ownership of the engine's **commit points**: the flush posture is
+    /// switched to [`FlushPolicy::CallerDriven`] and every append path here
+    /// `fsync`s before it returns. Durability is unchanged (a returned sort key
+    /// is still durable), but a batch of records that arrive together shares one
+    /// `fsync` instead of paying one each — the group-commit fix for the command
+    /// bus's dispatch latency (noetl/ai-meta#205).
+    pub fn new(mut engine: L0Engine<D>) -> Self {
         let tip = engine.global_sequence();
+        engine.set_flush_policy(FlushPolicy::CallerDriven);
         let (tip_tx, _rx) = watch::channel(tip);
         Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -121,13 +140,54 @@ where
     /// never skips an ingested record. The command's identity stays in its
     /// payload; the returned key is the ack token followers commit against.
     pub fn append(&self, record: D::Record) -> io::Result<u64> {
-        let seq = {
+        let (seq, handles) = {
             let mut engine = self.engine.lock().unwrap();
-            engine.append_writer_assigned(record).map_err(io_err)?
+            let seq = engine.append_writer_assigned(record).map_err(io_err)?;
+            (seq, engine.take_sync_handles().map_err(io_err)?)
         };
+        // Close the durability window with the engine lock released — the key is
+        // a durable ack, but the `fsync` must not block readers to earn it.
+        commit(&handles)?;
         // Ignore send errors: no live subscribers is fine (shadow tier).
         let _ = self.tip_tx.send(seq);
         Ok(seq)
+    }
+
+    /// **Group commit** — append a whole batch under **one** engine-lock
+    /// acquisition and **one** `fsync`, returning each record's writer-assigned
+    /// sort key in the order given. The fix for the command bus's dispatch
+    /// latency (noetl/ai-meta#205): under posture A every append paid its own
+    /// ~4 ms `sync_data()` while holding the engine lock, which capped the bus at
+    /// ~230 commands/s and turned the control plane's publish path into a queue.
+    /// N records that arrive together now share one `fsync`.
+    ///
+    /// Durability is **unchanged**: this returns only after the `fsync` that
+    /// covers every record in the batch, so a returned key is as durable as one
+    /// from [`append`](Self::append). Ordering is unchanged: the writer still
+    /// assigns each key ([`L0Engine::append_writer_assigned`]) under the same
+    /// serialized lock, strictly increasing across the batch, so the ascending
+    /// shard-log contract the #203 fix restored holds exactly as before.
+    ///
+    /// Followers are woken **once**, at the batch tip — a [`watch`] signal
+    /// carries the latest value, and a woken follower drains its feed to the tip
+    /// before parking again, so one wake per batch delivers every record in it.
+    pub fn append_batch(&self, records: Vec<D::Record>) -> io::Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (seqs, handles) = {
+            let mut engine = self.engine.lock().unwrap();
+            let mut seqs = Vec::with_capacity(records.len());
+            for record in records {
+                seqs.push(engine.append_writer_assigned(record).map_err(io_err)?);
+            }
+            (seqs, engine.take_sync_handles().map_err(io_err)?)
+        };
+        commit(&handles)?;
+        if let Some(tip) = seqs.last() {
+            let _ = self.tip_tx.send(*tip);
+        }
+        Ok(seqs)
     }
 
     /// A shared handle to the underlying engine — for flush / inspection in
