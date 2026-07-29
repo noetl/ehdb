@@ -456,6 +456,41 @@ impl<D: Dataset> L0Engine<D> {
         self.append_record(D::assign_sort_key(record, seq))
     }
 
+    /// **Take the commit handles** for every shard with outstanding appends — the
+    /// group-commit seam under [`FlushPolicy::CallerDriven`] (noetl/ai-meta#205).
+    ///
+    /// Each handle is a duplicated descriptor onto a shard's active part
+    /// ([`PartWriter::take_sync_handle`]); calling `sync_data()` on it closes the
+    /// durability window for every append that shard has taken since the last
+    /// take, so a batch of records that arrived together pays **one** `fsync`
+    /// instead of one each. Returning handles rather than doing the `fsync` here
+    /// lets the caller drop the engine lock first, so the blocking `fsync` does
+    /// not stall readers holding up the consuming side.
+    ///
+    /// The caller **must** complete the `sync_data()` before acknowledging any
+    /// record in the batch — that is what keeps the crash window identical to
+    /// posture A.
+    pub fn take_sync_handles(&mut self) -> Result<Vec<std::fs::File>> {
+        let mut handles = Vec::new();
+        for writer in self.writers.values_mut() {
+            if let Some(h) = writer.take_sync_handle()? {
+                handles.push(h);
+            }
+        }
+        Ok(handles)
+    }
+
+    /// Switch the flush posture for this engine, propagating it to the already-open
+    /// active part writers. Used by [`crate::FeedWriter`] to take ownership of its
+    /// own commit points (group commit); durability is unchanged because the
+    /// writer syncs before it returns.
+    pub fn set_flush_policy(&mut self, policy: FlushPolicy) {
+        self.config.flush = policy;
+        for writer in self.writers.values_mut() {
+            writer.set_flush_policy(policy);
+        }
+    }
+
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {
         if !self.writers.contains_key(&shard) {
             let writer = PartWriter::<D>::open(

@@ -39,6 +39,18 @@ pub enum FlushPolicy {
     /// Posture B — batch appends, `fsync` after `fsync_every` records (and always
     /// on seal). Faster, larger crash window; derived/metrics tiers only.
     Buffered { fsync_every: u32 },
+    /// Posture A, **group-committed** — an append never `fsync`s on its own; the
+    /// caller calls [`PartWriter::sync`] to close the durability window over a
+    /// whole batch. The crash window is *not* widened: the caller is required to
+    /// `sync` before it acknowledges any record in the batch, so a record is
+    /// still durable before its writer confirms it. What changes is the *cost* —
+    /// N records that arrive together share one `sync_data()` instead of paying
+    /// N (noetl/ai-meta#205).
+    ///
+    /// Only for a writer that owns its commit points. [`crate::FeedWriter`] does
+    /// (it drives `sync` on every append path); a bare `L0Engine` caller does
+    /// not — use [`Self::EveryAppend`] there.
+    CallerDriven,
 }
 
 /// A sealed, immutable part ready for the manifest + the async uploader.
@@ -178,6 +190,11 @@ impl<D: Dataset> PartWriter<D> {
                     self.unflushed_since_fsync = 0;
                 }
             }
+            // The caller closes the durability window (group commit) — see
+            // `sync`. Track the debt so `sync` can skip a no-op fsync.
+            FlushPolicy::CallerDriven => {
+                self.unflushed_since_fsync += 1;
+            }
         }
 
         if self.record_count == 0 {
@@ -192,6 +209,45 @@ impl<D: Dataset> PartWriter<D> {
         }
         self.records.push(record);
         Ok(mark_offset)
+    }
+
+    /// Switch this writer's flush posture (see [`crate::L0Engine::set_flush_policy`]).
+    /// Any fsync debt already accrued carries over to the next [`sync`](Self::sync)
+    /// or [`seal`](Self::seal), so no append is left unflushed by the switch.
+    pub fn set_flush_policy(&mut self, policy: FlushPolicy) {
+        self.flush = policy;
+    }
+
+    /// **Take the commit handle** for everything appended since the last take —
+    /// the group-commit seam ([`FlushPolicy::CallerDriven`]). Returns a
+    /// *duplicated* file descriptor (`try_clone`) onto the active part, and
+    /// clears the outstanding fsync debt; `None` when nothing is owed.
+    ///
+    /// The duplicate is the point: `sync_data()` on it flushes the same file, so
+    /// the caller can run the (millisecond-scale, blocking) `fsync` **after**
+    /// releasing the engine lock. Holding that lock across the `fsync` is what
+    /// stalled every reader — a claiming consumer needs the same lock to poll its
+    /// feed, so an in-lock `fsync` blocked the whole consuming side for its
+    /// duration (noetl/ai-meta#205).
+    ///
+    /// Safe against a concurrent take: an append that lands between one caller's
+    /// take and its `fsync` may or may not be covered by it, but it raises the
+    /// debt again and so is covered by its own commit. `fsync` is monotone —
+    /// covering more than asked is never wrong. Safe against a concurrent
+    /// [`seal`](Self::seal) too: seal `fsync`s before it renames, so data reached
+    /// through a handle taken earlier is already durable.
+    pub fn take_sync_handle(&mut self) -> Result<Option<File>> {
+        if self.unflushed_since_fsync == 0 {
+            return Ok(None);
+        }
+        let Some(file) = self.file.as_ref() else {
+            return Ok(None);
+        };
+        let dup = file
+            .try_clone()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        self.unflushed_since_fsync = 0;
+        Ok(Some(dup))
     }
 
     /// Whether the active part has hit a seal trigger (size or record count).

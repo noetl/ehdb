@@ -130,7 +130,8 @@ async fn router_publishes_to_the_owning_shard() {
         writers.push(w);
     }
 
-    let mut router = PublishRouter::<D1EventLog>::connect(shard_count, addrs)
+    // `&self` — the router pipelines, so it needs no exclusive borrow to publish.
+    let router = PublishRouter::<D1EventLog>::connect(shard_count, addrs)
         .await
         .unwrap();
 
