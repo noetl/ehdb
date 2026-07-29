@@ -170,6 +170,20 @@ async fn pipelined_publish_returns_each_callers_own_key() {
         "every published record is in the log"
     );
 
+    // The ascending-contract canary never tripped: no append landed at or below
+    // its shard's tail, which is the loss class #203 fixed and the one a batched
+    // or pipelined write path could plausibly reintroduce.
+    assert_eq!(
+        engine
+            .lock()
+            .unwrap()
+            .metrics()
+            .snapshot()
+            .out_of_order_appends,
+        0,
+        "no out-of-order append under concurrent pipelined publish"
+    );
+
     for d in [&obj, &local] {
         let _ = std::fs::remove_dir_all(d);
     }
