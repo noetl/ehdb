@@ -12,6 +12,10 @@ ehdb-core.workspace = true
 ehdb-l0.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# TCP keepalive on every feed socket (noetl/ai-meta#208): tokio exposes only
+# `set_nodelay`, so the keepalive setters come from socket2 (already in the tree
+# as tokio's own dependency).  `all` is what gates the interval/retries setters.
+socket2 = { version = "0.5", features = ["all"] }
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]

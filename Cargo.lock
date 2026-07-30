@@ -613,6 +613,7 @@ dependencies = [
  "ehdb-l0",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
 ]
 

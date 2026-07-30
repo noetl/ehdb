@@ -27,6 +27,7 @@
 //! `global_sequence` as the cursor (the ack watermark T1 builds on).
 
 pub mod claim;
+pub mod cursor;
 pub mod group;
 pub mod publish;
 pub mod scaler;
@@ -35,6 +36,7 @@ pub mod subject;
 pub use claim::{
     d1_command_subject, serve_claims, ClaimClient, ClaimCoordinator, Claimed, DEFAULT_POOL,
 };
+pub use cursor::{CursorFallback, CursorOrigin, CursorStore};
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
 pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
 pub use scaler::{render_prometheus, ShardLag};
@@ -43,6 +45,7 @@ pub use subject::{Subject, SubjectFilter, SubjectFn};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ehdb_l0::{ChangeFeed, Dataset, FlushPolicy, L0Engine};
 use serde::de::DeserializeOwned;
@@ -61,6 +64,50 @@ pub struct SubscribeReq {
 
 pub(crate) fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+/// How long a connection may sit idle before the kernel starts probing the peer.
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+/// The gap between keepalive probes once probing has started.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// How many unanswered probes declare the connection dead — so a dead peer
+/// surfaces as a read/write error in roughly
+/// `KEEPALIVE_IDLE + KEEPALIVE_RETRIES * KEEPALIVE_INTERVAL` ≈ 11 s.
+pub const KEEPALIVE_RETRIES: u32 = 3;
+
+/// The socket posture every ehdb-feed connection gets: `TCP_NODELAY` (a single
+/// record is delivered immediately, not Nagle-batched) **plus TCP keepalive**.
+///
+/// Keepalive is the fix for the silent wedge in noetl/ai-meta#208. Every protocol
+/// in this crate parks on a blocking read while it waits for the peer — a
+/// claimer inside `claim_next`, a subscriber inside its push loop, a publisher
+/// waiting for its durable ack. When the peer's pod dies, whether that read ever
+/// returns depends on a FIN or RST actually arriving: under Kubernetes it often
+/// does not (the veth and conntrack entry go away with the pod), so the socket is
+/// left **half-open** and the read neither yields data nor errors. Without
+/// keepalive the caller parks forever, no error is logged, and every redial path
+/// in this crate and its callers is unreachable because there is no `Err` to
+/// trigger it — which is exactly how a routine writer restart wedged dispatch
+/// with `0 of 30` commands claimed and nothing in any log.
+///
+/// With keepalive armed, the kernel probes an idle connection and a dead peer
+/// becomes an ordinary `io::Error` within ~11 s, so the existing
+/// error-then-reconnect paths do their job unchanged.
+pub(crate) fn configure_stream(sock: &TcpStream) -> io::Result<()> {
+    sock.set_nodelay(true)?;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    // `with_retries` (TCP_KEEPCNT) is not portable to every target socket2
+    // supports; the idle+interval pair alone still bounds detection everywhere.
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "windows"
+    )))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
+    socket2::SockRef::from(sock).set_tcp_keepalive(&keepalive)
 }
 
 /// Close the durability window over the handles taken from the engine, with the
@@ -222,7 +269,7 @@ where
 {
     loop {
         let (mut sock, _peer) = listener.accept().await?;
-        sock.set_nodelay(true)?;
+        configure_stream(&sock)?;
         let req_bytes = read_frame(&mut sock).await?;
         let req: SubscribeReq = serde_json::from_slice(&req_bytes).map_err(io_err)?;
         let (engine, rx) = writer.subscriber_handle();
@@ -273,7 +320,7 @@ impl FeedSubscription {
     /// (`0` = from the beginning; the writer's current tip = only new records).
     pub async fn connect(addr: SocketAddr, shard: u32, cursor: u64) -> io::Result<Self> {
         let mut sock = TcpStream::connect(addr).await?;
-        sock.set_nodelay(true)?;
+        configure_stream(&sock)?;
         let req = serde_json::to_vec(&SubscribeReq { shard, cursor }).map_err(io_err)?;
         write_frame(&mut sock, &req).await?;
         Ok(Self { sock })
