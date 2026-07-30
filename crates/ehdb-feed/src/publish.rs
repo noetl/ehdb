@@ -66,7 +66,7 @@ where
 {
     loop {
         let (sock, _peer) = listener.accept().await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         let writer = Arc::clone(&writer);
         tokio::spawn(async move {
             let (mut rd, mut wr) = sock.into_split();
@@ -130,7 +130,7 @@ impl PublishClient {
     /// service name), resolved by `TcpStream::connect` (finding-#2 fix).
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         Ok(Self { sock })
     }
 
@@ -169,7 +169,7 @@ impl PipelinedPublishClient {
     /// service name), resolved by `TcpStream::connect` (finding-#2 fix).
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         let (mut rd, mut wr) = sock.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<u64>)>();
 

@@ -95,7 +95,7 @@ where
 {
     loop {
         let (mut sock, _peer) = listener.accept().await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         let (engine, rx) = writer.subscriber_handle();
         tokio::spawn(async move {
             let head = match read_head(&mut sock).await {
