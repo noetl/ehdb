@@ -89,6 +89,12 @@ fn prometheus_exposition_is_well_formed() {
     assert!(p0 < p1 && p1 < p2);
     // Aggregate = sum.
     assert!(text.contains("ehdb_feed_total_lag 15\n"));
+    // The committed cursor rides alongside (noetl/ai-meta#208): lag alone cannot
+    // tell "caught up" from "resumed at the wrong place".
+    assert!(text.contains("# TYPE ehdb_feed_shard_committed gauge"));
+    assert!(text.contains("ehdb_feed_shard_committed{shard=\"0\"} 9\n"));
+    assert!(text.contains("ehdb_feed_shard_committed{shard=\"1\"} 4\n"));
+    assert!(text.contains("ehdb_feed_shard_committed{shard=\"2\"} 5\n"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

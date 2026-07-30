@@ -16,6 +16,13 @@
 //! TYPE gauge` header, one `ehdb_feed_shard_lag{shard="N"}` series per shard, and
 //! an `ehdb_feed_total_lag` aggregate (a convenient single trigger for a
 //! pool-wide `ScaledObject`).
+//!
+//! The **committed cursor** is exposed alongside it as
+//! `ehdb_feed_shard_committed{shard="N"}` (noetl/ai-meta#208): lag alone cannot
+//! distinguish "caught up" from "resumed at the wrong place", and the committed
+//! cursor is exactly the value a restarted writer resumes from — so a restart
+//! that starts replaying is visible as the cursor jumping backwards rather than
+//! only as a lag spike.
 
 use std::io;
 use std::net::SocketAddr;
@@ -36,6 +43,7 @@ pub struct ShardLag {
 
 const LAG_METRIC: &str = "ehdb_feed_shard_lag";
 const TOTAL_METRIC: &str = "ehdb_feed_total_lag";
+const COMMITTED_METRIC: &str = "ehdb_feed_shard_committed";
 
 /// Render shard lags as Prometheus exposition text (v0.0.4).
 pub fn render_prometheus(samples: &[ShardLag]) -> String {
@@ -51,6 +59,16 @@ pub fn render_prometheus(samples: &[ShardLag]) -> String {
         out.push_str(&format!(
             "{LAG_METRIC}{{shard=\"{}\"}} {}\n",
             s.shard, s.lag
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP {COMMITTED_METRIC} Consumer-group committed cursor (acked prefix) per shard — the sort key a restarted writer resumes from.\n"
+    ));
+    out.push_str(&format!("# TYPE {COMMITTED_METRIC} gauge\n"));
+    for s in &ordered {
+        out.push_str(&format!(
+            "{COMMITTED_METRIC}{{shard=\"{}\"}} {}\n",
+            s.shard, s.committed
         ));
     }
     let total: u64 = ordered.iter().map(|s| s.lag).sum();
