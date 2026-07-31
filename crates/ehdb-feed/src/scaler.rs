@@ -23,6 +23,15 @@
 //! cursor is exactly the value a restarted writer resumes from — so a restart
 //! that starts replaying is visible as the cursor jumping backwards rather than
 //! only as a lag spike.
+//!
+//! The committed cursor turned out not to be enough on its own: sort keys are
+//! assigned from the engine's *recovered* sequence, so the cursor is relative to
+//! what the manifest recovered and legitimately steps down across a restart. The
+//! `ehdb_feed_shard_resume_*` family ([`render_resume`]) closes that: it states
+//! what was stored, the reopened tip, what was used, and how many records the
+//! restart actually replayed — so "the restart was invisible" is one equality
+//! (`ehdb_feed_shard_resume_replay_records == 0`) rather than arithmetic across
+//! scrapes.
 
 use std::io;
 use std::net::SocketAddr;
@@ -30,6 +39,8 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+use crate::cursor::ResumeReport;
 
 /// One shard consumer group's lag sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,4 +129,127 @@ where
 {
     let listener = TcpListener::bind(addr).await?;
     serve_metrics(listener, provider).await
+}
+
+const RESUME_FROM_METRIC: &str = "ehdb_feed_shard_resume_from";
+const RESUME_TIP_METRIC: &str = "ehdb_feed_shard_resume_tip";
+const RESUME_STORED_METRIC: &str = "ehdb_feed_shard_resume_stored";
+const RESUME_REPLAY_METRIC: &str = "ehdb_feed_shard_resume_replay_records";
+
+/// Render the **resume facts** as Prometheus exposition text — the startup half
+/// of the restart signal (noetl/ai-meta#208).
+///
+/// These are constants for the life of the process: what a restart resumed from
+/// and whether it replayed. They exist as gauges rather than only a log line so a
+/// runbook can *assert* the outcome — `ehdb_feed_shard_resume_replay_records == 0`
+/// is the check "the restart was invisible", answerable from one scrape with no
+/// arithmetic across samples and no log scraping.
+///
+/// `ehdb_feed_shard_committed` cannot answer it: sort keys are assigned from the
+/// engine's recovered sequence, so the committed cursor is relative to what the
+/// manifest recovered and legitimately steps *down* across a restart. That is
+/// precisely what made the first prod restart's `origin="persisted"
+/// from_cursor=0` line unreadable.
+///
+/// `resume_stored` is emitted only when a cursor was actually read back, so
+/// "nothing stored" is an absent series rather than an indistinguishable `0`.
+pub fn render_resume(reports: &[ResumeReport]) -> String {
+    let mut ordered = reports.to_vec();
+    ordered.sort_by_key(|r| r.shard);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# HELP {RESUME_FROM_METRIC} The cursor this shard's claim group started from at process start.\n"
+    ));
+    out.push_str(&format!("# TYPE {RESUME_FROM_METRIC} gauge\n"));
+    for r in &ordered {
+        out.push_str(&format!(
+            "{RESUME_FROM_METRIC}{{shard=\"{}\",origin=\"{}\"}} {}\n",
+            r.shard,
+            r.origin.as_str(),
+            r.from_cursor
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP {RESUME_TIP_METRIC} The reopened log's tip at resume time — the ceiling the stored cursor is clamped to.\n"
+    ));
+    out.push_str(&format!("# TYPE {RESUME_TIP_METRIC} gauge\n"));
+    for r in &ordered {
+        out.push_str(&format!(
+            "{RESUME_TIP_METRIC}{{shard=\"{}\"}} {}\n",
+            r.shard, r.tip
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP {RESUME_STORED_METRIC} The cursor read back from the durable store before clamping (absent when nothing was stored).\n"
+    ));
+    out.push_str(&format!("# TYPE {RESUME_STORED_METRIC} gauge\n"));
+    for r in &ordered {
+        if let Some(stored) = r.stored_cursor {
+            out.push_str(&format!(
+                "{RESUME_STORED_METRIC}{{shard=\"{}\",clamped=\"{}\"}} {}\n",
+                r.shard,
+                r.clamped(),
+                stored
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "# HELP {RESUME_REPLAY_METRIC} Records re-served from the existing log at resume — 0 means the restart replayed nothing.\n"
+    ));
+    out.push_str(&format!("# TYPE {RESUME_REPLAY_METRIC} gauge\n"));
+    for r in &ordered {
+        out.push_str(&format!(
+            "{RESUME_REPLAY_METRIC}{{shard=\"{}\"}} {}\n",
+            r.shard,
+            r.replay_records()
+        ));
+    }
+    out
+}
+
+/// [`serve_metrics`] plus the process-constant resume facts
+/// ([`render_resume`]). `reports` is captured once at startup — these values do
+/// not change while the process runs.
+pub async fn serve_metrics_with_resume<F>(
+    listener: TcpListener,
+    reports: Vec<ResumeReport>,
+    provider: F,
+) -> io::Result<()>
+where
+    F: Fn() -> Vec<ShardLag> + Send + Sync + 'static,
+{
+    let resume = Arc::new(render_resume(&reports));
+    let provider = Arc::new(provider);
+    loop {
+        let (mut sock, _peer) = listener.accept().await?;
+        let provider = Arc::clone(&provider);
+        let resume = Arc::clone(&resume);
+        tokio::spawn(async move {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let body = format!("{}{}", render_prometheus(&provider()), resume);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+    }
+}
+
+/// Bind `addr` and serve lag + resume facts (convenience over
+/// [`serve_metrics_with_resume`]).
+pub async fn bind_and_serve_with_resume<F>(
+    addr: SocketAddr,
+    reports: Vec<ResumeReport>,
+    provider: F,
+) -> io::Result<()>
+where
+    F: Fn() -> Vec<ShardLag> + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr).await?;
+    serve_metrics_with_resume(listener, reports, provider).await
 }

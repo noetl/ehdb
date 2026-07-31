@@ -189,6 +189,82 @@ impl CursorOrigin {
     }
 }
 
+/// Everything a restart needs to say about where it resumed — the
+/// unambiguous form of the one-line restart signal (noetl/ai-meta#208).
+///
+/// **Why the origin alone is not enough.** The first prod writer restart on the
+/// EHDB bus logged `origin="persisted" from_cursor=0`, which reads exactly like a
+/// replay from the beginning of the shard — the failure the resume fix exists to
+/// prevent. It was not one: the reopened log's tip was itself low (sort keys are
+/// assigned from the engine's recovered sequence, so the number is relative to
+/// what the manifest recovered, not an absolute all-time count), the stored
+/// cursor was clamped down to it, and nothing was re-served. Proving that took
+/// arithmetic across two scrapes of `ehdb_feed_shard_committed`. A runbook cannot
+/// rely on a signal that needs arithmetic to disambiguate.
+///
+/// So the report carries the three numbers that make the outcome self-evident —
+/// what was stored, what the reopened log's tip was, what was actually used — and
+/// derives the two questions an operator asks: was the cursor clamped, and did
+/// anything replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeReport {
+    /// The shard this coordinator serves.
+    pub shard: u32,
+    /// The cursor read back from the [`CursorStore`], before clamping. `None`
+    /// when nothing was stored (a first start or a wiped volume).
+    pub stored_cursor: Option<u64>,
+    /// The reopened log's tip (`global_sequence`) at resume time — the ceiling
+    /// the stored cursor is clamped to.
+    pub tip: u64,
+    /// The cursor the group actually started from, after clamping / fallback.
+    pub from_cursor: u64,
+    /// How `from_cursor` was chosen.
+    pub origin: CursorOrigin,
+}
+
+impl ResumeReport {
+    /// Was a stored cursor clamped down to the reopened log's tip? True means
+    /// the log recovered less than the cursor covered — expected after an
+    /// unsealed-tail loss, and the reason a "persisted" resume can start at a
+    /// number lower than the one last persisted.
+    pub fn clamped(&self) -> bool {
+        matches!(self.stored_cursor, Some(c) if c > self.tip)
+    }
+
+    /// How many records the group will re-serve from the existing log — the
+    /// replay this fix exists to keep at zero. `tip - from_cursor`.
+    pub fn replay_records(&self) -> u64 {
+        self.tip.saturating_sub(self.from_cursor)
+    }
+
+    /// Did this start replay anything already in the log?
+    pub fn replayed(&self) -> bool {
+        self.replay_records() > 0
+    }
+}
+
+impl std::fmt::Display for ResumeReport {
+    /// The restart line, unambiguous on its own:
+    /// `shard=0 origin=persisted stored_cursor=408 tip=165 from_cursor=165
+    /// clamped=true replay=false replay_records=0`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shard={} origin={}", self.shard, self.origin.as_str())?;
+        match self.stored_cursor {
+            Some(c) => write!(f, " stored_cursor={c}")?,
+            None => write!(f, " stored_cursor=none")?,
+        }
+        write!(
+            f,
+            " tip={} from_cursor={} clamped={} replay={} replay_records={}",
+            self.tip,
+            self.from_cursor,
+            self.clamped(),
+            self.replayed(),
+            self.replay_records()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
