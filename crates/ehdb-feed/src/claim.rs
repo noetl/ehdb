@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
 
-use crate::cursor::{CursorFallback, CursorOrigin, CursorStore};
+use crate::cursor::{CursorFallback, CursorOrigin, CursorStore, ResumeReport};
 use crate::group::{MemberId, SubjectConsumerGroup};
 use crate::subject::{Subject, SubjectFn};
 use crate::{io_err, read_frame, write_frame, FeedWriter};
@@ -131,6 +131,10 @@ pub struct ClaimCoordinator<D: Dataset> {
     /// The cursor this coordinator started from, and how it was chosen — for the
     /// host's one-line restart log.
     started_at: (u64, CursorOrigin),
+    /// The full resume story, when this coordinator came up through
+    /// [`resume`](Self::resume): what was stored, the reopened log's tip, and
+    /// what was actually used (noetl/ai-meta#208).
+    resume_report: Option<ResumeReport>,
 }
 
 impl<D> ClaimCoordinator<D>
@@ -158,6 +162,7 @@ where
             subject_of,
             None,
             CursorOrigin::Persisted,
+            None,
         )
     }
 
@@ -197,7 +202,8 @@ where
         // the global sequence is a sound "after now" watermark for any shard (same
         // basis as `ChangeFeed::tail`).
         let tip = writer.engine().lock().unwrap().global_sequence();
-        let (from_cursor, origin) = match store.load()? {
+        let stored = store.load()?;
+        let (from_cursor, origin) = match stored {
             // Clamped to the tip on purpose. The engine resumes from its durable
             // manifest, so a log that lost an unsealed tail can reopen *behind* the
             // cursor we persisted — and since the writer then re-issues keys from
@@ -210,6 +216,13 @@ where
                 CursorFallback::Beginning => (0, CursorOrigin::FallbackBeginning),
             },
         };
+        let report = ResumeReport {
+            shard,
+            stored_cursor: stored,
+            tip,
+            from_cursor,
+            origin,
+        };
         Ok(Self::build(
             writer,
             shard,
@@ -218,9 +231,13 @@ where
             subject_of,
             Some(store),
             origin,
+            Some(report),
         ))
     }
 
+    // The private constructor both `new` and `resume` funnel through; the arity
+    // is the union of their inputs, not an interface anyone calls.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         writer: Arc<FeedWriter<D>>,
         shard: u32,
@@ -229,6 +246,7 @@ where
         subject_of: SubjectFn<D::Record>,
         cursor_store: Option<CursorStore>,
         origin: CursorOrigin,
+        resume_report: Option<ResumeReport>,
     ) -> Self {
         let ack_wait_ticks = ack_wait.as_millis() as u64;
         let poll_interval =
@@ -245,6 +263,7 @@ where
             poll_interval,
             cursor_store,
             started_at: (from_cursor, origin),
+            resume_report,
         }
     }
 
@@ -252,6 +271,16 @@ where
     /// host's restart log line.
     pub fn started_from(&self) -> (u64, CursorOrigin) {
         self.started_at
+    }
+
+    /// The full resume story for the host's restart line and the resume gauges —
+    /// what was stored, the reopened log's tip, what was actually used, whether
+    /// the cursor was clamped, and whether anything replayed
+    /// ([`ResumeReport`], noetl/ai-meta#208). `None` when this coordinator was
+    /// built with [`new`](Self::new) rather than resumed, so a caller can never
+    /// mistake "no durable progress configured" for "resumed at 0".
+    pub fn resume_report(&self) -> Option<ResumeReport> {
+        self.resume_report
     }
 
     fn now_ticks(&self) -> u64 {
