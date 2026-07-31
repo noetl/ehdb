@@ -20,7 +20,7 @@
 //! acked and no longer in flight. Persisting it and reconstructing a group from
 //! it resumes exactly where the group left off (the durable-progress seam).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ehdb_core::Result;
 use ehdb_l0::{ChangeFeed, Dataset, L0Engine};
@@ -232,6 +232,12 @@ pub struct SubjectConsumerGroup<D: Dataset> {
     pending: VecDeque<(Subject, D::Record)>,
     /// Delivered-but-unacked, keyed by sort key (ascending).
     inflight: BTreeMap<u64, SubjectInFlight<D::Record>>,
+    /// Every subject this group has ever routed a record to — the label set
+    /// [`subject_lags`](Self::subject_lags) reports, so a drained subject keeps
+    /// publishing `0` instead of its series vanishing (noetl/ai-meta#194: a KEDA
+    /// trigger reading a series that disappears at lag 0 is a scaler error, not
+    /// a scale-to-min). Bounded by pools × shards — a handful of entries.
+    seen_subjects: BTreeSet<String>,
 }
 
 impl<D> SubjectConsumerGroup<D>
@@ -257,6 +263,7 @@ where
             subject_of,
             pending: VecDeque::new(),
             inflight: BTreeMap::new(),
+            seen_subjects: BTreeSet::new(),
         }
     }
 
@@ -270,9 +277,77 @@ where
         for rec in self.feed.poll(engine)? {
             self.delivered_frontier = self.delivered_frontier.max(D::sort_key(&rec));
             let subject = (self.subject_of)(&rec);
+            self.seen_subjects.insert(subject.as_str());
             self.pending.push_back((subject, rec));
         }
         Ok(())
+    }
+
+    /// Seed the reported subject set from the shard's existing log, without
+    /// delivering anything.
+    ///
+    /// A group resumed at the tail has seen no records yet, so
+    /// [`subject_lags`](Self::subject_lags) would report an empty label set until
+    /// the first command of each pool arrives — exactly the window after a writer
+    /// restart when an autoscaler most needs a reading. Scanning the retained log
+    /// once at construction closes that hole: every subject the shard has ever
+    /// carried is reported from the first scrape, at `0` when drained. Costs one
+    /// partition read at startup and never moves the feed cursor, so it cannot
+    /// affect delivery.
+    pub fn seed_subjects(&mut self, engine: &L0Engine<D>) -> Result<()> {
+        for rec in engine.read_partition_after(self.shard, 0)? {
+            self.seen_subjects.insert((self.subject_of)(&rec).as_str());
+        }
+        Ok(())
+    }
+
+    /// Every subject this group reports a lag for — the seeded/seen label set.
+    pub fn seen_subjects(&self) -> impl Iterator<Item = &str> {
+        self.seen_subjects.iter().map(String::as_str)
+    }
+
+    /// **Per-subject consumer lag** — the shard's backlog past the global
+    /// committed cursor, split by routing subject (`commands.<pool>.shard.<n>`).
+    ///
+    /// [`lag`](Self::lag) is whole-shard by construction: one cursor, every
+    /// subject. That is the right number for "is this shard behind", but it is
+    /// the wrong trigger for scaling **one pool** — the pools share a shard, so a
+    /// system-pool backlog would scale the user pool, and a single stuck
+    /// system-pool command pins the global committed cursor and therefore pins
+    /// whole-shard lag high forever. This splits the same backlog by the subject a
+    /// worker actually subscribes to, so a pool's ScaledObject reads its own
+    /// queue (noetl/ai-meta#194 T2).
+    ///
+    /// Every subject in [`seen_subjects`](Self::seen_subjects) is present in the
+    /// result, at `0` when it has no backlog.
+    ///
+    /// Counted as *undelivered + delivered-but-unacked*, per subject: the group's
+    /// own `pending` + `inflight`, plus the not-yet-pulled tail past
+    /// `delivered_frontier`. It deliberately does **not** re-derive the count from
+    /// the committed cursor the way [`lag`](Self::lag) does — records above a
+    /// pinned cursor that this group has already acked are not backlog for
+    /// anyone, and attributing them to a pool is exactly the false signal this
+    /// split exists to remove. So the per-subject values sum to `lag` only when
+    /// nothing above the cursor has been acked; otherwise they sum to less, which
+    /// is the honest number.
+    pub fn subject_lags(&self, engine: &L0Engine<D>) -> Result<Vec<(String, u64)>> {
+        let mut counts: BTreeMap<String, u64> = self
+            .seen_subjects
+            .iter()
+            .map(|s| (s.clone(), 0u64))
+            .collect();
+        let mut bump = |subject: String| *counts.entry(subject).or_insert(0) += 1;
+        for (subject, _) in &self.pending {
+            bump(subject.as_str());
+        }
+        for f in self.inflight.values() {
+            bump(f.subject.as_str());
+        }
+        // The tail the group has not pulled yet — real backlog, not yet tagged.
+        for rec in engine.read_partition_after(self.shard, self.delivered_frontier)? {
+            bump((self.subject_of)(&rec).as_str());
+        }
+        Ok(counts.into_iter().collect())
     }
 
     /// Assign the next record **matching `filter`** to `member` at logical time

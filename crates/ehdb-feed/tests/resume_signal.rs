@@ -189,3 +189,80 @@ async fn a_replaying_restart_is_reported_as_a_replay() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_writers_endpoint_serves_the_resume_facts_and_the_per_subject_lag_together() {
+    // The two families answer different questions and the writer needs both from
+    // one scrape: `ehdb_feed_subject_lag` is the per-pool autoscaler trigger
+    // (noetl/ai-meta#194), the resume gauges say whether the last restart
+    // replayed (noetl/ai-meta#208). Binding a server that renders only one drops
+    // the other silently — nothing errors, the series is just absent, and for the
+    // lag family an absent series is a KEDA *scaler error*. This pins the
+    // combined endpoint so that regression cannot ship.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let reports = vec![ResumeReport {
+        shard: 0,
+        from_cursor: 41,
+        tip: 41,
+        stored_cursor: Some(41),
+        origin: CursorOrigin::Persisted,
+    }];
+
+    tokio::spawn(ehdb_feed::bind_and_serve_snapshot_with_resume(
+        addr,
+        reports,
+        || ehdb_feed::LagSnapshot {
+            shards: vec![ehdb_feed::ShardLag {
+                shard: 0,
+                committed: 41,
+                lag: 6,
+            }],
+            subjects: vec![ehdb_feed::SubjectLag {
+                subject: "commands.shared.shard.0".to_string(),
+                lag: 6,
+            }],
+        },
+    ));
+
+    let mut sock = {
+        let mut attempt = None;
+        for _ in 0..50 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => {
+                    attempt = Some(s);
+                    break;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        attempt.expect("metrics server accepted a connection")
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    sock.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    sock.flush().await.unwrap();
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp).await.unwrap();
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+    // The autoscaler trigger, byte-stable for KEDA's prefix match.
+    assert!(
+        resp.contains("ehdb_feed_subject_lag{subject=\"commands.shared.shard.0\"} 6\n"),
+        "per-subject lag missing: {resp}"
+    );
+    // The restart verdict, answerable without arithmetic across scrapes.
+    assert!(
+        resp.contains("ehdb_feed_shard_resume_replay_records{shard=\"0\"} 0\n"),
+        "resume facts missing: {resp}"
+    );
+    // And the pre-existing families the runbooks already read.
+    assert!(resp.contains("ehdb_feed_total_lag 6\n"), "{resp}");
+    assert!(
+        resp.contains("ehdb_feed_shard_committed{shard=\"0\"} 41\n"),
+        "{resp}"
+    );
+}

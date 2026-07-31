@@ -52,12 +52,57 @@ pub struct ShardLag {
     pub lag: u64,
 }
 
+/// One routing subject's backlog — the per-pool slice of a shard's lag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectLag {
+    /// The routing subject, e.g. `commands.shared.shard.0`. It already carries
+    /// the shard, so this series needs no second label.
+    pub subject: String,
+    /// Backlog for this subject: records past the group's committed cursor whose
+    /// subject matches (undelivered + unacked).
+    pub lag: u64,
+}
+
+/// A full sample of the writer's lag surface: per-shard totals plus the
+/// per-subject split.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LagSnapshot {
+    pub shards: Vec<ShardLag>,
+    pub subjects: Vec<SubjectLag>,
+}
+
+impl LagSnapshot {
+    /// A snapshot with no per-subject split — the pre-noetl/ai-meta#194 shape.
+    pub fn shards_only(shards: Vec<ShardLag>) -> Self {
+        Self {
+            shards,
+            subjects: Vec::new(),
+        }
+    }
+}
+
 const LAG_METRIC: &str = "ehdb_feed_shard_lag";
 const TOTAL_METRIC: &str = "ehdb_feed_total_lag";
 const COMMITTED_METRIC: &str = "ehdb_feed_shard_committed";
+const SUBJECT_METRIC: &str = "ehdb_feed_subject_lag";
 
 /// Render shard lags as Prometheus exposition text (v0.0.4).
 pub fn render_prometheus(samples: &[ShardLag]) -> String {
+    render_snapshot(&LagSnapshot::shards_only(samples.to_vec()))
+}
+
+/// Render a full lag snapshot (per-shard + per-subject) as Prometheus exposition
+/// text (v0.0.4).
+///
+/// **The per-subject series is a scaler contract.** KEDA's `metrics-api` scaler
+/// in `format: prometheus` matches `valueLocation` as a *prefix of the whole
+/// `name{labels}` token* and takes the first matching line — it has no label
+/// selector. So the rendered line must be byte-stable:
+/// `ehdb_feed_subject_lag{subject="commands.shared.shard.0"} 12`, exactly one
+/// label, subjects in sorted order. Changing the label set or its spacing breaks
+/// every ScaledObject pointing at it (noetl/ai-meta#194).
+pub fn render_snapshot(snapshot: &LagSnapshot) -> String {
+    let samples = &snapshot.shards;
     let mut out = String::new();
     out.push_str(&format!(
         "# HELP {LAG_METRIC} Consumer-group backlog (undelivered + unacked records) per shard.\n"
@@ -88,6 +133,21 @@ pub fn render_prometheus(samples: &[ShardLag]) -> String {
     ));
     out.push_str(&format!("# TYPE {TOTAL_METRIC} gauge\n"));
     out.push_str(&format!("{TOTAL_METRIC} {total}\n"));
+
+    // Per-subject split — the per-pool trigger value. Always emitted (even with
+    // no subjects known yet) so the family's HELP/TYPE headers are stable.
+    out.push_str(&format!(
+        "# HELP {SUBJECT_METRIC} Consumer-group backlog per routing subject (commands.<pool>.shard.<n>) — the per-pool autoscaler trigger.\n"
+    ));
+    out.push_str(&format!("# TYPE {SUBJECT_METRIC} gauge\n"));
+    let mut subjects = snapshot.subjects.clone();
+    subjects.sort_by(|a, b| a.subject.cmp(&b.subject));
+    for s in &subjects {
+        out.push_str(&format!(
+            "{SUBJECT_METRIC}{{subject=\"{}\"}} {}\n",
+            s.subject, s.lag
+        ));
+    }
     out
 }
 
@@ -102,6 +162,15 @@ pub async fn serve_metrics<F>(listener: TcpListener, provider: F) -> io::Result<
 where
     F: Fn() -> Vec<ShardLag> + Send + Sync + 'static,
 {
+    serve_snapshot_metrics(listener, move || LagSnapshot::shards_only(provider())).await
+}
+
+/// [`serve_metrics`] over a full [`LagSnapshot`] — per-shard totals plus the
+/// per-subject split.
+pub async fn serve_snapshot_metrics<F>(listener: TcpListener, provider: F) -> io::Result<()>
+where
+    F: Fn() -> LagSnapshot + Send + Sync + 'static,
+{
     let provider = Arc::new(provider);
     loop {
         let (mut sock, _peer) = listener.accept().await?;
@@ -110,7 +179,7 @@ where
             // Drain the request head (we don't route on it); tolerate a short read.
             let mut scratch = [0u8; 1024];
             let _ = sock.read(&mut scratch).await;
-            let body = render_prometheus(&provider());
+            let body = render_snapshot(&provider());
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -252,4 +321,66 @@ where
 {
     let listener = TcpListener::bind(addr).await?;
     serve_metrics_with_resume(listener, reports, provider).await
+}
+
+/// Bind `addr` and serve a full lag snapshot (convenience over
+/// [`serve_snapshot_metrics`]).
+pub async fn bind_and_serve_snapshot<F>(addr: SocketAddr, provider: F) -> io::Result<()>
+where
+    F: Fn() -> LagSnapshot + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr).await?;
+    serve_snapshot_metrics(listener, provider).await
+}
+
+/// [`serve_snapshot_metrics`] plus the process-constant resume facts
+/// ([`render_resume`]) — **the endpoint a deployed writer serves.**
+///
+/// The two halves answer different questions and a writer needs both from one
+/// scrape: the snapshot carries `ehdb_feed_subject_lag`, which is the per-pool
+/// autoscaler trigger (noetl/ai-meta#194), and the resume facts carry whether
+/// the last restart replayed anything (noetl/ai-meta#208). Serving only one
+/// silently drops the other — [`serve_metrics_with_resume`] renders lag without
+/// the per-subject split, so it must not be what the writer binds.
+pub async fn serve_snapshot_metrics_with_resume<F>(
+    listener: TcpListener,
+    reports: Vec<ResumeReport>,
+    provider: F,
+) -> io::Result<()>
+where
+    F: Fn() -> LagSnapshot + Send + Sync + 'static,
+{
+    let resume = Arc::new(render_resume(&reports));
+    let provider = Arc::new(provider);
+    loop {
+        let (mut sock, _peer) = listener.accept().await?;
+        let provider = Arc::clone(&provider);
+        let resume = Arc::clone(&resume);
+        tokio::spawn(async move {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let body = format!("{}{}", render_snapshot(&provider()), resume);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+    }
+}
+
+/// Bind `addr` and serve the full lag snapshot + resume facts (convenience over
+/// [`serve_snapshot_metrics_with_resume`]).
+pub async fn bind_and_serve_snapshot_with_resume<F>(
+    addr: SocketAddr,
+    reports: Vec<ResumeReport>,
+    provider: F,
+) -> io::Result<()>
+where
+    F: Fn() -> LagSnapshot + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr).await?;
+    serve_snapshot_metrics_with_resume(listener, reports, provider).await
 }
