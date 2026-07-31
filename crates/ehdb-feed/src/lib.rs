@@ -29,6 +29,7 @@
 pub mod claim;
 pub mod cursor;
 pub mod group;
+pub mod groups;
 pub mod publish;
 pub mod scaler;
 pub mod sse;
@@ -38,6 +39,10 @@ pub use claim::{
 };
 pub use cursor::{CursorFallback, CursorOrigin, CursorStore, ResumeReport};
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
+pub use groups::{
+    event_feed_subject, serve_group_claims, GroupClaimClient, GroupClaimed, GroupCoordinator,
+    EVENT_SUBJECT_ROOT, UNKNOWN_EVENT_TYPE,
+};
 pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
 pub use scaler::{
     bind_and_serve_snapshot_with_resume, render_prometheus, render_resume, render_snapshot,

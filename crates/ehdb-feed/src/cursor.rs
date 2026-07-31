@@ -75,6 +75,36 @@ impl CursorStore {
         })
     }
 
+    /// The store for one **named group** on `shard` under `dir` —
+    /// `claim-cursor.<group>.shard-<n>.json`.
+    ///
+    /// The events feed runs N independently-cursored groups over one shard
+    /// (see [`crate::groups`]), so each needs its own file. Same crash-safe
+    /// write, same monotonic guard, same fallback-on-unreadable posture as
+    /// [`open`](Self::open) — only the path differs.
+    ///
+    /// `group` is sanitised to `[A-Za-z0-9_-]` so a name can never escape the
+    /// directory or collide with the un-named shard file.
+    pub fn open_named(dir: impl AsRef<Path>, group: &str, shard: u32) -> io::Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let safe: String = group
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Ok(Self {
+            path: dir.join(format!("claim-cursor.{safe}.shard-{shard}.json")),
+            shard,
+            written: AtomicU64::new(0),
+        })
+    }
+
     /// The file this store persists to.
     pub fn path(&self) -> &Path {
         &self.path
