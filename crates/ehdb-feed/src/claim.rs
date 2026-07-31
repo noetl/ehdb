@@ -316,6 +316,34 @@ where
         group.lag(&e).unwrap_or(0)
     }
 
+    /// This shard's backlog split by routing subject — the **per-pool** KEDA lag
+    /// value (see [`SubjectConsumerGroup::subject_lags`]). `lag()` is whole-shard
+    /// and so mixes the pools that share the shard; a pool's ScaledObject wants
+    /// only its own subject (noetl/ai-meta#194 T2).
+    pub async fn subject_lags(&self) -> Vec<crate::scaler::SubjectLag> {
+        let group = self.group.lock().await;
+        let engine = self.writer.engine();
+        let e = engine.lock().unwrap();
+        group
+            .subject_lags(&e)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(subject, lag)| crate::scaler::SubjectLag { subject, lag })
+            .collect()
+    }
+
+    /// Seed the reported subject label set from the shard's existing log, so a
+    /// freshly-started writer publishes a `0` for every subject it has ever
+    /// carried rather than an empty label set
+    /// ([`SubjectConsumerGroup::seed_subjects`]). Best-effort: a read error
+    /// leaves the set to fill in from live traffic.
+    pub async fn seed_subjects(&self) {
+        let mut group = self.group.lock().await;
+        let engine = self.writer.engine();
+        let e = engine.lock().unwrap();
+        let _ = group.seed_subjects(&e);
+    }
+
     /// The group's contiguous acked-through cursor — everything at or below it is
     /// acked and not in flight. The value a restart resumes from
     /// ([`resume`](Self::resume)) and the `committed` field of this shard's
