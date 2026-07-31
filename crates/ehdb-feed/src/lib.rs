@@ -39,7 +39,7 @@ pub use claim::{
 pub use cursor::{CursorFallback, CursorOrigin, CursorStore};
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
 pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
-pub use scaler::{render_prometheus, ShardLag};
+pub use scaler::{render_prometheus, render_snapshot, LagSnapshot, ShardLag, SubjectLag};
 pub use subject::{Subject, SubjectFilter, SubjectFn};
 
 use std::io;
