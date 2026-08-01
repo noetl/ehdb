@@ -53,7 +53,6 @@ pub use scaler::{
 pub use subject::{Subject, SubjectFilter, SubjectFn};
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
