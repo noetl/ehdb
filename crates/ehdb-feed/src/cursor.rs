@@ -59,6 +59,21 @@ pub struct CursorStore {
     shard: u32,
     /// Highest value written by this process — the monotonic guard.
     written: AtomicU64,
+    /// Serialises the temp-write→rename sequence.
+    ///
+    /// [`store`](Self::store) writes a **fixed** temp path and renames it over
+    /// the live file. Two concurrent calls on the same store therefore race on
+    /// that one temp name: both `create` it, the first `rename` moves it away,
+    /// and the second fails `ENOENT`. The monotonic guard does not prevent this
+    /// — two acks carrying different committed values both pass it and then run
+    /// concurrently.
+    ///
+    /// That is exactly how the events feed produced a stream of cursor-persist
+    /// failures on prod: `GroupCoordinator::ack` releases the group lock before
+    /// persisting, so the two system-pool replicas' acks overlapped freely
+    /// (noetl/ai-meta#216). Serialising here is cheap — the critical section is
+    /// already `fsync`-bound and a lost cursor write only costs replay.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl CursorStore {
@@ -72,6 +87,7 @@ impl CursorStore {
             path: dir.join(format!("claim-cursor.shard-{shard}.json")),
             shard,
             written: AtomicU64::new(0),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -102,6 +118,7 @@ impl CursorStore {
             path: dir.join(format!("claim-cursor.{safe}.shard-{shard}.json")),
             shard,
             written: AtomicU64::new(0),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -149,6 +166,9 @@ impl CursorStore {
         })
         .map_err(crate::io_err)?;
 
+        // Hold the write lock across temp-create → rename so concurrent callers
+        // cannot clobber each other's temp file (see `write_lock`).
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = self.path.with_extension("json.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
@@ -364,5 +384,67 @@ mod tests {
             CursorFallback::Beginning
         );
         assert_eq!(CursorFallback::default(), CursorFallback::Tail);
+    }
+}
+
+#[cfg(test)]
+mod t216_concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The #216 root cause: `store` writes a **fixed** temp path and renames it,
+    /// so concurrent callers on the same store raced — both created the temp
+    /// file, the first rename moved it away, and the second failed `ENOENT`.
+    ///
+    /// This hammers one store from many threads with strictly increasing
+    /// cursors (so the monotonic guard does not mask the race) and asserts every
+    /// call succeeds. Before the `write_lock` this failed reliably.
+    #[test]
+    fn concurrent_stores_do_not_race_on_the_temp_file() {
+        let dir = std::env::temp_dir().join(format!("ehdb-cursor-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(CursorStore::open_named(&dir, "noetl_materializer", 0).unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let mut errs = Vec::new();
+                for i in 0..60u64 {
+                    // Strictly increasing and interleaved across threads.
+                    let cursor = i * 8 + t + 1;
+                    if let Err(e) = store.store(cursor) {
+                        errs.push(format!("cursor {cursor}: {e}"));
+                    }
+                }
+                errs
+            }));
+        }
+        let errs: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        assert!(errs.is_empty(), "concurrent stores must not fail: {errs:?}");
+
+        // And the file is still readable + monotonic afterwards.
+        let got = store.load().unwrap().expect("a cursor must be persisted");
+        assert!(got > 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Distinct groups have distinct temp files, so they never contend.
+    #[test]
+    fn distinct_groups_use_distinct_temp_paths() {
+        let dir = std::env::temp_dir().join(format!("ehdb-cursor-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = CursorStore::open_named(&dir, "noetl_materializer", 0).unwrap();
+        let b = CursorStore::open_named(&dir, "noetl_result_materializer", 0).unwrap();
+        assert_ne!(
+            a.path().with_extension("json.tmp"),
+            b.path().with_extension("json.tmp"),
+            "per-group temp paths must not collide"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
