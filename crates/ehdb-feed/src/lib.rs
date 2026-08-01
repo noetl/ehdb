@@ -30,6 +30,7 @@ pub mod claim;
 pub mod cursor;
 pub mod group;
 pub mod groups;
+pub mod kv;
 pub mod publish;
 pub mod scaler;
 pub mod sse;
@@ -39,6 +40,7 @@ pub use claim::{
 };
 pub use cursor::{CursorFallback, CursorOrigin, CursorStore, ResumeReport};
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
+pub use kv::{serve_kv, KvClient, KvCoordinator};
 pub use groups::{
     event_feed_subject, serve_group_claims, GroupClaimClient, GroupClaimed, GroupCoordinator,
     EVENT_SUBJECT_ROOT, UNKNOWN_EVENT_TYPE,
