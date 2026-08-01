@@ -137,6 +137,13 @@ pub struct GroupCoordinator<D: Dataset> {
     /// here: this crate carries no logging dependency, and a persist failure is
     /// a metric an operator should see, not a line that scrolls past.
     cursor_errors: AtomicU64,
+    /// The most recent cursor-persist failure, as `(group, message)`.
+    ///
+    /// A bare counter was not diagnosable: it said 26 persists failed and gave
+    /// no way to learn why, which is how noetl/ai-meta#216 sat unexplained. The
+    /// crate still cannot log, so it keeps the last error for the host to read
+    /// and log — one string, overwritten, no allocation on the success path.
+    last_cursor_error: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl<D> GroupCoordinator<D>
@@ -179,6 +186,7 @@ where
             cursor_dir,
             fallback,
             cursor_errors: AtomicU64::new(0),
+            last_cursor_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -195,6 +203,22 @@ where
     /// never lost by this, only re-delivered.
     pub fn cursor_errors(&self) -> u64 {
         self.cursor_errors.load(Ordering::Relaxed)
+    }
+
+    /// The most recent cursor-persist failure as `(group, message)`, if any.
+    /// The host logs this; the crate cannot (no logging dependency).
+    pub fn last_cursor_error(&self) -> Option<(String, String)> {
+        self.last_cursor_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn record_cursor_error(&self, group: &str, err: &std::io::Error) {
+        self.cursor_errors.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_cursor_error.lock() {
+            *slot = Some((group.to_string(), err.to_string()));
+        }
     }
 
     fn now_ticks(&self) -> u64 {
@@ -313,8 +337,8 @@ where
             (acked, g.committed_cursor())
         };
         if let Some(cursor) = &handle.cursor {
-            if cursor.store(committed).is_err() {
-                self.cursor_errors.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = cursor.store(committed) {
+                self.record_cursor_error(group, &e);
             }
         }
         acked
@@ -379,8 +403,8 @@ where
                 let g = handle.group.lock().await;
                 g.committed_cursor()
             };
-            if cursor.store(committed).is_err() {
-                self.cursor_errors.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = cursor.store(committed) {
+                self.record_cursor_error(&_name, &e);
             }
         }
         Ok(())
