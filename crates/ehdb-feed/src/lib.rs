@@ -61,7 +61,7 @@ use ehdb_l0::{ChangeFeed, Dataset, FlushPolicy, L0Engine};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::watch;
 
 /// A subscriber's request: the shard to follow and the resume cursor (sort key
@@ -328,7 +328,14 @@ pub struct FeedSubscription {
 impl FeedSubscription {
     /// Connect to a feed server at `addr` and subscribe to `shard` from `cursor`
     /// (`0` = from the beginning; the writer's current tip = only new records).
-    pub async fn connect(addr: SocketAddr, shard: u32, cursor: u64) -> io::Result<Self> {
+    ///
+    /// `addr` accepts any [`ToSocketAddrs`] — including a `host:port` **DNS
+    /// name**, resolved at connect time. A Kubernetes service name therefore
+    /// works directly and a pod-IP change is followed on reconnect, the same fix
+    /// [`ClaimClient::connect`](crate::claim::ClaimClient::connect) carries. The
+    /// previous `SocketAddr`-only signature made this subscription unusable from
+    /// another pod without resolving the IP by hand.
+    pub async fn connect<A: ToSocketAddrs>(addr: A, shard: u32, cursor: u64) -> io::Result<Self> {
         let mut sock = TcpStream::connect(addr).await?;
         configure_stream(&sock)?;
         let req = serde_json::to_vec(&SubscribeReq { shard, cursor }).map_err(io_err)?;
