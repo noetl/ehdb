@@ -407,12 +407,55 @@ where
     D::Record: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
     loop {
-        let (mut sock, _peer) = listener.accept().await?;
-        configure_stream(&sock)?;
-        let req_bytes = read_frame(&mut sock).await?;
-        let req: SubscribeReq = serde_json::from_slice(&req_bytes).map_err(io_err)?;
-        let (engine, rx) = writer.subscriber_handle();
+        // noetl/ehdb#311 — every per-connection failure below used to `?` out of
+        // this loop, which drops the listener and kills the face for the rest of
+        // the process.  One malformed connection was enough:
+        //
+        //     $ printf 'GET / HTTP/1.1\r\n\r\n' | nc 127.0.0.1 9108
+        //     $ netstat -tln | grep -c ':9108'
+        //     0
+        //
+        // with no panic, no restart and no log line.  A port scan, an HTTP probe
+        // aimed at the wrong port, a load balancer's TCP check, or a client that
+        // dies mid-handshake all do it — including any Kubernetes `tcpSocket`
+        // probe, which is why the operational rule for this cluster has been
+        // "never bare-connect :9104/:9107/:9108".
+        //
+        // The handshake now happens INSIDE the spawned task, so a bad client can
+        // only ever kill its own connection.
+        let (sock, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            // An accept error is per-connection far more often than it is fatal
+            // (ECONNABORTED when the peer goes away between SYN and accept,
+            // EMFILE under fd pressure).  Killing the face for either is exactly
+            // the overreaction this issue is about.
+            Err(e) => {
+                tracing::warn!(error = %e, "feed: accept failed; face stays up");
+                continue;
+            }
+        };
+        let writer = Arc::clone(&writer);
         tokio::spawn(async move {
+            let mut sock = sock;
+            if let Err(e) = configure_stream(&sock) {
+                tracing::warn!(error = %e, "feed: rejecting connection (socket setup)");
+                return;
+            }
+            let req_bytes = match read_frame(&mut sock).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "feed: rejecting connection (bad handshake frame)");
+                    return;
+                }
+            };
+            let req: SubscribeReq = match serde_json::from_slice(&req_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "feed: rejecting connection (malformed SubscribeReq)");
+                    return;
+                }
+            };
+            let (engine, rx) = writer.subscriber_handle();
             let _ = push_loop::<D>(engine, rx, sock, req).await;
         });
     }
