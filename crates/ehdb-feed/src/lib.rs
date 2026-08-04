@@ -40,11 +40,11 @@ pub use claim::{
 };
 pub use cursor::{CursorFallback, CursorOrigin, CursorStore, ResumeReport};
 pub use group::{Delivery, MemberId, ShardConsumerGroup, SubjectConsumerGroup};
-pub use kv::{serve_kv, KvClient, KvCoordinator};
 pub use groups::{
     event_feed_subject, serve_group_claims, GroupClaimClient, GroupClaimed, GroupCoordinator,
     EVENT_SUBJECT_ROOT, UNKNOWN_EVENT_TYPE,
 };
+pub use kv::{serve_kv, KvClient, KvCoordinator};
 pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
 pub use scaler::{
     bind_and_serve_snapshot_with_resume, render_prometheus, render_resume, render_snapshot,
@@ -53,6 +53,7 @@ pub use scaler::{
 pub use subject::{Subject, SubjectFilter, SubjectFn};
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,10 +70,49 @@ use tokio::sync::watch;
 pub struct SubscribeReq {
     pub shard: u32,
     pub cursor: u64,
+    /// Opt this subscription into liveness heartbeats: while the feed is caught
+    /// up and the push loop is parked, the writer sends a heartbeat frame every
+    /// `heartbeat_ms` (noetl/ai-meta#225).
+    ///
+    /// `#[serde(default)]` so a pre-#225 client's `{shard, cursor}` frame still
+    /// decodes — that client gets no heartbeats, exactly as before.
+    #[serde(default)]
+    pub heartbeat_ms: Option<u64>,
 }
 
 pub(crate) fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+/// How often a parked read proves the peer is still alive to a client that asked
+/// for heartbeats (noetl/ai-meta#208 for the command claim face, #225 for the
+/// events group-claim and WAL fan-out faces).
+pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// How many consecutive heartbeats a client waits for before it calls the
+/// connection dead and redials. Three gives a ~15 s detection window with the
+/// default interval — slack enough that a busy peer is never mistaken for a dead
+/// one, short enough that consumption resumes in seconds.
+pub const HEARTBEAT_MISS_FACTOR: u32 = 3;
+
+/// The heartbeat frame a parked face sends. A distinct frame rather than a
+/// variant of any response type, so every response stays byte-identical on the
+/// wire and a client that never asks for heartbeats — and so never receives one
+/// — is unaffected.
+pub(crate) const HEARTBEAT_FRAME: &[u8] = b"{\"heartbeat\":true}";
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct HeartbeatFrame {
+    heartbeat: bool,
+}
+
+/// Is this frame a liveness heartbeat rather than a payload? Unambiguous: no
+/// response type in this crate carries a `heartbeat` field, so a real response
+/// fails to decode here.
+pub(crate) fn is_heartbeat(body: &[u8]) -> bool {
+    serde_json::from_slice::<HeartbeatFrame>(body)
+        .map(|h| h.heartbeat)
+        .unwrap_or(false)
 }
 
 /// How long a connection may sit idle before the kernel starts probing the peer.
@@ -156,6 +196,27 @@ pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result
 pub struct FeedWriter<D: Dataset> {
     engine: Arc<Mutex<L0Engine<D>>>,
     tip_tx: watch::Sender<u64>,
+    /// Set by [`seal_and_close`](FeedWriter::seal_and_close): the log has been
+    /// sealed for shutdown and no further append may be *acked*.
+    ///
+    /// This is the non-blocking half of the shutdown seal (noetl/ai-meta#226).
+    /// The worker used to enforce "nothing appends after the seal" by leaking
+    /// the engine's `MutexGuard` (`std::mem::forget`) and holding it through
+    /// process exit. That does stop appends — by parking every appender on a
+    /// mutex that is never released. Every append path in this crate runs
+    /// **inside an async task** and takes this `std::sync::Mutex` *blocking*
+    /// (`serve_ingest`'s committer, the claim/WAL readers), so each parked
+    /// appender burns a whole tokio worker thread. With a backlog in flight at
+    /// SIGTERM there are more parked appenders than worker threads, the runtime
+    /// is starved, and the shutdown future that was supposed to go on and seal
+    /// the *second* host is never polled again — not even its timeout fires.
+    ///
+    /// A flag costs nothing on the hot path (one relaxed-ordering load per
+    /// batch, not per record) and fails the post-seal appender **loudly and
+    /// immediately** instead of hanging it, which is also the better contract:
+    /// the publisher gets an error and retries against the replacement writer
+    /// rather than blocking until its own timeout.
+    closed: Arc<AtomicBool>,
 }
 
 impl<D> FeedWriter<D>
@@ -179,7 +240,52 @@ where
         Self {
             engine: Arc::new(Mutex::new(engine)),
             tip_tx,
+            closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Seal the active part for shutdown, wait for its upload, and **close the
+    /// writer to further appends** — without holding the engine lock afterwards
+    /// (noetl/ai-meta#226).
+    ///
+    /// After this returns, every [`append`](Self::append) /
+    /// [`append_batch`](Self::append_batch) fails with `feed writer sealed`
+    /// rather than landing in a fresh active part that the next incarnation
+    /// would never see (an acked-then-lost record — the hole the seal exists to
+    /// close).
+    ///
+    /// # Ordering
+    ///
+    /// The flag is set **before** the lock is taken and re-checked **under** it
+    /// by the append paths, which makes the three cases exhaustive:
+    ///
+    /// - An appender already holding the lock finishes and is acked. Its record
+    ///   is in the part this call then seals — correct.
+    /// - An appender already blocked *on* the lock wakes after the seal
+    ///   releases it, sees `closed`, and errors without appending. Its
+    ///   publisher retries. Correct, and it waited only for the flush, not
+    ///   forever.
+    /// - An appender arriving after the flag is set never touches the mutex at
+    ///   all. Correct, and it costs no thread.
+    ///
+    /// Idempotent: a second call re-flushes (a no-op with nothing pending) and
+    /// leaves the writer closed.
+    pub fn seal_and_close(&self) -> io::Result<()> {
+        // Set first: an appender that has not yet reached the lock now fails
+        // fast instead of queueing behind the flush below.
+        self.closed.store(true, Ordering::SeqCst);
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| io_err("L0 engine mutex poisoned before the shutdown seal"))?;
+        engine.flush_and_wait_uploads().map_err(io_err)
+        // Lock released here — deliberately. `closed` is what holds the line
+        // from this point on, and it does so without owning a thread.
+    }
+
+    /// Has this writer been sealed for shutdown ([`seal_and_close`](Self::seal_and_close))?
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Append one record to the durable log and wake followers. Returns the
@@ -196,8 +302,14 @@ where
     /// never skips an ingested record. The command's identity stays in its
     /// payload; the returned key is the ack token followers commit against.
     pub fn append(&self, record: D::Record) -> io::Result<u64> {
+        // Cheap pre-check: a sealed writer never even contends for the lock.
+        self.ensure_open()?;
         let (seq, handles) = {
             let mut engine = self.engine.lock().unwrap();
+            // Re-check under the lock: the seal may have completed while this
+            // appender was blocked on it. Without this the pre-check is a plain
+            // TOCTOU and a record could still be acked into a post-seal part.
+            self.ensure_open()?;
             let seq = engine.append_writer_assigned(record).map_err(io_err)?;
             (seq, engine.take_sync_handles().map_err(io_err)?)
         };
@@ -231,8 +343,13 @@ where
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        // Cheap pre-check: a sealed writer never even contends for the lock.
+        self.ensure_open()?;
         let (seqs, handles) = {
             let mut engine = self.engine.lock().unwrap();
+            // Re-check under the lock — see `append` for why the pre-check
+            // alone is not enough.
+            self.ensure_open()?;
             let mut seqs = Vec::with_capacity(records.len());
             for record in records {
                 seqs.push(engine.append_writer_assigned(record).map_err(io_err)?);
@@ -244,6 +361,19 @@ where
             let _ = self.tip_tx.send(*tip);
         }
         Ok(seqs)
+    }
+
+    /// `Err` once the writer has been sealed for shutdown. The error is
+    /// deliberately an ordinary `io::Error`: every publish path in this crate
+    /// and its callers already treats one as "drop the connection and redial",
+    /// which is the correct response to "this writer is going away".
+    fn ensure_open(&self) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(io_err(
+                "feed writer sealed for shutdown — republish to the replacement writer",
+            ));
+        }
+        Ok(())
     }
 
     /// A shared handle to the underlying engine — for flush / inspection in
@@ -299,6 +429,18 @@ where
     D::Record: Serialize + DeserializeOwned + Clone,
 {
     let mut feed = ChangeFeed::new(req.shard, req.cursor);
+    // noetl/ai-meta#225: a subscriber that asked for heartbeats gets one up
+    // front, so it learns *immediately* that this writer heartbeats and can arm
+    // its read deadline for the whole connection — rather than only after the
+    // feed happens to go quiet for a beat. A subscriber that did not ask (a
+    // pre-#225 client) is served exactly as before.
+    let beat = req
+        .heartbeat_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis);
+    if beat.is_some() {
+        write_frame(&mut sock, HEARTBEAT_FRAME).await?;
+    }
     loop {
         let batch = {
             let engine = engine.lock().unwrap();
@@ -313,8 +455,24 @@ where
         // Caught up — park until the next append advances the tip. A race (append
         // between poll and here) already bumped the watch version, so this
         // returns immediately rather than sleeping through it.
-        if rx.changed().await.is_err() {
-            return Ok(()); // the writer was dropped
+        match beat {
+            None => {
+                if rx.changed().await.is_err() {
+                    return Ok(()); // the writer was dropped
+                }
+            }
+            Some(beat) => {
+                // A heartbeat only *pauses* the park, it never abandons it: the
+                // `watch` receiver keeps its version across the timeout, so no
+                // append can be missed by a heartbeat tick.
+                loop {
+                    match tokio::time::timeout(beat, rx.changed()).await {
+                        Ok(Ok(())) => break,
+                        Ok(Err(_)) => return Ok(()), // the writer was dropped
+                        Err(_) => write_frame(&mut sock, HEARTBEAT_FRAME).await?,
+                    }
+                }
+            }
         }
     }
 }
@@ -322,6 +480,13 @@ where
 /// A subscriber connection to a [`FeedWriter`]'s shard feed.
 pub struct FeedSubscription {
     sock: TcpStream,
+    /// How long a parked read may go quiet before the peer is declared dead.
+    /// Cleared once a peer proves it does not heartbeat, so an older writer
+    /// never triggers a redial loop on a genuinely idle feed.
+    read_deadline: Option<Duration>,
+    /// Has this connection ever seen a heartbeat? Only then is a missed one
+    /// evidence of a dead peer.
+    peer_heartbeats: bool,
 }
 
 impl FeedSubscription {
@@ -335,16 +500,77 @@ impl FeedSubscription {
     /// previous `SocketAddr`-only signature made this subscription unusable from
     /// another pod without resolving the IP by hand.
     pub async fn connect<A: ToSocketAddrs>(addr: A, shard: u32, cursor: u64) -> io::Result<Self> {
+        Self::connect_with_heartbeat(addr, shard, cursor, Some(DEFAULT_HEARTBEAT)).await
+    }
+
+    /// [`connect`](Self::connect) with an explicit heartbeat interval — `None`
+    /// opts out of heartbeats entirely (keepalive still applies), which is only
+    /// wanted in tests that assert the pre-#225 wire shape.
+    pub async fn connect_with_heartbeat<A: ToSocketAddrs>(
+        addr: A,
+        shard: u32,
+        cursor: u64,
+        heartbeat: Option<Duration>,
+    ) -> io::Result<Self> {
         let mut sock = TcpStream::connect(addr).await?;
         configure_stream(&sock)?;
-        let req = serde_json::to_vec(&SubscribeReq { shard, cursor }).map_err(io_err)?;
+        let req = serde_json::to_vec(&SubscribeReq {
+            shard,
+            cursor,
+            heartbeat_ms: heartbeat.map(|hb| hb.as_millis() as u64),
+        })
+        .map_err(io_err)?;
         write_frame(&mut sock, &req).await?;
-        Ok(Self { sock })
+        Ok(Self {
+            sock,
+            read_deadline: heartbeat.map(|hb| hb * HEARTBEAT_MISS_FACTOR),
+            peer_heartbeats: false,
+        })
     }
 
     /// Receive the next delivered batch (one or more records in sort-key order).
+    ///
+    /// Parking here is unbounded by design — the feed may legitimately be idle
+    /// for hours. What is *not* unbounded is waiting on a **dead** writer: while
+    /// parked this consumes the writer's heartbeat frames, and once the peer has
+    /// proven it heartbeats, [`HEARTBEAT_MISS_FACTOR`] missed beats return an
+    /// error so the caller resubscribes (noetl/ai-meta#225). A writer that never
+    /// heartbeats (a pre-#225 build) disarms the deadline on the first miss and
+    /// liveness falls back to TCP keepalive alone.
     pub async fn recv_batch<R: DeserializeOwned>(&mut self) -> io::Result<Vec<R>> {
-        let body = read_frame(&mut self.sock).await?;
-        serde_json::from_slice(&body).map_err(io_err)
+        loop {
+            let body = match self.read_deadline {
+                None => read_frame(&mut self.sock).await?,
+                Some(deadline) => {
+                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                        Ok(body) => body?,
+                        Err(_) if self.peer_heartbeats => {
+                            return Err(io_err(format!(
+                                "events-feed writer stopped heartbeating for {}ms",
+                                deadline.as_millis()
+                            )));
+                        }
+                        Err(_) => {
+                            // Never heartbeated: treat the peer as heartbeat-unaware
+                            // rather than dead, and let keepalive own liveness.
+                            self.read_deadline = None;
+                            continue;
+                        }
+                    }
+                }
+            };
+            if is_heartbeat(&body) {
+                self.peer_heartbeats = true;
+                continue;
+            }
+            return serde_json::from_slice(&body).map_err(io_err);
+        }
+    }
+
+    /// Has the writer on this connection proven it sends heartbeats? Used by
+    /// tests (and useful in diagnostics) to distinguish keepalive-only liveness
+    /// from heartbeat-backed liveness.
+    pub fn peer_heartbeats(&self) -> bool {
+        self.peer_heartbeats
     }
 }

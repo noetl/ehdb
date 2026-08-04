@@ -388,6 +388,16 @@ where
     /// ack path: a group that goes idle mid-batch has already had its cursor
     /// stored on its last ack, so this mainly bounds the loss window for a group
     /// whose final ack raced a shutdown.
+    /// The writer this coordinator serves from.
+    ///
+    /// The events host hands back only the coordinator, so without this its
+    /// caller cannot reach the log to append to it or to seal it — which makes
+    /// the two-host shutdown path untestable from outside the crate, and that
+    /// path is exactly where noetl/ai-meta#226 lost records.
+    pub fn writer(&self) -> Arc<FeedWriter<D>> {
+        Arc::clone(&self.writer)
+    }
+
     pub async fn checkpoint(&self) -> io::Result<()> {
         let groups = {
             let g = self.groups.lock().await;
@@ -425,6 +435,15 @@ enum GroupClaimReq {
         group: String,
         member: MemberId,
         filter: String,
+        /// `heartbeat_ms` opts this connection into liveness heartbeats: while
+        /// the claim is parked, the coordinator sends a heartbeat frame every
+        /// `heartbeat_ms` so the client can tell an idle feed from a dead writer
+        /// (noetl/ai-meta#225 — the events-face twin of #208's command face).
+        ///
+        /// `#[serde(default)]` so a pre-#225 client's frame still decodes; it
+        /// means no heartbeats, so the wire shape for that client is unchanged.
+        #[serde(default)]
+        heartbeat_ms: Option<u64>,
     },
     /// Ack a claimed record in `group`.
     Ack { group: String, sort_key: u64 },
@@ -442,6 +461,19 @@ struct GroupClaimResp<R> {
 
 /// Accept named-group claim connections on `listener`, served from the shared
 /// `coordinator`. Runs until the listener errors; spawn it as a task.
+///
+/// Accepted sockets get keepalive ([`crate::configure_stream`]) so a consumer
+/// whose pod vanished stops holding a connection, and a `Next` that asked for
+/// heartbeats gets one every `heartbeat_ms` while it parks — the liveness half
+/// of noetl/ai-meta#225.
+///
+/// Before that this face set `TCP_NODELAY` and nothing else, which is precisely
+/// how the events consumers wedged in prod: a writer restart left the client's
+/// socket half-open (ESTABLISHED client-side, unknown to the replacement
+/// writer), the parked `claim_next` read neither yielded nor errored, and every
+/// redial path downstream was unreachable because there was no `Err` to trigger
+/// it. `noetl.event` — the sole durable event log — took no writes for 3h24m
+/// with every health signal green.
 pub async fn serve_group_claims<D>(
     listener: TcpListener,
     coordinator: Arc<GroupCoordinator<D>>,
@@ -452,9 +484,15 @@ where
 {
     loop {
         let (mut sock, _peer) = listener.accept().await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
+            // One heartbeat up front on the first heartbeat-requesting claim of a
+            // connection, so the client learns immediately that this coordinator
+            // heartbeats and can arm its read deadline for the whole connection
+            // — rather than only after its first claim happens to park long
+            // enough. Once per connection, so the per-claim path pays nothing.
+            let mut liveness_announced = false;
             loop {
                 let body = match read_frame(&mut sock).await {
                     Ok(b) => b,
@@ -469,8 +507,42 @@ where
                         group,
                         member,
                         filter,
+                        heartbeat_ms,
                     } => {
-                        let delivery = coordinator.claim_next(&group, &filter, member).await;
+                        let claim = coordinator.claim_next(&group, &filter, member);
+                        let delivery = match heartbeat_ms.filter(|ms| *ms > 0) {
+                            None => claim.await,
+                            Some(ms) => {
+                                if !liveness_announced {
+                                    if write_frame(&mut sock, crate::HEARTBEAT_FRAME)
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    liveness_announced = true;
+                                }
+                                let beat = Duration::from_millis(ms);
+                                // `&mut claim` inside the timeout: a heartbeat
+                                // only *pauses* polling the claim, it never
+                                // drops it, so no assignment can be lost to a
+                                // heartbeat tick.
+                                tokio::pin!(claim);
+                                loop {
+                                    match tokio::time::timeout(beat, &mut claim).await {
+                                        Ok(delivery) => break delivery,
+                                        Err(_) => {
+                                            if write_frame(&mut sock, crate::HEARTBEAT_FRAME)
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
                         let resp = GroupClaimResp {
                             sort_key: delivery.sort_key,
                             redelivered: delivery.redelivered,
@@ -517,6 +589,16 @@ pub struct GroupClaimClient {
     group: String,
     member: MemberId,
     filter: String,
+    /// The heartbeat interval this client asked the coordinator for (`None` =
+    /// opted out; the pre-#225 wire behaviour).
+    heartbeat: Option<Duration>,
+    /// How long a parked read may go quiet before the peer is declared dead.
+    /// Cleared once a peer proves it does not heartbeat, so an older coordinator
+    /// never triggers a redial loop on a genuinely idle feed.
+    read_deadline: Option<Duration>,
+    /// Has this connection ever seen a heartbeat? Only then is a missed one
+    /// evidence of a dead peer.
+    peer_heartbeats: bool,
 }
 
 impl GroupClaimClient {
@@ -526,19 +608,40 @@ impl GroupClaimClient {
     /// `addr` accepts a `host:port` DNS name, resolved at connect time, so a
     /// Kubernetes service name works directly and pod-IP changes are followed on
     /// reconnect.
+    /// The socket carries keepalive and the claim asks for
+    /// [`DEFAULT_HEARTBEAT`](crate::DEFAULT_HEARTBEAT) liveness heartbeats, so a
+    /// writer restart surfaces as a read error instead of an indefinite park
+    /// (noetl/ai-meta#225).
     pub async fn connect<A: ToSocketAddrs>(
         addr: A,
         group: impl Into<String>,
         member: MemberId,
         filter: impl Into<String>,
     ) -> io::Result<Self> {
+        Self::connect_with_heartbeat(addr, group, member, filter, Some(crate::DEFAULT_HEARTBEAT))
+            .await
+    }
+
+    /// [`connect`](Self::connect) with an explicit heartbeat interval — `None`
+    /// opts out of heartbeats entirely (keepalive still applies), which is only
+    /// wanted in tests that assert the pre-#225 wire shape.
+    pub async fn connect_with_heartbeat<A: ToSocketAddrs>(
+        addr: A,
+        group: impl Into<String>,
+        member: MemberId,
+        filter: impl Into<String>,
+        heartbeat: Option<Duration>,
+    ) -> io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
-        sock.set_nodelay(true)?;
+        crate::configure_stream(&sock)?;
         Ok(Self {
             sock,
             group: group.into(),
             member,
             filter: filter.into(),
+            heartbeat,
+            read_deadline: heartbeat.map(|hb| hb * crate::HEARTBEAT_MISS_FACTOR),
+            peer_heartbeats: false,
         })
     }
 
@@ -548,21 +651,63 @@ impl GroupClaimClient {
     }
 
     /// Claim the next record (blocks until one matching the filter is assigned).
+    ///
+    /// Parking here is unbounded by design — the events feed may legitimately be
+    /// idle for hours. What is *not* unbounded is waiting on a **dead**
+    /// coordinator: while parked this consumes the coordinator's heartbeat
+    /// frames, and once the peer has proven it heartbeats,
+    /// [`HEARTBEAT_MISS_FACTOR`](crate::HEARTBEAT_MISS_FACTOR) missed beats
+    /// return an error so the caller redials (noetl/ai-meta#225). A coordinator
+    /// that never heartbeats (a pre-#225 writer) disarms the deadline on the
+    /// first miss and liveness falls back to TCP keepalive alone.
     pub async fn claim_next<R: DeserializeOwned>(&mut self) -> io::Result<GroupClaimed<R>> {
         let req = serde_json::to_vec(&GroupClaimReq::Next {
             group: self.group.clone(),
             member: self.member,
             filter: self.filter.clone(),
+            heartbeat_ms: self.heartbeat.map(|hb| hb.as_millis() as u64),
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
-        let body = read_frame(&mut self.sock).await?;
-        let resp: GroupClaimResp<R> = serde_json::from_slice(&body).map_err(io_err)?;
-        Ok(GroupClaimed {
-            sort_key: resp.sort_key,
-            redelivered: resp.redelivered,
-            record: resp.record,
-        })
+        loop {
+            let body = match self.read_deadline {
+                None => read_frame(&mut self.sock).await?,
+                Some(deadline) => {
+                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                        Ok(body) => body?,
+                        Err(_) if self.peer_heartbeats => {
+                            return Err(io_err(format!(
+                                "events-feed group coordinator stopped heartbeating for {}ms",
+                                deadline.as_millis()
+                            )));
+                        }
+                        Err(_) => {
+                            // Never heartbeated: treat the peer as heartbeat-unaware
+                            // rather than dead, and let keepalive own liveness.
+                            self.read_deadline = None;
+                            continue;
+                        }
+                    }
+                }
+            };
+            if crate::is_heartbeat(&body) {
+                self.peer_heartbeats = true;
+                continue;
+            }
+            let resp: GroupClaimResp<R> = serde_json::from_slice(&body).map_err(io_err)?;
+            return Ok(GroupClaimed {
+                sort_key: resp.sort_key,
+                redelivered: resp.redelivered,
+                record: resp.record,
+            });
+        }
+    }
+
+    /// Has the coordinator on this connection proven it sends heartbeats? Used by
+    /// tests (and useful in diagnostics) to distinguish keepalive-only liveness
+    /// from heartbeat-backed liveness.
+    pub fn peer_heartbeats(&self) -> bool {
+        self.peer_heartbeats
     }
 
     /// Ack a claimed record by its sort key.
