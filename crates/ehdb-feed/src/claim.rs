@@ -88,34 +88,12 @@ pub fn d1_command_subject(shard_count: u32) -> SubjectFn<EventRecord> {
 /// `ack_wait` redelivery surfaces even with no new appends.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 
-/// How often a parked `claim_next` proves the coordinator is still alive to a
-/// client that asked for heartbeats (noetl/ai-meta#208).
-pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(5);
-
-/// How many consecutive heartbeats a client waits for before it calls the
-/// connection dead and redials. Three gives a ~15 s detection window with the
-/// default interval — slack enough that a busy coordinator is never mistaken for a
-/// dead one, short enough that dispatch resumes in seconds.
-pub const HEARTBEAT_MISS_FACTOR: u32 = 3;
-
-/// The heartbeat frame the coordinator sends on a parked claim. A distinct frame
-/// rather than a variant of [`ClaimResp`], so the claim response stays
-/// byte-identical on the wire and a pre-#208 client — which never asks for
-/// heartbeats and so never receives one — is unaffected.
-const HEARTBEAT_FRAME: &[u8] = b"{\"heartbeat\":true}";
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct HeartbeatFrame {
-    heartbeat: bool,
-}
-
-/// Is this frame a coordinator heartbeat rather than a claim? Unambiguous: a
-/// [`ClaimResp`] frame has no `heartbeat` field, so it fails to decode here.
-fn is_heartbeat(body: &[u8]) -> bool {
-    serde_json::from_slice::<HeartbeatFrame>(body)
-        .map(|h| h.heartbeat)
-        .unwrap_or(false)
-}
+// The heartbeat primitives moved to the crate root in noetl/ai-meta#225, when
+// the events group-claim (:9104) and WAL fan-out (:9108) faces adopted the same
+// mechanism this face got in #208. Re-exported here so `claim::DEFAULT_HEARTBEAT`
+// and `claim::HEARTBEAT_MISS_FACTOR` keep resolving for existing callers.
+use crate::{is_heartbeat, HEARTBEAT_FRAME};
+pub use crate::{DEFAULT_HEARTBEAT, HEARTBEAT_MISS_FACTOR};
 
 /// The shared per-shard claim coordinator: one [`ShardConsumerGroup`] behind an
 /// async mutex, over the co-located writer's engine. Every worker replica claims
