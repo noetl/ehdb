@@ -502,6 +502,29 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_records,
                 self.config.flush,
             )?;
+            // noetl/ai-meta#209 defect 2 — a writer that just recovered an
+            // active part left by a crash holds records the manifest does not
+            // know about, because the manifest lists sealed parts only. The
+            // engine's `global_sequence` came from that manifest, so it is
+            // *behind* the recovered tail; lift both it and the shard tail above
+            // the recovered records before anything is appended.
+            //
+            // Skipping this would let the next `append_writer_assigned` mint a
+            // key at or below the recovered tail. That append lands behind every
+            // follower cursor and is never delivered — the silent-drop class of
+            // noetl/ai-meta#203 — so recovery without this would trade a crash
+            // loss for a quieter one.
+            if let Some(recovered_tip) = writer.max_sequence() {
+                if recovered_tip > self.global_sequence {
+                    self.global_sequence = recovered_tip;
+                }
+                let tail = self.shard_tail_max.entry(shard).or_insert(recovered_tip);
+                if recovered_tip > *tail {
+                    *tail = recovered_tip;
+                }
+                self.metrics
+                    .add_recovered_active_records(writer.pending_records().len() as u64);
+            }
             self.writers.insert(shard, writer);
         }
         Ok(())

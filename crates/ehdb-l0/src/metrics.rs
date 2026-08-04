@@ -29,6 +29,17 @@ pub struct L0Metrics {
     /// [`append_record`]: crate::engine::L0Engine::append_record
     /// [`append_writer_assigned`]: crate::engine::L0Engine::append_writer_assigned
     pub out_of_order_appends: AtomicU64,
+    /// Records recovered by replaying an unsealed active part left behind by a
+    /// crash (noetl/ai-meta#209 defect 2). These were `fsync`ed and acked to a
+    /// publisher but sat outside the durable manifest, which lists sealed parts
+    /// only — before recovery existed they were destroyed on the next open.
+    ///
+    /// A non-zero value means the process did **not** exit cleanly: a clean
+    /// shutdown seals, so there is no active part left to replay. Treat a rising
+    /// count as a report of hard kills (SIGKILL / OOM / node loss), not as an
+    /// error in itself — the records were saved, and the number is how many
+    /// would previously have been lost.
+    pub recovered_active_records: AtomicU64,
     /// Parts sealed (active → immutable).
     pub seals: AtomicU64,
     /// Parts durably uploaded to the object store.
@@ -83,6 +94,11 @@ impl L0Metrics {
     pub(crate) fn incr_out_of_order_appends(&self) {
         self.out_of_order_appends.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn add_recovered_active_records(&self, n: u64) {
+        self.recovered_active_records
+            .fetch_add(n, Ordering::Relaxed);
+    }
     pub(crate) fn incr_seals(&self) {
         self.seals.fetch_add(1, Ordering::Relaxed);
     }
@@ -126,6 +142,7 @@ impl L0Metrics {
         L0MetricsSnapshot {
             appends: self.appends.load(Ordering::Relaxed),
             out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
+            recovered_active_records: self.recovered_active_records.load(Ordering::Relaxed),
             seals: self.seals.load(Ordering::Relaxed),
             uploads: self.uploads.load(Ordering::Relaxed),
             upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
@@ -152,6 +169,7 @@ impl L0Metrics {
 pub struct L0MetricsSnapshot {
     pub appends: u64,
     pub out_of_order_appends: u64,
+    pub recovered_active_records: u64,
     pub seals: u64,
     pub uploads: u64,
     pub upload_bytes: u64,
