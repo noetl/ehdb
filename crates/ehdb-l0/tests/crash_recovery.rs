@@ -56,7 +56,8 @@ fn unsealed_records_survive_an_engine_reopen() {
 
     {
         let mut engine =
-            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(&[obj.clone()])).unwrap();
+            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(std::slice::from_ref(&obj)))
+                .unwrap();
         for seq in 1..=5 {
             engine.append_record(rec(seq, "exec-a")).unwrap();
         }
@@ -97,7 +98,8 @@ fn a_post_recovery_append_does_not_land_behind_the_recovered_tail() {
 
     {
         let mut engine =
-            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(&[obj.clone()])).unwrap();
+            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(std::slice::from_ref(&obj)))
+                .unwrap();
         for seq in 1..=4 {
             engine.append_record(rec(seq, "exec-a")).unwrap();
         }
@@ -131,7 +133,8 @@ fn a_sealed_engine_recovers_nothing_on_reopen() {
 
     {
         let mut engine =
-            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(&[obj.clone()])).unwrap();
+            L0Engine::<D1EventLog>::open_replicated(cfg(), targets(std::slice::from_ref(&obj)))
+                .unwrap();
         for seq in 1..=3 {
             engine.append_record(rec(seq, "exec-a")).unwrap();
         }
