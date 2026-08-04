@@ -176,6 +176,28 @@ impl KvCoordinator {
         Ok(n)
     }
 
+    /// Seal the KV store's active parts and wait for their uploads —
+    /// the shutdown seam (noetl/ai-meta#209).
+    ///
+    /// Without this the coordinator kept its `KvStore` private with no way to
+    /// flush it, so a host could seal its feed writers on SIGTERM and still
+    /// leave the KV face unsealed. Everything written to the active part since
+    /// the last seal — sessions, request state — sat outside the durable
+    /// manifest.
+    ///
+    /// Since the L0 active-part recovery in the same issue, an unsealed KV part
+    /// is *replayed* on the next open rather than destroyed, so this is no
+    /// longer the difference between "kept" and "lost". It is still the
+    /// difference between "durable in the object store, recoverable by any
+    /// replica" and "local-only on a volume that may not come back", which is
+    /// the guarantee a graceful shutdown is supposed to provide.
+    ///
+    /// Terminal path only: like every seal, do not call this on a coordinator
+    /// that intends to keep serving.
+    pub async fn flush_and_wait(&self) -> io::Result<()> {
+        self.store.lock().await.flush_and_wait().map_err(io_err)
+    }
+
     /// Spawn a periodic sweep over `buckets`.
     pub fn spawn_sweeper(self: Arc<Self>, buckets: Vec<String>, every: Duration) {
         tokio::spawn(async move {
@@ -434,6 +456,33 @@ mod tests {
         let substrate = Arc::new(LocalFsSubstrate::new(&dir).unwrap());
         let store = KvStore::open(KvStore::config(&dir), substrate).unwrap();
         Arc::new(KvCoordinator::new(store))
+    }
+
+    /// noetl/ai-meta#209 — the shutdown seam the worker could not reach.
+    ///
+    /// `KvCoordinator` owned its `KvStore` privately with no flush, so a host
+    /// sealing its feed writers on SIGTERM still left the KV face unsealed.
+    /// Sealing must be callable, must be safe with nothing pending, and must
+    /// leave already-written entries readable afterwards.
+    #[tokio::test]
+    async fn flush_and_wait_seals_without_losing_entries() {
+        let c = coordinator("seal");
+        // Safe on an empty store — a host seals unconditionally on shutdown.
+        c.flush_and_wait().await.unwrap();
+
+        c.put("sessions", "a", "token-1".into(), 0).await.unwrap();
+        c.put("requests", "r", "state-1".into(), 0).await.unwrap();
+        c.flush_and_wait().await.unwrap();
+
+        assert_eq!(
+            c.get("sessions", "a").await.unwrap(),
+            Some("token-1".into()),
+            "sealing must not lose what it made durable"
+        );
+        assert_eq!(
+            c.get("requests", "r").await.unwrap(),
+            Some("state-1".into())
+        );
     }
 
     #[tokio::test]
