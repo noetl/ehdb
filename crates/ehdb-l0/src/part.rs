@@ -27,7 +27,7 @@ use ehdb_core::{EhdbError, Result};
 use crate::bloom::Bloom;
 use crate::catalog::{GranuleMark, PartMeta, SparseIndex};
 use crate::dataset::Dataset;
-use crate::frame::encode_frame;
+use crate::frame::{encode_frame, iter_frames_from};
 
 /// Durability-window posture (RFC §2.3). D1's event log uses [`Self::EveryAppend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,13 +134,6 @@ impl<D: Dataset> PartWriter<D> {
         self.active_path = self
             .part_dir
             .join(format!("part-{:06}.active", self.next_local_id));
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.active_path)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
-        self.file = Some(file);
         self.records.clear();
         self.marks.clear();
         self.min_sequence = 0;
@@ -148,7 +141,111 @@ impl<D: Dataset> PartWriter<D> {
         self.byte_len = 0;
         self.record_count = 0;
         self.unflushed_since_fsync = 0;
+
+        // noetl/ai-meta#209 defect 2 — recover, do not truncate.
+        //
+        // This used to open with `.truncate(true)`, which made a hard kill
+        // unrecoverable *by construction*: the engine resumes its catalog from
+        // the durable manifest, which only lists SEALED parts, so records in the
+        // active part were already invisible after a restart — and truncating
+        // then destroyed the one copy of them that existed. Up to
+        // `seal_max_records` (1024) records per shard, every one of them
+        // `fsync`ed and acked to a publisher, gone on SIGKILL / OOM / node loss.
+        // A durable ack a restart can lose is a contract violation, so the
+        // active part is now replayed instead.
+        //
+        // The frame codec already carries the recovery contract this needs
+        // (`iter_frames_from`, byte-identical to the #254 segment format): it
+        // stops at a torn tail — a half-written header or body at EOF, which is
+        // exactly what a crash mid-append leaves — and returns the intact
+        // prefix. Bit-rot (a *complete* frame with bad magic or a CRC mismatch)
+        // surfaces as an error and is never silently repaired.
+        let recovered = self.recover_active()?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true);
+        if recovered {
+            // Append, so the recovered prefix survives and the next append lands
+            // after it.
+            opts.append(true);
+        } else {
+            opts.truncate(true);
+        }
+        let file = opts
+            .open(&self.active_path)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        self.file = Some(file);
         Ok(())
+    }
+
+    /// Replay an active part left behind by a crash, rebuilding the in-memory
+    /// state an orderly open would have had. Returns whether anything was
+    /// recovered.
+    ///
+    /// The file is truncated to the end of the last intact frame. That is the
+    /// only mutation, and it is required: appending after a torn tail would
+    /// leave a permanently unparseable byte range in the middle of the part,
+    /// turning a recoverable crash into corruption on the *next* restart.
+    fn recover_active(&mut self) -> Result<bool> {
+        let bytes = match fs::read(&self.active_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(EhdbError::Storage(err.to_string())),
+        };
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        // Propagates on bit-rot — see `read_frame_at`.
+        let frames = iter_frames_from(&bytes, 0)?;
+        if frames.is_empty() {
+            // Nothing intact: the whole file is a torn tail (a crash between
+            // create and the first complete frame). Start clean.
+            return Ok(false);
+        }
+        let mut intact_len = 0u64;
+        for frame in &frames {
+            let record: D::Record = serde_json::from_slice(frame.body)
+                .map_err(|err| EhdbError::Storage(format!("decode recovered l0 record: {err}")))?;
+            let sort_key = D::sort_key(&record);
+            if self.record_count % self.granule_size as u64 == 0 {
+                self.marks.push(GranuleMark {
+                    first_sequence: sort_key,
+                    byte_offset: frame.offset,
+                    record_count: 0,
+                });
+            }
+            if self.record_count == 0 {
+                self.min_sequence = sort_key;
+            }
+            self.max_sequence = sort_key;
+            self.record_count += 1;
+            if let Some(last) = self.marks.last_mut() {
+                last.record_count += 1;
+            }
+            self.records.push(record);
+            intact_len = frame.offset + frame.frame_len;
+        }
+        self.byte_len = intact_len;
+        // Drop a torn tail so the part stays parseable from here on.
+        if intact_len < bytes.len() as u64 {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.active_path)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.set_len(intact_len)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            file.sync_all()
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+        Ok(true)
+    }
+
+    /// Highest sort key held in the active (unsealed) part, or `None` when it is
+    /// empty. The engine uses this after a recovering open to lift its global
+    /// sequence and shard tail above the recovered records — without it, the
+    /// next writer-assigned key could land at or below the recovered tail, which
+    /// is the silent-drop class of noetl/ai-meta#203.
+    pub fn max_sequence(&self) -> Option<u64> {
+        (self.record_count > 0).then_some(self.max_sequence)
     }
 
     /// Append one record to the active part (hot tier). Never touches the object
@@ -462,20 +559,213 @@ pub fn build_merged_part<D: Dataset>(
 mod tests {
     use super::*;
     use crate::dataset::{D1EventLog, EventRecord};
-    use crate::frame::iter_frames_from;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A directory no other test — and no *previous run* — can be using.
+    ///
+    /// The old version keyed on a per-process counter plus the thread id, which
+    /// repeat across test binaries and across runs. That was survivable only
+    /// while `open_active` truncated: leftovers were wiped on open. Now that an
+    /// existing active part is recovered, a reused directory makes a test read a
+    /// previous run's records and fail with an inflated count. Pid + a
+    /// monotonic-clock nanos reading makes the path unique per run.
     fn tmp() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         std::env::temp_dir().join(format!(
-            "ehdb-l0-part-{n}-{:?}",
+            "ehdb-l0-part-{}-{n}-{nanos}-{:?}",
+            std::process::id(),
             std::thread::current().id()
         ))
     }
 
     fn rec(seq: u64, exec: &str) -> EventRecord {
         EventRecord::new(seq, exec, format!("txn-{seq}"), format!("payload-{seq}"))
+    }
+
+    /// A writer for `part_dir` with the small-part settings the recovery tests
+    /// share, so each test differs only in what it does to the file.
+    fn writer(dir: &PathBuf) -> PartWriter<D1EventLog> {
+        PartWriter::<D1EventLog>::open(
+            "d1_event_log",
+            0,
+            dir,
+            2,
+            1 << 20,
+            1024,
+            FlushPolicy::EveryAppend,
+        )
+        .expect("open part writer")
+    }
+
+    /// noetl/ai-meta#209 defect 2 — the core contract: records `fsync`ed into an
+    /// unsealed active part survive a process that never got to seal.
+    ///
+    /// Before this fix `open_active` opened with `.truncate(true)`, so reopening
+    /// destroyed them — up to 1024 acked records per shard on any SIGKILL.
+    #[test]
+    fn unsealed_active_part_survives_a_crash() {
+        let dir = tmp();
+        {
+            let mut w = writer(&dir);
+            for seq in 1..=5 {
+                w.append(rec(seq, "exec-a")).unwrap();
+            }
+            // No seal, no clean close — drop is what a SIGKILL leaves behind.
+        }
+        let w = writer(&dir);
+        assert_eq!(
+            w.pending_records().len(),
+            5,
+            "all 5 acked records recovered"
+        );
+        assert_eq!(w.max_sequence(), Some(5));
+        assert_eq!(
+            w.pending_records()
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "recovered in order"
+        );
+    }
+
+    /// Recovery must leave the writer *appendable*, not merely readable: the
+    /// next append has to land after the recovered prefix, and a second crash
+    /// has to recover the union of both.
+    #[test]
+    fn appends_after_recovery_extend_the_recovered_part() {
+        let dir = tmp();
+        {
+            let mut w = writer(&dir);
+            w.append(rec(1, "exec-a")).unwrap();
+            w.append(rec(2, "exec-a")).unwrap();
+        }
+        {
+            let mut w = writer(&dir);
+            w.append(rec(3, "exec-a")).unwrap();
+        }
+        let w = writer(&dir);
+        assert_eq!(
+            w.pending_records()
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the post-recovery append survived the second crash too"
+        );
+    }
+
+    /// A crash mid-`write_all` leaves a partial frame at EOF. Recovery keeps the
+    /// intact prefix and drops the torn tail — the #254 contract the frame codec
+    /// already implements.
+    #[test]
+    fn torn_tail_is_dropped_and_the_prefix_is_kept() {
+        let dir = tmp();
+        let path = {
+            let mut w = writer(&dir);
+            for seq in 1..=3 {
+                w.append(rec(seq, "exec-a")).unwrap();
+            }
+            w.active_path().to_path_buf()
+        };
+        // Simulate the interrupted write: lop off part of the last frame.
+        let bytes = fs::read(&path).unwrap();
+        let torn = &bytes[..bytes.len() - 5];
+        fs::write(&path, torn).unwrap();
+
+        let mut w = writer(&dir);
+        assert_eq!(w.pending_records().len(), 2, "intact prefix kept");
+        assert_eq!(w.max_sequence(), Some(2));
+        // And the file was truncated to the intact boundary, so appending after
+        // recovery cannot bury an unparseable range mid-file.
+        w.append(rec(4, "exec-a")).unwrap();
+        let reread = writer(&dir);
+        assert_eq!(
+            reread
+                .pending_records()
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4],
+            "the part is still fully parseable after appending over a torn tail"
+        );
+    }
+
+    /// Bit-rot is not a torn tail. A *complete* frame whose CRC does not match
+    /// must surface as an error, never be silently dropped or repaired.
+    #[test]
+    fn bit_rot_in_a_complete_frame_is_an_error() {
+        let dir = tmp();
+        let path = {
+            let mut w = writer(&dir);
+            w.append(rec(1, "exec-a")).unwrap();
+            w.append(rec(2, "exec-a")).unwrap();
+            w.active_path().to_path_buf()
+        };
+        let mut bytes = fs::read(&path).unwrap();
+        // Corrupt a body byte of the FIRST frame, leaving its header intact.
+        let body_start = crate::frame::FRAME_HEADER_LEN;
+        bytes[body_start] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        let err = PartWriter::<D1EventLog>::open(
+            "d1_event_log",
+            0,
+            &dir,
+            2,
+            1 << 20,
+            1024,
+            FlushPolicy::EveryAppend,
+        )
+        .err()
+        .expect("corrupt frame must not open silently");
+        assert!(
+            format!("{err}").contains("CRC"),
+            "expected a CRC error, got: {err}"
+        );
+    }
+
+    /// An empty or absent active part is the ordinary first-open case and must
+    /// not be mistaken for recovery.
+    #[test]
+    fn absent_or_empty_active_part_opens_clean() {
+        let dir = tmp();
+        let w = writer(&dir);
+        assert_eq!(w.pending_records().len(), 0);
+        assert_eq!(w.max_sequence(), None);
+        let path = w.active_path().to_path_buf();
+        drop(w);
+        // A zero-byte file (crashed between create and first append).
+        fs::write(&path, b"").unwrap();
+        let w = writer(&dir);
+        assert_eq!(w.pending_records().len(), 0);
+        assert_eq!(w.max_sequence(), None);
+    }
+
+    /// A clean seal leaves nothing to recover — the recovery path must not
+    /// resurrect records that are already durable in a sealed part, which would
+    /// double them.
+    #[test]
+    fn a_sealed_part_leaves_nothing_to_recover() {
+        let dir = tmp();
+        {
+            let mut w = writer(&dir);
+            w.append(rec(1, "exec-a")).unwrap();
+            w.append(rec(2, "exec-a")).unwrap();
+            let sealed = w.seal().unwrap().expect("sealed");
+            assert_eq!(sealed.records.len(), 2);
+        }
+        let w = writer(&dir);
+        assert_eq!(
+            w.pending_records().len(),
+            0,
+            "sealed records must not be replayed as pending"
+        );
     }
 
     #[test]

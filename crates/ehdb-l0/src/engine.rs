@@ -253,8 +253,30 @@ impl<D: Dataset> L0Engine<D> {
             .unwrap_or_else(|| Manifest::empty(&config.dataset));
         let global_sequence = manifest.max_sequence();
         let mut engine = Self::assemble(config, replicas, metrics, manifest, global_sequence);
+        // noetl/ai-meta#209 defect 2 — recover BEFORE anything reads or appends.
+        //
+        // Writers are opened lazily by `ensure_writer`, and recovery rides that
+        // open.  Lazy is too late on both paths: `append_writer_assigned` reads
+        // `global_sequence` to mint its key *before* calling into the append that
+        // would open the writer, so the first post-crash append lands at or below
+        // the recovered tip (the #203 silent drop); and a read never opens a
+        // writer at all, so recovered records stay invisible until something
+        // happens to append.  Both were caught by the engine-level tests and
+        // neither is visible from the writer's own unit tests.
+        engine.recover_active_parts()?;
         engine.start_uploader();
         Ok(engine)
+    }
+
+    /// Open every shard's writer once at startup, so an active part left by a
+    /// crash is replayed (and the sequence reconciled) before the engine serves
+    /// anything.  A shard with no active part opens an empty writer, which is
+    /// what `ensure_writer` would have done on first append anyway.
+    fn recover_active_parts(&mut self) -> Result<()> {
+        for shard in 0..self.config.shard_count.max(1) {
+            self.ensure_writer(shard)?;
+        }
+        Ok(())
     }
 
     /// **Cold-load** a fresh node (empty local dir) from a single substrate:
@@ -502,6 +524,29 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_records,
                 self.config.flush,
             )?;
+            // noetl/ai-meta#209 defect 2 — a writer that just recovered an
+            // active part left by a crash holds records the manifest does not
+            // know about, because the manifest lists sealed parts only. The
+            // engine's `global_sequence` came from that manifest, so it is
+            // *behind* the recovered tail; lift both it and the shard tail above
+            // the recovered records before anything is appended.
+            //
+            // Skipping this would let the next `append_writer_assigned` mint a
+            // key at or below the recovered tail. That append lands behind every
+            // follower cursor and is never delivered — the silent-drop class of
+            // noetl/ai-meta#203 — so recovery without this would trade a crash
+            // loss for a quieter one.
+            if let Some(recovered_tip) = writer.max_sequence() {
+                if recovered_tip > self.global_sequence {
+                    self.global_sequence = recovered_tip;
+                }
+                let tail = self.shard_tail_max.entry(shard).or_insert(recovered_tip);
+                if recovered_tip > *tail {
+                    *tail = recovered_tip;
+                }
+                self.metrics
+                    .add_recovered_active_records(writer.pending_records().len() as u64);
+            }
             self.writers.insert(shard, writer);
         }
         Ok(())
