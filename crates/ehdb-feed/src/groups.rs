@@ -388,6 +388,16 @@ where
     /// ack path: a group that goes idle mid-batch has already had its cursor
     /// stored on its last ack, so this mainly bounds the loss window for a group
     /// whose final ack raced a shutdown.
+    /// The writer this coordinator serves from.
+    ///
+    /// The events host hands back only the coordinator, so without this its
+    /// caller cannot reach the log to append to it or to seal it — which makes
+    /// the two-host shutdown path untestable from outside the crate, and that
+    /// path is exactly where noetl/ai-meta#226 lost records.
+    pub fn writer(&self) -> Arc<FeedWriter<D>> {
+        Arc::clone(&self.writer)
+    }
+
     pub async fn checkpoint(&self) -> io::Result<()> {
         let groups = {
             let g = self.groups.lock().await;
