@@ -8,6 +8,10 @@ rust-version.workspace = true
 description = "EHDB L1 — networked change-feed delivery over the L0 Watch(shard,cursor) primitive: the per-shard writer's push transport to subscribers. noetl-internal only."
 
 [dependencies]
+# noetl/ehdb#311 — the face-killing bug was SILENT; a rejected connection now
+# says so.  The host process (noetl-worker) installs a tracing subscriber, so
+# these actually surface rather than being emitted into a void.
+tracing.workspace = true
 ehdb-core.workspace = true
 ehdb-l0.workspace = true
 serde = { workspace = true }

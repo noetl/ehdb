@@ -265,8 +265,22 @@ impl KvResp {
 /// Serve the KV face on `listener` from the shared `coordinator`.
 pub async fn serve_kv(listener: TcpListener, coordinator: Arc<KvCoordinator>) -> io::Result<()> {
     loop {
-        let (mut sock, _peer) = listener.accept().await?;
-        sock.set_nodelay(true)?;
+        // noetl/ehdb#311 — per-connection failures must not drop the listener.
+        // This face already spawns its handshake, so it could not be killed the
+        // way the WAL fan-out face could; but an accept error and the socket
+        // setup below both still `?`d out of the loop, and a peer that vanishes
+        // between SYN and accept is a routine, per-connection event.
+        let (mut sock, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "kv: accept failed; face stays up");
+                continue;
+            }
+        };
+        if let Err(e) = sock.set_nodelay(true) {
+            tracing::warn!(error = %e, "kv: rejecting connection (socket setup)");
+            continue;
+        }
         let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
             loop {
