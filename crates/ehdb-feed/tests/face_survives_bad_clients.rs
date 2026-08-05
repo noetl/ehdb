@@ -131,7 +131,9 @@ async fn a_malformed_subscribe_request_does_not_kill_the_face() {
 
     let junk = b"{\"not\":\"a subscribe req\"}";
     let mut bad = TcpStream::connect(addr).await.unwrap();
-    bad.write_all(&(junk.len() as u32).to_be_bytes()).await.unwrap();
+    bad.write_all(&(junk.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
     bad.write_all(junk).await.unwrap();
     bad.flush().await.unwrap();
     drop(bad);
