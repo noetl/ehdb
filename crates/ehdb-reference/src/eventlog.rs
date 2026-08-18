@@ -226,6 +226,20 @@ pub trait EventLogDriver {
     fn driver_name(&self) -> &'static str;
     /// Persist + order one authorized event; assign the next global sequence.
     fn append(&self, request: &EventLogAppendRequest) -> Result<EventLogAppendOutcome>;
+    /// Append N events as one unit (noetl/ai-meta#155).
+    ///
+    /// The default is exactly N sequential [`Self::append`] calls, so a driver
+    /// that does not override it behaves as before. An engine whose append pays
+    /// a fixed per-record cost (an `fsync`, a round trip) overrides this to pay
+    /// it once.
+    ///
+    /// Ordering is the caller's: records are appended in slice order.
+    fn append_batch(
+        &self,
+        requests: &[EventLogAppendRequest],
+    ) -> Result<Vec<EventLogAppendOutcome>> {
+        requests.iter().map(|r| self.append(r)).collect()
+    }
     /// Ordered scan of the whole log by global sequence.
     fn scan_global(&self, request: &EventLogScanRequest) -> Result<EventLogScanOutcome>;
     /// Ordered read scoped to a single execution.
@@ -336,6 +350,82 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                 created_stream,
                 log_record_count,
             })
+        })
+    }
+
+    /// One runtime lock, one transaction-log batch, one `fsync` for the whole
+    /// set — see [`EventLogDriver::append_batch`].
+    ///
+    /// The per-record sequence is computed by advancing a base taken from ONE
+    /// replay, not by replaying per record: re-deriving it each time is the
+    /// O(store) cost this whole change exists to remove.
+    fn append_batch(
+        &self,
+        requests: &[EventLogAppendRequest],
+    ) -> Result<Vec<EventLogAppendOutcome>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (tenant, namespace, stream) = self.coordinates()?;
+
+        crate::with_runtime(&self.log_path, |runtime| {
+            let (creating_stream, base_sequence) = match runtime
+                .state()
+                .streams
+                .replay(&tenant, &namespace, &stream, None)
+            {
+                Ok(records) => (false, records.len() as u64 + 1),
+                Err(_) => (true, StreamSequence::first().value()),
+            };
+
+            let mut transactions = Vec::with_capacity(requests.len());
+            let mut outcomes = Vec::with_capacity(requests.len());
+            for (sequence, (index, request)) in (base_sequence..).zip(requests.iter().enumerate()) {
+                let subject = execution_subject(&request.execution_id)?;
+                let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+                let payload = request.payload.clone().into_bytes();
+                let byte_len = payload.len();
+
+                // Only the first record can create the stream; the rest publish
+                // into the one it just created.
+                let created_stream = creating_stream && index == 0;
+                let mut mutations = Vec::with_capacity(2);
+                if created_stream {
+                    mutations.push(Mutation::Stream(StreamMutation::CreateStream {
+                        stream: stream.clone(),
+                        retention: RetentionPolicy::KeepAll,
+                    }));
+                }
+                mutations.push(Mutation::Stream(StreamMutation::Publish {
+                    stream: stream.clone(),
+                    subject,
+                    payload,
+                    sequence,
+                }));
+
+                transactions.push(CommitTransaction {
+                    transaction_id,
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    mutations,
+                });
+                outcomes.push(EventLogAppendOutcome {
+                    action: "eventlog-append".to_string(),
+                    execution_id: request.execution_id.trim().to_string(),
+                    global_sequence: sequence,
+                    byte_len,
+                    created_stream,
+                    // The single-record path reports the stream's record count
+                    // after its own append, which is exactly that record's
+                    // sequence (next = count + 1). Derived rather than replayed
+                    // so the batch does not reintroduce a per-record O(store)
+                    // read.
+                    log_record_count: sequence as usize,
+                });
+            }
+
+            runtime.append_batch(transactions)?;
+            Ok(outcomes)
         })
     }
 
@@ -1377,5 +1467,121 @@ mod runtime_cache_tests {
 
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
+    }
+}
+
+#[cfg(test)]
+mod append_batch_driver_tests {
+    use super::*;
+
+    fn temp_log(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ehdb-drvbatch-{tag}-{}-{n}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn driver(path: &std::path::Path) -> LocalReferenceEventLogDriver {
+        LocalReferenceEventLogDriver::new(path.to_path_buf(), "t".to_string(), "n".to_string())
+    }
+
+    fn reqs(n: usize) -> Vec<EventLogAppendRequest> {
+        (0..n)
+            .map(|i| EventLogAppendRequest {
+                execution_id: format!("exec{}", i % 3),
+                transaction_id: format!("tx-{i}"),
+                payload: format!("{{\"i\":{i}}}"),
+            })
+            .collect()
+    }
+
+    /// `append_batch` must produce exactly what N `append` calls produce
+    /// (noetl/ai-meta#155).
+    ///
+    /// This is the property the whole change rests on: the batch is a
+    /// performance shape, not a semantic one. Sequences, per-record outcomes,
+    /// the bytes on disk and what a cold reopen replays must all match.
+    #[test]
+    fn batch_matches_sequential_exactly() {
+        let p_seq = temp_log("seq");
+        let d_seq = driver(&p_seq);
+        let sequential: Vec<_> = reqs(6)
+            .iter()
+            .map(|r| d_seq.append(r).expect("append"))
+            .collect();
+
+        let p_bat = temp_log("bat");
+        let d_bat = driver(&p_bat);
+        let batched = d_bat.append_batch(&reqs(6)).expect("append_batch");
+
+        assert_eq!(
+            sequential, batched,
+            "batched outcomes must equal sequential ones field for field"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p_seq).unwrap(),
+            std::fs::read_to_string(&p_bat).unwrap(),
+            "the log a batch writes must be byte-identical to the sequential one"
+        );
+
+        // Cold reopen: the batch must replay in the same order.
+        crate::invalidate_cached_runtime(&p_bat);
+        let scan = d_bat
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .expect("scan");
+        assert_eq!(scan.record_count, 6, "batch must survive a cold reopen");
+        assert!(
+            scan.records
+                .windows(2)
+                .all(|w| w[1].global_sequence > w[0].global_sequence),
+            "replayed order must be strictly increasing"
+        );
+
+        let _ = std::fs::remove_file(&p_seq);
+        let _ = std::fs::remove_file(&p_bat);
+    }
+
+    /// A batch appended onto a NON-empty log must continue the sequence rather
+    /// than restart it — the base is taken once and advanced, so an off-by-one
+    /// here would land the whole batch on top of existing records.
+    #[test]
+    fn batch_continues_an_existing_sequence() {
+        let p = temp_log("cont");
+        let d = driver(&p);
+        d.append(&EventLogAppendRequest {
+            execution_id: "exec0".to_string(),
+            transaction_id: "seed".to_string(),
+            payload: "{\"seed\":true}".to_string(),
+        })
+        .expect("seed");
+
+        let out = d.append_batch(&reqs(3)).expect("append_batch");
+        assert_eq!(
+            out.iter().map(|o| o.global_sequence).collect::<Vec<_>>(),
+            vec![2, 3, 4],
+            "batch must continue after the seed record"
+        );
+        assert!(
+            out.iter().all(|o| !o.created_stream),
+            "the stream already exists; no record may claim to have created it"
+        );
+
+        let scan = d
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .expect("scan");
+        assert_eq!(scan.record_count, 4, "seed + 3 batched");
+        let _ = std::fs::remove_file(&p);
     }
 }
