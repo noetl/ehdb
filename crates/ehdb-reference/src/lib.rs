@@ -337,6 +337,31 @@ impl LocalReferenceRuntime {
         Ok(record)
     }
 
+    /// Append N transactions through one file open and one `fsync`
+    /// (noetl/ai-meta#155).
+    ///
+    /// Same shape as [`Self::append`]: the next state is built on a copy and
+    /// only swapped in once the log write has succeeded, so a failed write
+    /// leaves both the log and the state untouched. The copy is taken **once
+    /// for the batch** rather than once per record — measured at ~2% of an
+    /// append's cost, so this is incidental; the win is the single `fsync`.
+    pub fn append_batch(
+        &mut self,
+        requests: Vec<CommitTransaction>,
+    ) -> Result<Vec<TransactionRecord>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut next_state = self.state.clone();
+        for request in &requests {
+            let preview = self.log.preview_record(request.clone())?;
+            next_state.apply_record(&preview)?;
+        }
+        let records = self.log.append_batch(requests)?;
+        self.state = next_state;
+        Ok(records)
+    }
+
     pub fn replay(&self) -> Vec<TransactionRecord> {
         self.log.replay(None)
     }

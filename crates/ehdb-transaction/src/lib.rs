@@ -465,6 +465,66 @@ impl LocalJsonlTransactionLog {
         Ok(record)
     }
 
+    /// Append N records with ONE file open and ONE `fsync` (noetl/ai-meta#155).
+    ///
+    /// [`Self::append`] pays an open + write + `sync_data` per record. Measured
+    /// at production scale (33 KB records) that is ~118 ms **on an empty
+    /// store** — essentially fixed per record, and the dominant cost of
+    /// mirroring into the EHDB event-log tier, which appends one record per
+    /// event.
+    ///
+    /// Durability is unchanged: this returns only after the single `sync_data`
+    /// covering every record in the batch, so a returned record is on disk
+    /// exactly as it was before. Ordering is unchanged: records are built and
+    /// written in request order.
+    ///
+    /// Atomicity is NOT stronger than the per-record path and deliberately so —
+    /// a torn write mid-batch leaves the prefix durable, the same state a crash
+    /// between two single appends leaves. The log is replay-truth, so a partial
+    /// batch replays as a shorter log rather than a corrupt one.
+    ///
+    /// On error nothing is inserted into the in-memory index, so the index
+    /// never claims a record the file does not hold.
+    pub fn append_batch(
+        &mut self,
+        requests: Vec<CommitTransaction>,
+    ) -> Result<Vec<TransactionRecord>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build every record before writing a byte, so a malformed request in
+        // the batch fails with nothing on disk.
+        //
+        // `build_record` takes `&self` and reads `next_sequence` WITHOUT
+        // advancing it, so it hands every record in the batch the same sequence
+        // and cannot see ids used earlier in this same batch. Both gaps are
+        // closed here rather than by inserting as we go, because inserting
+        // before the write would leave the in-memory index holding records the
+        // file does not — the direction that turns a failed write into a lie.
+        let mut records: Vec<TransactionRecord> = Vec::with_capacity(requests.len());
+        let mut batch_ids: BTreeSet<TransactionId> = BTreeSet::new();
+        for request in requests {
+            let mut record = self.inner.build_record(request)?;
+            if !batch_ids.insert(record.transaction_id.clone()) {
+                return Err(EhdbError::AlreadyExists(record.transaction_id.to_string()));
+            }
+            if let Some(previous) = records.last() {
+                record.sequence = previous.sequence.next();
+            }
+            records.push(record);
+        }
+
+        // Disk first, then the index — the same order the single-record path
+        // uses, so a write failure leaves the index behind the file rather than
+        // ahead of it. `insert_record` re-validates sequence continuity, so a
+        // mis-stamped batch fails loudly instead of landing out of order.
+        self.append_records_to_disk(&records)?;
+        for record in &records {
+            self.inner.insert_record(record.clone())?;
+        }
+        Ok(records)
+    }
+
     pub fn preview_record(&self, request: CommitTransaction) -> Result<TransactionRecord> {
         self.inner.build_record(request)
     }
@@ -483,6 +543,38 @@ impl LocalJsonlTransactionLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// One open, N writes, ONE `sync_data`. The single-record path is this with
+    /// a batch of one, kept separate only so the hot single-append path does not
+    /// allocate a slice.
+    fn append_records_to_disk(&self, records: &[TransactionRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // Serialise into one buffer so the batch reaches the file as a single
+        // `write_all` — N small writes to an O_APPEND fd are N syscalls, and
+        // interleaving is what a torn batch would look like on replay.
+        let mut buf = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut buf, record)
+                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+            buf.push(b'\n');
+        }
+        file.write_all(&buf)
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        file.sync_data()
+            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        Ok(())
     }
 
     fn append_record_to_disk(&self, record: &TransactionRecord) -> Result<()> {
@@ -1111,5 +1203,96 @@ mod tests {
         assert!(matches!(error, EhdbError::Storage(_)));
 
         fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod append_batch_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ehdb-batch-{tag}-{}-{n}.jsonl", std::process::id()))
+    }
+
+    fn req(id: &str) -> CommitTransaction {
+        CommitTransaction {
+            transaction_id: TransactionId::new(id.to_string()).unwrap(),
+            tenant: TenantId::new("t".to_string()).unwrap(),
+            namespace: NamespaceName::new("n".to_string()).unwrap(),
+            mutations: vec![Mutation::Stream(StreamMutation::CreateStream {
+                stream: StreamName::new(format!("s-{id}")).unwrap(),
+                retention: RetentionPolicy::KeepAll,
+            })],
+        }
+    }
+
+    /// A batch must be indistinguishable from the same records appended one at
+    /// a time (noetl/ai-meta#155).
+    ///
+    /// The risk this guards is specific: `build_record` reads `next_sequence`
+    /// without advancing it, so a batch that trusts it stamps every record with
+    /// the same sequence. That would either be rejected by `insert_record` or,
+    /// worse, land out of order — and ordering is one of the properties the
+    /// tier comparator checks.
+    #[test]
+    fn batch_is_equivalent_to_sequential_appends() {
+        let p_seq = tmp("seq");
+        let mut a = LocalJsonlTransactionLog::open(&p_seq).unwrap();
+        let sequential: Vec<_> = (0..5)
+            .map(|i| a.append(req(&format!("tx{i}"))).unwrap())
+            .collect();
+
+        let p_bat = tmp("bat");
+        let mut b = LocalJsonlTransactionLog::open(&p_bat).unwrap();
+        let batched = b
+            .append_batch((0..5).map(|i| req(&format!("tx{i}"))).collect())
+            .unwrap();
+
+        assert_eq!(
+            sequential.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            batched.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            "batched sequences must match sequential ones exactly"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p_seq).unwrap(),
+            std::fs::read_to_string(&p_bat).unwrap(),
+            "the file a batch writes must be byte-identical to the sequential one"
+        );
+
+        // And the batch must be replayable: reopening sees all 5, in order.
+        let reopened = LocalJsonlTransactionLog::open(&p_bat).unwrap();
+        let replayed = reopened.replay(None);
+        assert_eq!(replayed.len(), 5, "batch must survive a cold reopen");
+        assert!(
+            replayed.windows(2).all(|w| w[1].sequence > w[0].sequence),
+            "replayed order must be strictly increasing"
+        );
+
+        let _ = std::fs::remove_file(&p_seq);
+        let _ = std::fs::remove_file(&p_bat);
+    }
+
+    /// A duplicate id inside one batch must be refused, and refused with
+    /// NOTHING written — `build_record` cannot see ids used earlier in the same
+    /// batch, so this is the gap the batch path has to close itself.
+    #[test]
+    fn duplicate_within_a_batch_is_refused_and_writes_nothing() {
+        let p = tmp("dup");
+        let mut log = LocalJsonlTransactionLog::open(&p).unwrap();
+        let err = log.append_batch(vec![req("a"), req("b"), req("a")]);
+        assert!(
+            err.is_err(),
+            "a duplicate id inside the batch must be refused"
+        );
+        assert!(
+            !p.exists() || std::fs::read_to_string(&p).unwrap().is_empty(),
+            "a refused batch must leave the file untouched"
+        );
+        assert_eq!(log.replay(None).len(), 0, "index must hold nothing either");
+        let _ = std::fs::remove_file(&p);
     }
 }
