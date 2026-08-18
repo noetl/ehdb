@@ -58,7 +58,6 @@ use ehdb_stream::{RetentionPolicy, StreamSequence, Subject, SubjectFilter};
 use ehdb_transaction::{CommitTransaction, Mutation, StreamMutation};
 use serde::{Deserialize, Serialize};
 
-
 /// The single canonical stream that carries NoETL's platform event log.  Using
 /// one stream makes its [`StreamSequence`] the global, monotonic, gapless
 /// event-log sequence (the JetStream stream-sequence / Postgres ordering twin).
