@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::Cursor,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -180,6 +180,142 @@ pub struct ReferenceDatabase {
 pub struct LocalReferenceRuntime {
     log: LocalJsonlTransactionLog,
     state: ReferenceDatabase,
+}
+
+/// Reuse one opened [`LocalReferenceRuntime`] per log path instead of
+/// reopening — and thereby re-replaying — the whole log on every operation.
+///
+/// # Why
+///
+/// [`LocalReferenceRuntime::open`] replays the entire JSONL log and rebuilds
+/// the in-memory [`ReferenceDatabase`] from scratch, so **every** driver call is
+/// O(log size). The EHDB event-log tier calls a driver method per mirrored
+/// event, which made the cost of mirroring one event proportional to everything
+/// mirrored before it.
+///
+/// Measured on production (noetl/ai-meta#155), tier store 161.7 MB:
+///
+/// | operation | latency |
+/// | :-- | --: |
+/// | `health` round trip (no store access) | 3.3 ms |
+/// | `scan(limit=10)`, 8 KB returned | 835 ms |
+/// | `read_execution`, 92 KB returned | 858 ms |
+///
+/// The latency does not track the result size, because it is not the read: it
+/// is the replay in front of it. That fixed ~840 ms, paid 76 times, was ~82 s
+/// of a 91 s user-facing turn.
+///
+/// # Safety of caching
+///
+/// The cached state is only correct while this process is the sole writer of
+/// the file — which is the tier's existing topology (one writer pod owns the
+/// store, and every reader goes through its tier service). The cache is keyed
+/// by path and each entry carries its own lock, so concurrent callers on one
+/// store serialise exactly as they did when each opened its own runtime.
+///
+/// Behaviour is otherwise unchanged: the same engine, the same file format, the
+/// same `log.append` write-and-flush, the same ordering and the same durability.
+/// What changes is that the replay happens once instead of once per call.
+///
+/// # Reverting
+///
+/// Off unless `NOETL_EHDB_REFERENCE_RUNTIME_CACHE` is truthy. Unset it and every
+/// call reopens exactly as before — no rebuild, per-deployment, immediate.
+pub fn runtime_cache_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_EHDB_REFERENCE_RUNTIME_CACHE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+type RuntimeCache =
+    std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<LocalReferenceRuntime>>>>;
+
+fn runtime_cache() -> &'static RuntimeCache {
+    static C: OnceLock<RuntimeCache> = OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// How many times [`with_runtime`] has actually replayed each log.
+///
+/// The point of the cache is that this stops tracking the operation count. A
+/// timing assertion would be flaky; this is the same property stated exactly.
+///
+/// Counted **per path** rather than globally: `cargo test` does not serialise
+/// tests, so a single global counter is moved by every other test in the
+/// binary and a delta taken around one operation measures the whole suite.
+type OpenCounts = std::sync::Mutex<HashMap<PathBuf, u64>>;
+
+fn runtime_opens() -> &'static OpenCounts {
+    static C: OnceLock<OpenCounts> = OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn note_open(path: &Path) {
+    if let Ok(mut m) = runtime_opens().lock() {
+        *m.entry(path.to_path_buf()).or_insert(0) += 1;
+    }
+}
+
+/// Replays performed through [`with_runtime`] for one log path.
+pub fn runtime_open_count(path: &Path) -> u64 {
+    runtime_opens()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(path).copied())
+        .unwrap_or(0)
+}
+
+/// Run `f` against an open runtime for `path`.
+///
+/// With the cache on, the runtime is opened once per path and reused; with it
+/// off, this is exactly `LocalReferenceRuntime::open(path)` followed by `f`, so
+/// the call sites read the same either way. See [`runtime_cache_enabled`].
+pub fn with_runtime<T>(
+    path: &Path,
+    f: impl FnOnce(&mut LocalReferenceRuntime) -> Result<T>,
+) -> Result<T> {
+    if !runtime_cache_enabled() {
+        note_open(path);
+        let mut runtime = LocalReferenceRuntime::open(path)?;
+        return f(&mut runtime);
+    }
+    let entry = {
+        let mut map = runtime_cache()
+            .lock()
+            .map_err(|_| EhdbError::InvalidState("reference runtime cache poisoned".to_string()))?;
+        match map.get(path) {
+            Some(e) => Arc::clone(e),
+            None => {
+                // Opened under the map lock so two callers racing on a cold path
+                // cannot both pay the replay and then disagree about which
+                // runtime is the live one.
+                note_open(path);
+                let rt = LocalReferenceRuntime::open(path)?;
+                let e = Arc::new(std::sync::Mutex::new(rt));
+                map.insert(path.to_path_buf(), Arc::clone(&e));
+                e
+            }
+        }
+    };
+    let mut guard = entry.lock().map_err(|_| {
+        EhdbError::InvalidState(format!("reference runtime poisoned for {}", path.display()))
+    })?;
+    f(&mut guard)
+}
+
+/// Drop any cached runtime for `path`, so the next call reopens from disk.
+///
+/// For tests and for an operator who has reason to believe the file changed
+/// underneath the process.
+pub fn invalidate_cached_runtime(path: &Path) {
+    if let Ok(mut map) = runtime_cache().lock() {
+        map.remove(path);
+    }
 }
 
 impl LocalReferenceRuntime {

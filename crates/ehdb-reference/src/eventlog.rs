@@ -58,8 +58,6 @@ use ehdb_stream::{RetentionPolicy, StreamSequence, Subject, SubjectFilter};
 use ehdb_transaction::{CommitTransaction, Mutation, StreamMutation};
 use serde::{Deserialize, Serialize};
 
-use crate::LocalReferenceRuntime;
-
 /// The single canonical stream that carries NoETL's platform event log.  Using
 /// one stream makes its [`StreamSequence`] the global, monotonic, gapless
 /// event-log sequence (the JetStream stream-sequence / Postgres ordering twin).
@@ -288,56 +286,56 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
         let payload = request.payload.clone().into_bytes();
         let byte_len = payload.len();
 
-        let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
+        crate::with_runtime(&self.log_path, |runtime| {
+            // Create-on-first-use + next global sequence from replayed state.  A
+            // missing stream replays as an error — that is the create signal, not a
+            // failure.  next = count + 1 keeps the sequence monotonic + gapless.
+            let (created_stream, next_sequence) = match runtime
+                .state()
+                .streams
+                .replay(&tenant, &namespace, &stream, None)
+            {
+                Ok(records) => (false, records.len() as u64 + 1),
+                Err(_) => (true, StreamSequence::first().value()),
+            };
 
-        // Create-on-first-use + next global sequence from replayed state.  A
-        // missing stream replays as an error — that is the create signal, not a
-        // failure.  next = count + 1 keeps the sequence monotonic + gapless.
-        let (created_stream, next_sequence) = match runtime
-            .state()
-            .streams
-            .replay(&tenant, &namespace, &stream, None)
-        {
-            Ok(records) => (false, records.len() as u64 + 1),
-            Err(_) => (true, StreamSequence::first().value()),
-        };
-
-        let mut mutations = Vec::with_capacity(2);
-        if created_stream {
-            mutations.push(Mutation::Stream(StreamMutation::CreateStream {
+            let mut mutations = Vec::with_capacity(2);
+            if created_stream {
+                mutations.push(Mutation::Stream(StreamMutation::CreateStream {
+                    stream: stream.clone(),
+                    // Append-only source of truth: keep every event.
+                    retention: RetentionPolicy::KeepAll,
+                }));
+            }
+            mutations.push(Mutation::Stream(StreamMutation::Publish {
                 stream: stream.clone(),
-                // Append-only source of truth: keep every event.
-                retention: RetentionPolicy::KeepAll,
+                subject,
+                payload,
+                sequence: next_sequence,
             }));
-        }
-        mutations.push(Mutation::Stream(StreamMutation::Publish {
-            stream: stream.clone(),
-            subject,
-            payload,
-            sequence: next_sequence,
-        }));
 
-        runtime.append(CommitTransaction {
-            transaction_id,
-            tenant: tenant.clone(),
-            namespace: namespace.clone(),
-            mutations,
-        })?;
+            runtime.append(CommitTransaction {
+                transaction_id,
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations,
+            })?;
 
-        let log_record_count = runtime
-            .state()
-            .streams
-            .replay(&tenant, &namespace, &stream, None)
-            .map(|records| records.len())
-            .unwrap_or(0);
+            let log_record_count = runtime
+                .state()
+                .streams
+                .replay(&tenant, &namespace, &stream, None)
+                .map(|records| records.len())
+                .unwrap_or(0);
 
-        Ok(EventLogAppendOutcome {
-            action: "eventlog-append".to_string(),
-            execution_id: request.execution_id.trim().to_string(),
-            global_sequence: next_sequence,
-            byte_len,
-            created_stream,
-            log_record_count,
+            Ok(EventLogAppendOutcome {
+                action: "eventlog-append".to_string(),
+                execution_id: request.execution_id.trim().to_string(),
+                global_sequence: next_sequence,
+                byte_len,
+                created_stream,
+                log_record_count,
+            })
         })
     }
 
@@ -347,36 +345,36 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
             Some(value) => Some(StreamSequence::new(value)?),
             None => None,
         };
-        let runtime = LocalReferenceRuntime::open(&self.log_path)?;
-
-        match runtime
-            .state()
-            .streams
-            .replay(&tenant, &namespace, &stream, after)
-        {
-            Ok(records) => {
-                let record_count = records.len();
-                let projected = records
-                    .into_iter()
-                    .take(request.limit)
-                    .map(project_record)
-                    .collect::<Vec<_>>();
-                Ok(EventLogScanOutcome {
+        crate::with_runtime(&self.log_path, |runtime| {
+            match runtime
+                .state()
+                .streams
+                .replay(&tenant, &namespace, &stream, after)
+            {
+                Ok(records) => {
+                    let record_count = records.len();
+                    let projected = records
+                        .into_iter()
+                        .take(request.limit)
+                        .map(project_record)
+                        .collect::<Vec<_>>();
+                    Ok(EventLogScanOutcome {
+                        action: "eventlog-scan".to_string(),
+                        exists: true,
+                        record_count,
+                        returned: projected.len(),
+                        records: projected,
+                    })
+                }
+                Err(_) => Ok(EventLogScanOutcome {
                     action: "eventlog-scan".to_string(),
-                    exists: true,
-                    record_count,
-                    returned: projected.len(),
-                    records: projected,
-                })
+                    exists: false,
+                    record_count: 0,
+                    returned: 0,
+                    records: Vec::new(),
+                }),
             }
-            Err(_) => Ok(EventLogScanOutcome {
-                action: "eventlog-scan".to_string(),
-                exists: false,
-                record_count: 0,
-                returned: 0,
-                records: Vec::new(),
-            }),
-        }
+        })
     }
 
     fn read_execution(
@@ -391,114 +389,114 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
             Some(value) => Some(StreamSequence::new(value)?),
             None => None,
         };
-        let runtime = LocalReferenceRuntime::open(&self.log_path)?;
-
-        match runtime
-            .state()
-            .streams
-            .replay_matching(&tenant, &namespace, &stream, &filter, after)
-        {
-            Ok(records) => {
-                let record_count = records.len();
-                let projected = records
-                    .into_iter()
-                    .take(request.limit)
-                    .map(project_record)
-                    .collect::<Vec<_>>();
-                Ok(EventLogReadExecutionOutcome {
+        crate::with_runtime(&self.log_path, |runtime| {
+            match runtime
+                .state()
+                .streams
+                .replay_matching(&tenant, &namespace, &stream, &filter, after)
+            {
+                Ok(records) => {
+                    let record_count = records.len();
+                    let projected = records
+                        .into_iter()
+                        .take(request.limit)
+                        .map(project_record)
+                        .collect::<Vec<_>>();
+                    Ok(EventLogReadExecutionOutcome {
+                        action: "eventlog-read-exec".to_string(),
+                        execution_id: request.execution_id.trim().to_string(),
+                        exists: true,
+                        record_count,
+                        returned: projected.len(),
+                        records: projected,
+                    })
+                }
+                // A missing stream (no event ever appended) is an absent probe, not
+                // an error — a per-execution read of a never-written log is empty.
+                Err(_) => Ok(EventLogReadExecutionOutcome {
                     action: "eventlog-read-exec".to_string(),
                     execution_id: request.execution_id.trim().to_string(),
-                    exists: true,
-                    record_count,
-                    returned: projected.len(),
-                    records: projected,
-                })
+                    exists: false,
+                    record_count: 0,
+                    returned: 0,
+                    records: Vec::new(),
+                }),
             }
-            // A missing stream (no event ever appended) is an absent probe, not
-            // an error — a per-execution read of a never-written log is empty.
-            Err(_) => Ok(EventLogReadExecutionOutcome {
-                action: "eventlog-read-exec".to_string(),
-                execution_id: request.execution_id.trim().to_string(),
-                exists: false,
-                record_count: 0,
-                returned: 0,
-                records: Vec::new(),
-            }),
-        }
+        })
     }
 
     fn tail(&self, request: &EventLogTailRequest) -> Result<EventLogTailOutcome> {
         let (tenant, namespace, stream) = self.coordinates()?;
         let consumer = ConsumerName::new(request.consumer.clone())?;
 
-        let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
+        crate::with_runtime(&self.log_path, |runtime| {
+            // A durable consumer over a never-written log is an absent probe.
+            if runtime
+                .state()
+                .streams
+                .replay(&tenant, &namespace, &stream, None)
+                .is_err()
+            {
+                return Ok(EventLogTailOutcome {
+                    action: "eventlog-tail".to_string(),
+                    consumer: consumer.to_string(),
+                    exists: false,
+                    created_consumer: false,
+                    acked_sequence: None,
+                    pending_count: 0,
+                    returned: 0,
+                    records: Vec::new(),
+                });
+            }
 
-        // A durable consumer over a never-written log is an absent probe.
-        if runtime
-            .state()
-            .streams
-            .replay(&tenant, &namespace, &stream, None)
-            .is_err()
-        {
-            return Ok(EventLogTailOutcome {
+            // Create the durable consumer on first pull (JetStream-style durable).
+            let created_consumer = runtime
+                .state()
+                .streams
+                .consumer(&tenant, &namespace, &stream, &consumer)
+                .is_err();
+            if created_consumer {
+                let transaction_id = TransactionId::new(request.transaction_id.clone())?;
+                runtime.append(CommitTransaction {
+                    transaction_id,
+                    tenant: tenant.clone(),
+                    namespace: namespace.clone(),
+                    mutations: vec![Mutation::Stream(StreamMutation::CreateConsumer {
+                        stream: stream.clone(),
+                        consumer: consumer.clone(),
+                    })],
+                })?;
+            }
+
+            let acked_sequence = runtime
+                .state()
+                .streams
+                .consumer(&tenant, &namespace, &stream, &consumer)
+                .ok()
+                .and_then(|durable| durable.acked_sequence.map(|sequence| sequence.value()));
+
+            let pending = runtime
+                .state()
+                .streams
+                .replay_for_consumer(&tenant, &namespace, &stream, &consumer)?;
+            let pending_count = pending.len();
+            let records = pending
+                .into_iter()
+                .take(request.limit)
+                .map(project_record)
+                .collect::<Vec<_>>();
+            let returned = records.len();
+
+            Ok(EventLogTailOutcome {
                 action: "eventlog-tail".to_string(),
                 consumer: consumer.to_string(),
-                exists: false,
-                created_consumer: false,
-                acked_sequence: None,
-                pending_count: 0,
-                returned: 0,
-                records: Vec::new(),
-            });
-        }
-
-        // Create the durable consumer on first pull (JetStream-style durable).
-        let created_consumer = runtime
-            .state()
-            .streams
-            .consumer(&tenant, &namespace, &stream, &consumer)
-            .is_err();
-        if created_consumer {
-            let transaction_id = TransactionId::new(request.transaction_id.clone())?;
-            runtime.append(CommitTransaction {
-                transaction_id,
-                tenant: tenant.clone(),
-                namespace: namespace.clone(),
-                mutations: vec![Mutation::Stream(StreamMutation::CreateConsumer {
-                    stream: stream.clone(),
-                    consumer: consumer.clone(),
-                })],
-            })?;
-        }
-
-        let acked_sequence = runtime
-            .state()
-            .streams
-            .consumer(&tenant, &namespace, &stream, &consumer)
-            .ok()
-            .and_then(|durable| durable.acked_sequence.map(|sequence| sequence.value()));
-
-        let pending = runtime
-            .state()
-            .streams
-            .replay_for_consumer(&tenant, &namespace, &stream, &consumer)?;
-        let pending_count = pending.len();
-        let records = pending
-            .into_iter()
-            .take(request.limit)
-            .map(project_record)
-            .collect::<Vec<_>>();
-        let returned = records.len();
-
-        Ok(EventLogTailOutcome {
-            action: "eventlog-tail".to_string(),
-            consumer: consumer.to_string(),
-            exists: true,
-            created_consumer,
-            acked_sequence,
-            pending_count,
-            returned,
-            records,
+                exists: true,
+                created_consumer,
+                acked_sequence,
+                pending_count,
+                returned,
+                records,
+            })
         })
     }
 
@@ -509,22 +507,23 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
         // StreamSequence rejects 0; a real ack always names a published record.
         let sequence = StreamSequence::new(request.sequence)?;
 
-        let mut runtime = LocalReferenceRuntime::open(&self.log_path)?;
-        runtime.append(CommitTransaction {
-            transaction_id,
-            tenant: tenant.clone(),
-            namespace: namespace.clone(),
-            mutations: vec![Mutation::Stream(StreamMutation::Ack {
-                stream: stream.clone(),
-                consumer: consumer.clone(),
-                sequence: sequence.value(),
-            })],
-        })?;
+        crate::with_runtime(&self.log_path, |runtime| {
+            runtime.append(CommitTransaction {
+                transaction_id,
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                mutations: vec![Mutation::Stream(StreamMutation::Ack {
+                    stream: stream.clone(),
+                    consumer: consumer.clone(),
+                    sequence: sequence.value(),
+                })],
+            })?;
 
-        Ok(EventLogAckOutcome {
-            action: "eventlog-ack".to_string(),
-            consumer: consumer.to_string(),
-            acked_sequence: sequence.value(),
+            Ok(EventLogAckOutcome {
+                action: "eventlog-ack".to_string(),
+                consumer: consumer.to_string(),
+                acked_sequence: sequence.value(),
+            })
         })
     }
 }
@@ -1278,5 +1277,105 @@ mod tests {
         let err = exercise_primary_serve(&d, &[], "projector", "ack-txn").unwrap_err();
         assert!(err.to_string().contains("at least one event"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod runtime_cache_tests {
+    use super::*;
+    use crate::{runtime_open_count, EventLogDriver};
+
+    /// Unique per call — the cache is keyed by path, so two tests sharing one
+    /// path would share a runtime and the counts would depend on test order.
+    fn temp_log(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ehdb-rtcache-{tag}-{}-{n}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn driver(path: &std::path::Path) -> LocalReferenceEventLogDriver {
+        LocalReferenceEventLogDriver::new(path.to_path_buf(), "t".to_string(), "n".to_string())
+    }
+
+    fn append_n(d: &LocalReferenceEventLogDriver, n: usize) {
+        for i in 0..n {
+            d.append(&EventLogAppendRequest {
+                execution_id: "exec1".to_string(),
+                transaction_id: format!("tx-{i}"),
+                payload: format!("{{\"i\":{i}}}"),
+            })
+            .expect("append");
+        }
+    }
+
+    /// The whole point of the cache, stated as a count rather than a duration,
+    /// plus the durability it must not trade away.
+    ///
+    /// Without the cache every driver call runs `LocalReferenceRuntime::open`,
+    /// which replays the entire log — so replays track operations and one
+    /// append costs a pass over everything appended before it
+    /// (noetl/ai-meta#155: 835 ms per operation on a 161 MB production store,
+    /// independent of how much data the operation returned).
+    ///
+    /// Timing this would be flaky; counting replays says the same thing
+    /// exactly. Asserted in BOTH directions, so a cache that silently stops
+    /// engaging fails here rather than in production.
+    ///
+    /// One test, not two: the switch is a process-global env var and
+    /// `cargo test` does not serialise tests, so two tests toggling it race.
+    #[test]
+    fn cache_collapses_replays_and_still_writes_through() {
+        // --- arm A: cache OFF, one replay per operation -------------------
+        let p1 = temp_log("off");
+        std::env::set_var("NOETL_EHDB_REFERENCE_RUNTIME_CACHE", "false");
+        let d1 = driver(&p1);
+        append_n(&d1, 5);
+        let uncached = runtime_open_count(&p1);
+        assert_eq!(
+            uncached, 5,
+            "cache off must replay once per append; got {uncached}"
+        );
+
+        // --- arm B: cache ON, one replay for the whole path ---------------
+        let p2 = temp_log("on");
+        std::env::set_var("NOETL_EHDB_REFERENCE_RUNTIME_CACHE", "true");
+        let d2 = driver(&p2);
+        append_n(&d2, 5);
+        let cached = runtime_open_count(&p2);
+        assert_eq!(
+            cached, 1,
+            "cache on must replay exactly once per path; got {cached}"
+        );
+
+        // --- arm C: the cached writer still lands on disk -----------------
+        // Drop the cached state and read the file cold: if the append had only
+        // updated memory, this is where it would show.
+        std::env::remove_var("NOETL_EHDB_REFERENCE_RUNTIME_CACHE");
+        crate::invalidate_cached_runtime(&p2);
+        let out = d2
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 100,
+            })
+            .expect("scan");
+        assert_eq!(out.record_count, 5, "cached appends must be on disk");
+        assert_eq!(
+            out.records
+                .iter()
+                .map(|r| r.global_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "sequence must stay monotonic and gapless through the cache"
+        );
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
     }
 }
