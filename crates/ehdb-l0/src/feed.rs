@@ -45,6 +45,32 @@ pub struct ChangeFeed {
     cursor: u64,
 }
 
+/// Records delivered per [`ChangeFeed::poll`] batch, from
+/// `EHDB_FEED_BATCH_LIMIT` (default 2000).
+///
+/// The default is chosen against measured prod records (~8 KiB serialised
+/// apiece on the events feed), putting a full batch near 16 MiB of frame — two
+/// orders of magnitude under the 3313 MiB peak that caused noetl/ai-meta#298,
+/// and still large enough that a caught-up feed almost always drains in one
+/// round trip.
+///
+/// `0` is treated as "unbounded" so the old behaviour remains reachable for a
+/// deliberate operator override; it is not the default precisely because
+/// unbounded is what broke.
+pub fn default_batch_limit() -> usize {
+    match std::env::var("EHDB_FEED_BATCH_LIMIT") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => usize::MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT_FEED_BATCH_LIMIT,
+        },
+        Err(_) => DEFAULT_FEED_BATCH_LIMIT,
+    }
+}
+
+/// Default for [`default_batch_limit`].
+pub const DEFAULT_FEED_BATCH_LIMIT: usize = 2000;
+
 impl ChangeFeed {
     /// Watch `shard` for records with sort key `> from_cursor`. `from_cursor = 0`
     /// replays the shard from the beginning; passing the engine's current tip
@@ -78,7 +104,26 @@ impl ChangeFeed {
     /// caught up). Idempotent at a fixed cursor: polling again without a new
     /// append returns nothing.
     pub fn poll<D: Dataset>(&mut self, engine: &L0Engine<D>) -> Result<Vec<D::Record>> {
-        let batch = engine.read_partition_after(self.shard, self.cursor)?;
+        self.poll_limited(engine, default_batch_limit())
+    }
+
+    /// [`poll`](Self::poll) delivering at most `limit` records per call.
+    ///
+    /// This is what keeps a replay-from-0 boot from being O(log) in memory. A
+    /// short batch is indistinguishable from a caught-up feed to every existing
+    /// caller — both re-poll from the advanced cursor — so bounding costs an
+    /// extra round trip per batch and changes nothing else.
+    ///
+    /// Deliberately *not* a persisted cursor and *not* an ack. A cursor that
+    /// survives a restart and outruns a freshly-emptied in-memory index is the
+    /// noetl/ai-meta#119 stall, which replay-from-0 exists to prevent. Bounding
+    /// the batch fixes the memory shape without touching that guarantee.
+    pub fn poll_limited<D: Dataset>(
+        &mut self,
+        engine: &L0Engine<D>,
+        limit: usize,
+    ) -> Result<Vec<D::Record>> {
+        let batch = engine.read_partition_after_limited(self.shard, self.cursor, limit)?;
         if let Some(last) = batch.last() {
             self.cursor = D::sort_key(last);
         }

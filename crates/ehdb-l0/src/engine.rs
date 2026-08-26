@@ -1007,6 +1007,44 @@ impl<D: Dataset> L0Engine<D> {
     /// (unsealed) hot buffer for the shard is included, so a just-appended record
     /// is visible to a follower immediately (the shadow-feed / delivery path).
     pub fn read_partition_after(&self, shard: u32, after_seq: u64) -> Result<Vec<D::Record>> {
+        self.read_partition_after_limited(shard, after_seq, usize::MAX)
+    }
+
+    /// `read_partition_after`, but delivering at most `limit` records.
+    ///
+    /// The unlimited form reads *the whole tail into one `Vec`*, and the feed
+    /// then serialises that into a single frame. At `after_seq = 0` — which is
+    /// what every replay-from-0 boot asks for — "the whole tail" is the whole
+    /// log, so the delivery buffer is O(log). On prod that reached **3313 MiB**
+    /// for 29,608 records against a 2 GiB container limit, and the system pool
+    /// OOM-crashlooped for twelve days (noetl/ai-meta#298).
+    ///
+    /// Note what was *not* wrong: the consumer's resident index was correctly
+    /// bounded the whole time (`NOETL_STATE_INDEX_MAX_BYTES`, 112 MiB resident
+    /// against a 256 MiB ceiling). The configured limit bounded the resting
+    /// index; nothing bounded the buffer the records arrive in. That is why
+    /// every limit read healthy while the pod died.
+    ///
+    /// The early break is sound because [`Manifest::prune`] returns parts sorted
+    /// by `min_sequence`: once `limit` records are in hand, every remaining part
+    /// holds strictly higher sort keys, so the lowest `limit` records after the
+    /// cursor are already collected. The hot buffer is the tail and is only read
+    /// when the limit has not been reached. Peak becomes O(one part + limit)
+    /// rather than O(log).
+    ///
+    /// Callers keep their cursor semantics unchanged: a short batch is exactly
+    /// what a caught-up feed already returns, and the caller re-polls from the
+    /// new cursor. No cursor is persisted and no ack is introduced, so the #119
+    /// self-rehydrating shape is untouched.
+    pub fn read_partition_after_limited(
+        &self,
+        shard: u32,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<D::Record>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out: Vec<D::Record> = Vec::new();
 
         let candidate_parts: Vec<_> = {
@@ -1017,6 +1055,11 @@ impl<D: Dataset> L0Engine<D> {
         };
 
         for part in &candidate_parts {
+            // Parts arrive in ascending `min_sequence`, so anything past this
+            // point is strictly higher than what is already collected.
+            if out.len() >= limit {
+                break;
+            }
             // Sparse-index start offset for the cursor; read from there to the
             // part end (the feed wants the shard's whole tail, no index narrowing).
             let start_offset = part.sparse_index.locate(after_seq + 1);
@@ -1041,16 +1084,20 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
 
-        // The active (unsealed) hot buffer for this shard.
-        if let Some(writer) = self.writers.get(&shard) {
-            for rec in writer.pending_records() {
-                if D::sort_key(rec) > after_seq {
-                    out.push(rec.clone());
+        // The active (unsealed) hot buffer for this shard — the tail, so it is
+        // only worth reading when the limit has not already been reached.
+        if out.len() < limit {
+            if let Some(writer) = self.writers.get(&shard) {
+                for rec in writer.pending_records() {
+                    if D::sort_key(rec) > after_seq {
+                        out.push(rec.clone());
+                    }
                 }
             }
         }
 
         out.sort_by_key(D::sort_key);
+        out.truncate(limit);
         Ok(out)
     }
 
