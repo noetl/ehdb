@@ -137,4 +137,3 @@ impl ChangeFeed {
         self.cursor = cursor;
     }
 }
-

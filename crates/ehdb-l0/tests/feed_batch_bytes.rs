@@ -29,7 +29,9 @@ fn engine_with(n: u64, payload_bytes: usize, tag: &str) -> L0Engine<D1EventLog> 
     let mut engine = L0Engine::<D1EventLog>::open(cfg, store).unwrap();
     let payload = "x".repeat(payload_bytes);
     for i in 0..n {
-        engine.append(&format!("e{i}"), "t", payload.clone()).unwrap();
+        engine
+            .append(&format!("e{i}"), "t", payload.clone())
+            .unwrap();
     }
     engine
 }
@@ -45,7 +47,11 @@ fn the_delivered_frame_is_bounded_by_batch_not_by_log_size() {
         let engine = engine_with(n, 512, &format!("n{n}"));
 
         // Pre-#298 shape: one unbounded poll = the whole log in one frame.
-        let unbounded = frame_bytes(&ChangeFeed::new(0, 0).poll_limited(&engine, usize::MAX).unwrap());
+        let unbounded = frame_bytes(
+            &ChangeFeed::new(0, 0)
+                .poll_limited(&engine, usize::MAX)
+                .unwrap(),
+        );
 
         // Post-fix: the largest single frame across a full bounded drain.
         let mut feed = ChangeFeed::new(0, 0);
@@ -59,14 +65,23 @@ fn the_delivered_frame_is_bounded_by_batch_not_by_log_size() {
             worst = worst.max(frame_bytes(&b));
             total += b.len();
         }
-        assert_eq!(total as u64, n, "the bounded drain must deliver every record");
+        assert_eq!(
+            total as u64, n,
+            "the bounded drain must deliver every record"
+        );
         rows.push((n, unbounded, worst));
     }
 
     println!("\n  log records | UNBOUNDED frame | BOUNDED worst frame | reduction");
     println!("  ------------+-----------------+---------------------+----------");
     for (n, u, w) in &rows {
-        println!("  {:>11} | {:>13} B | {:>17} B | {:>6.1}x", n, u, w, *u as f64 / *w as f64);
+        println!(
+            "  {:>11} | {:>13} B | {:>17} B | {:>6.1}x",
+            n,
+            u,
+            w,
+            *u as f64 / *w as f64
+        );
     }
     println!();
 

@@ -32,7 +32,9 @@ fn engine_with(n: u64, tag: &str) -> L0Engine<D1EventLog> {
     let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&obj).unwrap());
     let mut engine = L0Engine::<D1EventLog>::open(cfg, store).unwrap();
     for i in 0..n {
-        engine.append(&format!("e{i}"), "t", format!("p{i}")).unwrap();
+        engine
+            .append(&format!("e{i}"), "t", format!("p{i}"))
+            .unwrap();
     }
     engine
 }
@@ -82,8 +84,14 @@ fn a_bounded_drain_reproduces_the_unbounded_sequence_exactly() {
         drained.extend(seqs(&b));
     }
 
-    assert_eq!(unbounded, drained, "bounded drain must equal the unbounded read");
-    assert!(batches > 1, "the fixture must actually span multiple batches");
+    assert_eq!(
+        unbounded, drained,
+        "bounded drain must equal the unbounded read"
+    );
+    assert!(
+        batches > 1,
+        "the fixture must actually span multiple batches"
+    );
     assert_eq!(drained.len(), 300);
 }
 
@@ -108,7 +116,11 @@ fn a_zero_limit_delivers_nothing_and_does_not_move_the_cursor() {
     let engine = engine_with(50, "zero");
     let mut feed = ChangeFeed::new(0, 0);
     assert!(feed.poll_limited(&engine, 0).unwrap().is_empty());
-    assert_eq!(feed.cursor(), 0, "an empty batch must not advance the cursor");
+    assert_eq!(
+        feed.cursor(),
+        0,
+        "an empty batch must not advance the cursor"
+    );
 }
 
 /// If the effective default ever resolves to unbounded, the fix is inert and
@@ -118,7 +130,11 @@ fn a_zero_limit_delivers_nothing_and_does_not_move_the_cursor() {
 #[test]
 fn the_effective_default_is_bounded_and_actually_caps_a_poll() {
     let limit = ehdb_l0::feed::default_batch_limit();
-    assert_ne!(limit, usize::MAX, "the shipped default must bound the batch");
+    assert_ne!(
+        limit,
+        usize::MAX,
+        "the shipped default must bound the batch"
+    );
     assert!(limit > 0, "a default of 0 would wedge every consumer");
 
     // And prove the default is not merely a number: a log longer than it must
