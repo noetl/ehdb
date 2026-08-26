@@ -181,10 +181,49 @@ pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Largest frame body this process will allocate for, from
+/// `EHDB_FEED_MAX_FRAME_BYTES` (default 64 MiB). `0` disables the cap.
+///
+/// The length prefix is a `u32`, so before this cap a peer could name any size
+/// up to 4 GiB and the reader would allocate it sight-unseen — a pure
+/// `vec![0u8; n]` on a number that arrived over the socket. Under
+/// noetl/ai-meta#298 that was not hypothetical: a replay-from-0 batch was
+/// delivered as one whole-log frame and the consumer died allocating it.
+///
+/// Bounding the batch (`ChangeFeed::poll_limited`) is what makes frames small;
+/// this cap is the backstop that keeps a *malformed or pre-fix* peer from
+/// reintroducing the same allocation. Deliberately generous — it should never
+/// fire against a bounded producer.
+///
+/// ⚠ Roll order: a pre-#298 writer still emits whole-tail frames, so upgrade
+/// **writers before consumers**. The reverse order can trip this cap on a large
+/// replay, which surfaces as a resubscribe loop rather than an OOM.
+fn max_frame_bytes() -> usize {
+    match std::env::var("EHDB_FEED_MAX_FRAME_BYTES") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => usize::MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT_MAX_FRAME_BYTES,
+        },
+        Err(_) => DEFAULT_MAX_FRAME_BYTES,
+    }
+}
+
+/// Default for [`max_frame_bytes`].
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
+    let cap = max_frame_bytes();
+    if n > cap {
+        // Refuse *before* allocating. Returning an error makes the caller
+        // resubscribe, which is a recoverable loop; allocating would not be.
+        return Err(io_err(format!(
+            "events-feed frame of {n} bytes exceeds EHDB_FEED_MAX_FRAME_BYTES ({cap});              refusing to allocate (noetl/ai-meta#298)"
+        )));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     Ok(buf)
