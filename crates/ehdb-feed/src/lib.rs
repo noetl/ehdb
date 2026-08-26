@@ -142,6 +142,37 @@ pub const KEEPALIVE_RETRIES: u32 = 3;
 /// With keepalive armed, the kernel probes an idle connection and a dead peer
 /// becomes an ordinary `io::Error` within ~11 s, so the existing
 /// error-then-reconnect paths do their job unchanged.
+/// The hard ceiling on a single blocking read, from `EHDB_READ_HARD_CEILING_MS`
+/// (default 300_000 = 5 minutes). `0` disables it.
+///
+/// This exists because "let keepalive own liveness" was not a fallback — it was
+/// an **unbounded park**. On a first deadline miss against a peer that had not
+/// yet proven it heartbeats, all three read loops set `read_deadline = None`,
+/// and every subsequent read awaited with no timeout at all. TCP keepalive is
+/// the only thing left, and keepalive cannot see a peer that is *alive but
+/// stuck* — which is precisely the case the surrounding comments say the
+/// heartbeat exists to catch. The disarm removed the defense exactly when it
+/// was needed (noetl/ai-meta#297).
+///
+/// A miss now **demotes** to this ceiling instead of disarming; a second miss at
+/// the ceiling returns an error and the caller redials. Redialling an idle bus
+/// is cheap. Parking on a stuck one is a silent, unbounded dispatch stall — one
+/// ran ~36 h in kind and ~2.4 days on prod (noetl/ai-meta#208) with the pod
+/// Running, 1/1, probes green and nothing logged.
+pub fn hard_read_ceiling() -> Option<Duration> {
+    match std::env::var("EHDB_READ_HARD_CEILING_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(DEFAULT_READ_HARD_CEILING),
+        },
+        Err(_) => Some(DEFAULT_READ_HARD_CEILING),
+    }
+}
+
+/// Default for [`hard_read_ceiling`].
+pub const DEFAULT_READ_HARD_CEILING: Duration = Duration::from_millis(300_000);
+
 pub(crate) fn configure_stream(sock: &TcpStream) -> io::Result<()> {
     sock.set_nodelay(true)?;
     let keepalive = socket2::TcpKeepalive::new()
@@ -569,6 +600,9 @@ pub struct FeedSubscription {
     /// Has this connection ever seen a heartbeat? Only then is a missed one
     /// evidence of a dead peer.
     peer_heartbeats: bool,
+    /// Has a deadline miss already demoted this connection to the hard ceiling?
+    /// A second miss at the ceiling is treated as a dead peer (noetl/ai-meta#297).
+    deadline_demoted: bool,
 }
 
 impl FeedSubscription {
@@ -607,6 +641,7 @@ impl FeedSubscription {
             sock,
             read_deadline: heartbeat.map(|hb| hb * HEARTBEAT_MISS_FACTOR),
             peer_heartbeats: false,
+            deadline_demoted: false,
         })
     }
 
@@ -633,10 +668,31 @@ impl FeedSubscription {
                             )));
                         }
                         Err(_) => {
-                            // Never heartbeated: treat the peer as heartbeat-unaware
-                            // rather than dead, and let keepalive own liveness.
-                            self.read_deadline = None;
-                            continue;
+                            // Never heartbeated. Do NOT disarm — that is an
+                            // unbounded park, and keepalive cannot see a peer
+                            // that is alive but stuck (noetl/ai-meta#297).
+                            // Demote to the hard ceiling once; a miss at the
+                            // ceiling means dead, so error and let the caller
+                            // redial.
+                            match crate::hard_read_ceiling() {
+                                Some(ceiling) if !self.deadline_demoted => {
+                                    self.deadline_demoted = true;
+                                    self.read_deadline = Some(ceiling);
+                                    continue;
+                                }
+                                Some(ceiling) => {
+                                    return Err(io_err(format!(
+                                        "events-feed writer silent for {}ms with no heartbeat; \
+                                         treating as dead (noetl/ai-meta#297)",
+                                        ceiling.as_millis()
+                                    )));
+                                }
+                                None => {
+                                    // Explicitly disabled by the operator.
+                                    self.read_deadline = None;
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }

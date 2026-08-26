@@ -575,6 +575,9 @@ pub struct ClaimClient {
     /// Has this connection ever seen a heartbeat? Only then is a missed one
     /// evidence of a dead peer.
     peer_heartbeats: bool,
+    /// Has a deadline miss already demoted this connection to the hard ceiling?
+    /// A second miss at the ceiling is treated as a dead peer (noetl/ai-meta#297).
+    deadline_demoted: bool,
 }
 
 impl ClaimClient {
@@ -616,6 +619,7 @@ impl ClaimClient {
             heartbeat,
             read_deadline: heartbeat.map(|hb| hb * HEARTBEAT_MISS_FACTOR),
             peer_heartbeats: false,
+            deadline_demoted: false,
         })
     }
 
@@ -650,10 +654,31 @@ impl ClaimClient {
                             )));
                         }
                         Err(_) => {
-                            // Never heartbeated: treat the peer as heartbeat-unaware
-                            // rather than dead, and let keepalive own liveness.
-                            self.read_deadline = None;
-                            continue;
+                            // Never heartbeated. Do NOT disarm — that is an
+                            // unbounded park, and keepalive cannot see a peer
+                            // that is alive but stuck (noetl/ai-meta#297).
+                            // Demote to the hard ceiling once; a miss at the
+                            // ceiling means dead, so error and let the caller
+                            // redial.
+                            match crate::hard_read_ceiling() {
+                                Some(ceiling) if !self.deadline_demoted => {
+                                    self.deadline_demoted = true;
+                                    self.read_deadline = Some(ceiling);
+                                    continue;
+                                }
+                                Some(ceiling) => {
+                                    return Err(io_err(format!(
+                                        "claim coordinator silent for {}ms with no heartbeat; \
+                                         treating as dead (noetl/ai-meta#297)",
+                                        ceiling.as_millis()
+                                    )));
+                                }
+                                None => {
+                                    // Explicitly disabled by the operator.
+                                    self.read_deadline = None;
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
