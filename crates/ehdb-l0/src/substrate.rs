@@ -50,6 +50,17 @@ pub trait DurableSubstrate: Send + Sync {
     /// Write an **immutable** object. Returns `Ok(true)` if newly written,
     /// `Ok(false)` if an object already existed at `key` (idempotent re-upload —
     /// parts are content-stable, so a duplicate upload is a no-op, not an error).
+    /// Where this substrate's bytes physically live (noetl/ehdb#332).
+    ///
+    /// ⚠ Defaults to [`FailureDomain::Undeclared`] so existing implementations
+    /// keep compiling — but an undeclared substrate can never be *shown* to be
+    /// independent of another, and [`crate::failure_domain::validate_replica_domains`]
+    /// refuses a replica set built from them. Silence is not treated as
+    /// independence.
+    fn failure_domain(&self) -> crate::failure_domain::FailureDomain {
+        crate::failure_domain::FailureDomain::Undeclared
+    }
+
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool>;
 
     /// Overwrite a **mutable pointer** object (the manifest `LATEST` pointer and
@@ -60,6 +71,11 @@ pub trait DurableSubstrate: Send + Sync {
     /// Fetch a byte range `[offset, offset+len)` of an object — the core L0
     /// primitive that lets a lookup read *only* the resolved granule, not the
     /// whole part.
+    /// ⚠ A range extending past the end of the object is a **hard error**, not
+    /// a short read: the manifest states every part's length, so an over-read
+    /// means the caller and the store disagree, and returning fewer bytes would
+    /// let a truncated object read as intact. Pinned by the substrate
+    /// conformance suite across every implementation (noetl/ehdb#332).
     fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>>;
 
     /// Fetch a whole object (used for small manifests and for full-part replay on
@@ -131,7 +147,21 @@ impl LocalFsSubstrate {
     }
 }
 
+impl LocalFsSubstrate {
+    /// This substrate's root — used to detect a replica nested inside another.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
 impl DurableSubstrate for LocalFsSubstrate {
+    /// ⚠ Resolved from the root's **device id**, not its path. Two directories
+    /// on one PVC have different paths and the same device — the production
+    /// case — and a path comparison would call them independent.
+    fn failure_domain(&self) -> crate::failure_domain::FailureDomain {
+        crate::failure_domain::FailureDomain::for_path(&self.root)
+    }
+
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         let target = self.resolve(key)?;
         if target.exists() {
@@ -286,6 +316,14 @@ impl<S: DurableSubstrate> CountingSubstrate<S> {
 }
 
 impl<S: DurableSubstrate> DurableSubstrate for CountingSubstrate<S> {
+    /// ⚠ Forwarded, not defaulted. A decorator that let this fall back to
+    /// `Undeclared` would silently downgrade a real substrate's domain and make
+    /// a validated replica set fail — or, worse, make an unvalidated one look
+    /// undeclared rather than shared.
+    fn failure_domain(&self) -> crate::failure_domain::FailureDomain {
+        self.inner.failure_domain()
+    }
+
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         if let Some(latency) = self.put_latency {
             std::thread::sleep(latency);
@@ -440,5 +478,108 @@ mod tests {
             &["parts/a"]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// **A second `DurableSubstrate` implementation** (noetl/ehdb#332, F5).
+///
+/// Its purpose is to make the trait's contract testable against something that
+/// is not a filesystem — until this existed, `DurableSubstrate` had exactly one
+/// implementation, so nothing distinguished "the trait's contract" from
+/// "whatever `LocalFsSubstrate` happens to do". The conformance suite runs
+/// against both.
+///
+/// ⚠⚠ **Not a durability answer.** It is process memory: it dies with the
+/// process and is [`FailureDomain::Ephemeral`], which
+/// [`crate::failure_domain::survives_node_loss`] correctly refuses to count. A
+/// real independent failure domain needs an off-node store — see
+/// `docs/spec/second-substrate.md`.
+#[derive(Debug)]
+pub struct InMemorySubstrate {
+    instance: String,
+    objects: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+
+impl InMemorySubstrate {
+    pub fn new(instance: impl Into<String>) -> Self {
+        Self {
+            instance: instance.into(),
+            objects: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl DurableSubstrate for InMemorySubstrate {
+    fn failure_domain(&self) -> crate::failure_domain::FailureDomain {
+        crate::failure_domain::FailureDomain::Ephemeral {
+            instance: self.instance.clone(),
+        }
+    }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let mut g = self.objects.lock().unwrap();
+        if g.contains_key(key) {
+            return Ok(false);
+        }
+        g.insert(key.to_string(), bytes.to_vec());
+        Ok(true)
+    }
+
+    fn put_overwrite(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let g = self.objects.lock().unwrap();
+        let obj = g
+            .get(key)
+            .ok_or_else(|| EhdbError::NotFound(format!("substrate object {key}")))?;
+        let start = offset as usize;
+        let end = start.saturating_add(len as usize);
+        // ⚠ A range past the end is an ERROR, not a short read. The manifest
+        // states every part's length, so an over-read means the caller and the
+        // store disagree about the object — and returning fewer bytes would let
+        // a truncated part read as intact. `LocalFsSubstrate` uses `read_exact`
+        // and fails the same way; the conformance suite pins that they agree.
+        if end > obj.len() {
+            return Err(EhdbError::Storage(format!(
+                "get_range {key}: [{offset}, {end}) exceeds object length {}",
+                obj.len()
+            )));
+        }
+        Ok(obj[start..end].to_vec())
+    }
+
+    fn get_all(&self, key: &str) -> Result<Vec<u8>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| EhdbError::NotFound(format!("substrate object {key}")))
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.objects.lock().unwrap().contains_key(key))
+    }
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
     }
 }

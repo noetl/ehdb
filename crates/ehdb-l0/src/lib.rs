@@ -140,6 +140,7 @@ pub mod columnar;
 pub mod command_queue;
 pub mod dataset;
 pub mod engine;
+pub mod failure_domain;
 pub mod feed;
 pub mod frame;
 pub mod kv;
@@ -168,6 +169,10 @@ pub use dataset::{
     DEFAULT_SHARD_COUNT,
 };
 pub use engine::{L0Config, L0Engine, L0EventLogEngine, ReplicaTarget};
+pub use failure_domain::{
+    check_replica_domains, survives_node_loss, validate_replica_domains, DomainViolation,
+    FailureDomain, ReplicaDomain,
+};
 pub use feed::ChangeFeed;
 pub use kv::{KvDataset, KvEntry, KvOp, KvStore, DATASET_D4_KV};
 pub use merge::{MergePlan, MergePolicy};
@@ -187,7 +192,7 @@ pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use runtime::{
     RuntimeDataset, RuntimeEvent, RuntimeOp, RuntimeState, RuntimeStore, DATASET_D8_RUNTIME,
 };
-pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
+pub use substrate::{CountingSubstrate, DurableSubstrate, InMemorySubstrate, LocalFsSubstrate};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
 pub use wasm::{
     wasm_key, WasmBinding, WasmDataset, WasmModule, WasmOp, WasmOpKind, WasmStore, DATASET_D9_WASM,
