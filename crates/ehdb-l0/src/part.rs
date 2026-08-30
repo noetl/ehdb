@@ -21,6 +21,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ehdb_core::{EhdbError, Result};
 
@@ -78,6 +79,13 @@ pub struct PartWriter<D: Dataset> {
     granule_size: u32,
     seal_max_bytes: u64,
     seal_max_records: u64,
+    /// **Age-based seal trigger** (noetl/ehdb#329) — seal an active part once
+    /// its oldest record is this old, regardless of size or count.
+    ///
+    /// `None` (the default) is today's behavior: size and count only, which
+    /// makes the durability window **unbounded in time** on a shard that goes
+    /// quiet. Off by default so enabling it is a deliberate, reversible act.
+    seal_max_age: Option<Duration>,
     flush: FlushPolicy,
 
     // --- active part state ---
@@ -89,6 +97,10 @@ pub struct PartWriter<D: Dataset> {
     max_sequence: u64,
     byte_len: u64,
     record_count: u64,
+    /// When the **first** record of the current active part was appended. The
+    /// age trigger measures from here, so it bounds the wait of the *oldest*
+    /// record rather than the newest.
+    first_append_at: Option<Instant>,
     unflushed_since_fsync: u32,
 }
 
@@ -115,6 +127,7 @@ impl<D: Dataset> PartWriter<D> {
             granule_size: granule_size.max(1),
             seal_max_bytes,
             seal_max_records,
+            seal_max_age: None,
             flush,
             active_path: PathBuf::new(),
             file: None,
@@ -123,6 +136,7 @@ impl<D: Dataset> PartWriter<D> {
             min_sequence: 0,
             max_sequence: 0,
             byte_len: 0,
+            first_append_at: None,
             record_count: 0,
             unflushed_since_fsync: 0,
         };
@@ -140,6 +154,7 @@ impl<D: Dataset> PartWriter<D> {
         self.max_sequence = 0;
         self.byte_len = 0;
         self.record_count = 0;
+        self.first_append_at = None;
         self.unflushed_since_fsync = 0;
 
         // noetl/ai-meta#209 defect 2 — recover, do not truncate.
@@ -225,6 +240,12 @@ impl<D: Dataset> PartWriter<D> {
             intact_len = frame.offset + frame.frame_len;
         }
         self.byte_len = intact_len;
+        if self.record_count > 0 && self.first_append_at.is_none() {
+            // Recovered from a crashed active part. The records' true append
+            // instants are not knowable, so the window restarts now — which
+            // understates their age rather than inventing one.
+            self.first_append_at = Some(Instant::now());
+        }
         // Drop a torn tail so the part stays parseable from here on.
         if intact_len < bytes.len() as u64 {
             let file = OpenOptions::new()
@@ -299,6 +320,9 @@ impl<D: Dataset> PartWriter<D> {
         }
         self.max_sequence = sort_key;
         self.byte_len += frame.len() as u64;
+        if self.record_count == 0 {
+            self.first_append_at = Some(Instant::now());
+        }
         self.record_count += 1;
         // Grow the current granule's count.
         if let Some(last) = self.marks.last_mut() {
@@ -347,10 +371,42 @@ impl<D: Dataset> PartWriter<D> {
         Ok(Some(dup))
     }
 
-    /// Whether the active part has hit a seal trigger (size or record count).
+    /// Whether the active part has hit a seal trigger (size, record count, or
+    /// — when configured — **age**).
+    ///
+    /// ⚠ Size and count alone leave the durability window **unbounded in time**:
+    /// a shard that appends a few records and goes quiet never seals, never
+    /// uploads, and never replicates. The age trigger is what bounds it, and it
+    /// is off unless `seal_max_age` is set (noetl/ehdb#329).
     pub fn should_seal(&self) -> bool {
         self.record_count > 0
-            && (self.byte_len >= self.seal_max_bytes || self.record_count >= self.seal_max_records)
+            && (self.byte_len >= self.seal_max_bytes
+                || self.record_count >= self.seal_max_records
+                || self.aged_out())
+    }
+
+    /// Whether the age trigger alone would seal this part.
+    ///
+    /// ⚠ Separate from [`Self::should_seal`] on purpose: an idle shard takes no
+    /// appends, so nothing calls `should_seal` for it. Something must drive the
+    /// age check on a timer — see `L0Engine::seal_aged_parts`. A trigger that is
+    /// only consulted on append cannot fire on the shard it exists to protect.
+    pub fn aged_out(&self) -> bool {
+        match (self.seal_max_age, self.first_append_at) {
+            (Some(limit), Some(since)) => self.record_count > 0 && since.elapsed() >= limit,
+            _ => false,
+        }
+    }
+
+    /// Configure the age trigger. `None` restores today's size/count-only
+    /// behavior.
+    pub fn set_seal_max_age(&mut self, age: Option<Duration>) {
+        self.seal_max_age = age;
+    }
+
+    /// How long the oldest record in the active part has been waiting, if any.
+    pub fn active_age(&self) -> Option<Duration> {
+        self.first_append_at.map(|t| t.elapsed())
     }
 
     /// Whether the active part holds any un-sealed records.

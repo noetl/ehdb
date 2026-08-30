@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ehdb_core::{EhdbError, Result};
 
@@ -69,6 +69,18 @@ pub struct L0Config {
     pub seal_max_bytes: u64,
     /// Seal a part once it reaches this record count.
     pub seal_max_records: u64,
+    /// **Age-based seal trigger** (noetl/ehdb#329). Seal an active part once its
+    /// oldest record is this old, whatever its size or count.
+    ///
+    /// `None` — the default — is today's behavior, and today's behavior leaves
+    /// the durability window **unbounded in time**: a shard that appends a few
+    /// records and goes quiet never seals, so those records never reach the
+    /// substrate. Off by default so enabling it is deliberate and reversible.
+    ///
+    /// ⚠ Setting this is necessary but not sufficient. An idle shard takes no
+    /// appends, so something must drive [`L0Engine::seal_aged_parts`] on a
+    /// timer; the flag alone is inert on exactly the shard it protects.
+    pub seal_max_age: Option<Duration>,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
     /// L0.3 background merge/compaction policy.
@@ -86,6 +98,7 @@ impl L0Config {
             granule_size: DEFAULT_GRANULE_SIZE,
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
+            seal_max_age: None,
             flush: FlushPolicy::EveryAppend,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
         }
@@ -126,6 +139,13 @@ impl L0Config {
         self
     }
     /// Set the byte-size seal threshold.
+    /// Enable the **age-based seal trigger** (noetl/ehdb#329). `None` restores
+    /// the size/count-only default.
+    pub fn with_seal_max_age(mut self, seal_max_age: Option<Duration>) -> Self {
+        self.seal_max_age = seal_max_age;
+        self
+    }
+
     pub fn with_seal_max_bytes(mut self, seal_max_bytes: u64) -> Self {
         self.seal_max_bytes = seal_max_bytes;
         self
@@ -550,6 +570,8 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_records,
                 self.config.flush,
             )?;
+            let mut writer = writer;
+            writer.set_seal_max_age(self.config.seal_max_age);
             // noetl/ai-meta#209 defect 2 — a writer that just recovered an
             // active part left by a crash holds records the manifest does not
             // know about, because the manifest lists sealed parts only. The
@@ -663,6 +685,59 @@ impl<D: Dataset> L0Engine<D> {
     /// The superseded source objects are left in place for the retention/GC slice
     /// (L0.5) to reclaim; the manifest no longer references them, so reads never
     /// touch them.
+    /// **Seal every active part that has aged out** and enqueue its upload.
+    /// Returns how many parts were sealed.
+    ///
+    /// ⚠ This exists because [`PartWriter::should_seal`] is only consulted on
+    /// append, and the shard the age trigger protects is by definition the one
+    /// taking no appends. Setting `seal_max_age` without driving this on a timer
+    /// leaves the trigger **inert on exactly the shard it was added for** — the
+    /// flag would be present, the config would look correct, and nothing would
+    /// ever fire.
+    ///
+    /// A no-op when `seal_max_age` is `None`, so a caller can drive it
+    /// unconditionally.
+    pub fn seal_aged_parts(&mut self) -> Result<usize> {
+        // ⚠ A cheap short-circuit, NOT the enforcement point. Removing it
+        // changes no behavior — `PartWriter::aged_out` already returns false
+        // with no configured limit — and mutation testing confirms that. It is
+        // kept to avoid walking every writer on the default path; do not read it
+        // as the thing that keeps the trigger off.
+        if self.config.seal_max_age.is_none() {
+            return Ok(0);
+        }
+        let aged: Vec<u32> = self
+            .writers
+            .iter()
+            .filter(|(_, w)| w.aged_out())
+            .map(|(shard, _)| *shard)
+            .collect();
+        let mut sealed_count = 0;
+        for shard in aged {
+            let sealed = match self.writers.get_mut(&shard) {
+                Some(w) => w.seal()?,
+                None => None,
+            };
+            if let Some(sealed) = sealed {
+                self.register_and_upload(sealed)?;
+                sealed_count += 1;
+            }
+        }
+        Ok(sealed_count)
+    }
+
+    /// The age of the oldest un-sealed record per shard — what the age trigger
+    /// is comparing against.
+    pub fn active_ages(&self) -> Vec<(u32, Duration)> {
+        let mut out: Vec<(u32, Duration)> = self
+            .writers
+            .iter()
+            .filter_map(|(shard, w)| w.active_age().map(|age| (*shard, age)))
+            .collect();
+        out.sort_by_key(|(shard, _)| *shard);
+        out
+    }
+
     pub fn run_pending_merges(&mut self) -> Result<usize> {
         let mut count = 0;
         loop {
