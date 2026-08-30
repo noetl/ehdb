@@ -19,9 +19,7 @@ PostgreSQL, NATS JetStream, and external object stores.
 views are projections; vector retrieval is a **vectorized projection** over
 bounded, execution-scoped candidate sets, where exact cosine is sufficient and no
 ANN index is needed. Neither is replaced by an external engine — both are
-removed. Earlier text describing ANN indexes, Qdrant adapters or distributed
-query execution as "future surfaces" is superseded: they are not deferred, they
-are out of scope.
+removed — they are not deferred.
 
 ## Goals
 
@@ -359,9 +357,11 @@ over registered chunk embeddings. `VectorSearch` scopes candidates by
 tenant, namespace, and embedding model, validates finite non-zero query
 and embedding vectors, applies dimension compatibility, and returns
 deterministically ordered `VectorSearchHit` results. This is a local
-reference RAG primitive only; ANN indexes, retrieval services,
-production IAM, Qdrant adapters, and distributed query execution remain
-future surfaces.
+reference RAG primitive only. ⚠ ANN indexes, Qdrant adapters and
+distributed query execution are **out of scope** (ehdb#320), not deferred:
+retrieval is a vectorized projection over bounded candidate sets, so exact
+cosine is the design rather than a placeholder for one. Retrieval services and
+production IAM remain future surfaces.
 
 Retrieval metadata JSON decoding rejects unknown fields on documents,
 chunks, embeddings, registration requests, search requests, and local
@@ -377,8 +377,8 @@ gateway route, production retrieval API, or persistent daemon.
 The same service boundary also exposes exact local text matching through
 `SearchTextChunksRequest`, returning deterministic chunk hits with match
 counts for tenant/namespace-scoped RAG lookup fixtures. Full-text
-indexes, BM25 ranking, external search adapters, and distributed query
-execution remain future surfaces.
+indexes, BM25 ranking and external search adapters remain future surfaces;
+⚠ distributed query execution is **out of scope** (ehdb#320).
 `SearchHybridChunksRequest` combines exact cosine similarity and exact
 text match counts with caller-provided non-negative weights, producing
 deterministic hybrid RAG hits over replayed retrieval state. This is a
