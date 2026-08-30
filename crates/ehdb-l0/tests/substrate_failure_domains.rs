@@ -86,11 +86,107 @@ fn conformance(s: &dyn DurableSubstrate, name: &str) {
     s.delete("parts/a").unwrap(); // idempotent
 }
 
+/// Every `impl DurableSubstrate` in the workspace, run through the same suite.
+///
+/// ⚠ Decorators are included deliberately. `CountingSubstrate` already broke a
+/// contract once — it took the default `failure_domain()` instead of forwarding,
+/// silently downgrading a real substrate to `Undeclared`. A wrapper that
+/// forwards six methods correctly and the seventh wrongly is exactly as broken
+/// as a bad store, and only running it through the suite catches that.
 #[test]
-fn both_substrates_satisfy_the_same_contract() {
-    let dir = unique_dir("conformance");
-    conformance(&LocalFsSubstrate::new(&dir).unwrap(), "LocalFsSubstrate");
+fn every_substrate_implementation_satisfies_the_same_contract() {
+    use ehdb_l0::substrate::CountingSubstrate;
+    use std::sync::Arc;
+
+    // 1. the storage-backing filesystem impl
+    conformance(
+        &LocalFsSubstrate::new(&unique_dir("conf-fs")).unwrap(),
+        "LocalFsSubstrate",
+    );
+
+    // 2. the second storage-backing impl
     conformance(&InMemorySubstrate::new("test"), "InMemorySubstrate");
+
+    // 3. the decorator, over each of them
+    conformance(
+        &CountingSubstrate::new(LocalFsSubstrate::new(&unique_dir("conf-count-fs")).unwrap()),
+        "CountingSubstrate<LocalFsSubstrate>",
+    );
+    conformance(
+        &CountingSubstrate::new(InMemorySubstrate::new("counted")),
+        "CountingSubstrate<InMemorySubstrate>",
+    );
+
+    // 4. the `Arc<dyn ..>` blanket forward
+    let arced: Arc<dyn DurableSubstrate> = Arc::new(InMemorySubstrate::new("arced"));
+    conformance(&arced, "Arc<dyn DurableSubstrate>");
+}
+
+/// How many distinct `impl DurableSubstrate for` blocks the suite above covers.
+///
+/// ⚠ Keep this in step with that test. It is asserted against the source below,
+/// so adding an implementation without conformance-testing it fails CI rather
+/// than passing silently.
+const CONFORMANCE_COVERED_IMPLS: usize = 4;
+
+#[test]
+fn a_new_substrate_implementation_cannot_skip_the_conformance_suite() {
+    // ⚠⚠ The suite existing is not the same as the suite being APPLIED. Before
+    // this guard, a fifth `DurableSubstrate` could land fully untested and CI
+    // would stay green — the contract would be pinned for the impls someone
+    // remembered and unpinned for the one they added.
+    //
+    // Counts CODE, not prose: a doc comment naming the trait has cleared this
+    // kind of check before.
+    let src = include_str!("../src/substrate.rs");
+    let found = src
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//") && !l.starts_with("/*") && !l.starts_with('*'))
+        .filter(|l| l.contains("impl") && l.contains("DurableSubstrate for"))
+        .count();
+
+    assert_eq!(
+        found, CONFORMANCE_COVERED_IMPLS,
+        "found {found} `impl DurableSubstrate for` blocks in substrate.rs but the \
+         conformance suite covers {CONFORMANCE_COVERED_IMPLS}. Add the new \
+         implementation to `every_substrate_implementation_satisfies_the_same_contract` \
+         and bump CONFORMANCE_COVERED_IMPLS — a substrate that skips the suite is \
+         a contract nobody checked."
+    );
+}
+
+#[test]
+fn the_impl_counter_would_notice_a_new_implementation() {
+    // The positive control for the guard above. If the counting logic were
+    // broken — matching nothing, or matching a fixed number — the assertion
+    // would pass forever and pin nothing at all.
+    let src = include_str!("../src/substrate.rs");
+    let synthetic = format!("{src}\nimpl DurableSubstrate for Bogus {{}}\n");
+    let found = synthetic
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//") && !l.starts_with("/*") && !l.starts_with('*'))
+        .filter(|l| l.contains("impl") && l.contains("DurableSubstrate for"))
+        .count();
+    assert_eq!(
+        found,
+        CONFORMANCE_COVERED_IMPLS + 1,
+        "the counter must actually see a newly added implementation"
+    );
+
+    // And it must NOT be fooled by a doc comment that merely names the trait.
+    let commented = format!("{src}\n/// impl DurableSubstrate for NotReal\n");
+    let found_c = commented
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//") && !l.starts_with("/*") && !l.starts_with('*'))
+        .filter(|l| l.contains("impl") && l.contains("DurableSubstrate for"))
+        .count();
+    assert_eq!(
+        found_c, CONFORMANCE_COVERED_IMPLS,
+        "a doc comment naming the trait must not count as an implementation"
+    );
 }
 
 // ---------------------------------------------------------------------------
