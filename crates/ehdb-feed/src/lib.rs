@@ -47,8 +47,8 @@ pub use groups::{
 pub use kv::{serve_kv, KvClient, KvCoordinator};
 pub use publish::{serve_ingest, PipelinedPublishClient, PublishClient, PublishRouter};
 pub use scaler::{
-    bind_and_serve_snapshot_with_resume, render_prometheus, render_resume, render_snapshot,
-    LagSnapshot, ShardLag, SubjectLag,
+    bind_and_serve_snapshot_with_resume, render_prometheus, render_replicated_lag, render_resume,
+    render_snapshot, render_unreplicated, LagSnapshot, ShardLag, SubjectLag,
 };
 pub use subject::{Subject, SubjectFilter, SubjectFn};
 

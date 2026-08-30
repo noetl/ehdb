@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ehdb_core::{EhdbError, Result};
 
@@ -40,6 +40,7 @@ use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
 use crate::substrate::DurableSubstrate;
+use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 
 /// Back-compat alias: the D1 event-log engine is the generic [`L0Engine`]
 /// specialized to [`D1EventLog`]. It carries the D1 convenience API
@@ -68,6 +69,18 @@ pub struct L0Config {
     pub seal_max_bytes: u64,
     /// Seal a part once it reaches this record count.
     pub seal_max_records: u64,
+    /// **Age-based seal trigger** (noetl/ehdb#329). Seal an active part once its
+    /// oldest record is this old, whatever its size or count.
+    ///
+    /// `None` — the default — is today's behavior, and today's behavior leaves
+    /// the durability window **unbounded in time**: a shard that appends a few
+    /// records and goes quiet never seals, so those records never reach the
+    /// substrate. Off by default so enabling it is deliberate and reversible.
+    ///
+    /// ⚠ Setting this is necessary but not sufficient. An idle shard takes no
+    /// appends, so something must drive [`L0Engine::seal_aged_parts`] on a
+    /// timer; the flag alone is inert on exactly the shard it protects.
+    pub seal_max_age: Option<Duration>,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
     /// L0.3 background merge/compaction policy.
@@ -85,6 +98,7 @@ impl L0Config {
             granule_size: DEFAULT_GRANULE_SIZE,
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
+            seal_max_age: None,
             flush: FlushPolicy::EveryAppend,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
         }
@@ -125,6 +139,13 @@ impl L0Config {
         self
     }
     /// Set the byte-size seal threshold.
+    /// Enable the **age-based seal trigger** (noetl/ehdb#329). `None` restores
+    /// the size/count-only default.
+    pub fn with_seal_max_age(mut self, seal_max_age: Option<Duration>) -> Self {
+        self.seal_max_age = seal_max_age;
+        self
+    }
+
     pub fn with_seal_max_bytes(mut self, seal_max_bytes: u64) -> Self {
         self.seal_max_bytes = seal_max_bytes;
         self
@@ -169,6 +190,9 @@ struct UploadJob {
     substrate_key: String,
     local_path: String,
     part_id: String,
+    /// The part's shard — needed to close its durability window on the
+    /// [`UnreplicatedTracker`] when the upload lands (noetl/ehdb#328).
+    shard: u32,
     sealed_at: Instant,
 }
 
@@ -201,6 +225,10 @@ pub struct L0Engine<D: Dataset> {
     upload_handle: Option<JoinHandle<()>>,
     /// Outstanding upload count + condvar for `flush_and_wait_uploads`.
     outstanding: Arc<(Mutex<usize>, Condvar)>,
+    /// **The D1 durability window, measured from the append** (noetl/ehdb#328).
+    /// Shared with the uploader thread, which closes a part's window when it
+    /// becomes durable. Observability only — nothing here gates an append.
+    unreplicated: Arc<UnreplicatedTracker>,
 }
 
 impl<D: Dataset> L0Engine<D> {
@@ -343,6 +371,7 @@ impl<D: Dataset> L0Engine<D> {
         manifest: Manifest,
         global_sequence: u64,
     ) -> Self {
+        let shard_count = config.shard_count;
         Self {
             config,
             replicas,
@@ -354,6 +383,7 @@ impl<D: Dataset> L0Engine<D> {
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
+            unreplicated: Arc::new(UnreplicatedTracker::new(shard_count)),
         }
     }
 
@@ -363,6 +393,7 @@ impl<D: Dataset> L0Engine<D> {
         let manifest = Arc::clone(&self.manifest);
         let metrics = Arc::clone(&self.metrics);
         let outstanding = Arc::clone(&self.outstanding);
+        let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
@@ -408,6 +439,15 @@ impl<D: Dataset> L0Engine<D> {
 
                     let lag = job.sealed_at.elapsed().as_micros() as u64;
                     metrics.record_upload(bytes.len() as u64, lag);
+                    // Close this part's durability window and record the
+                    // **append→durable** latency. ⚠ `lag` above is measured from
+                    // the SEAL and cannot see the pre-seal term; this one can.
+                    // The failure paths above deliberately do NOT reach here —
+                    // a part that did not replicate is still pending, which is
+                    // what the window should keep reporting.
+                    if let Some(end_to_end) = unreplicated.on_upload_done(job.shard, &job.part_id) {
+                        metrics.record_replicated_lag(end_to_end.as_micros() as u64);
+                    }
                     decrement(&outstanding);
                 }
             })
@@ -445,6 +485,12 @@ impl<D: Dataset> L0Engine<D> {
             self.global_sequence = sort_key;
         }
         self.metrics.incr_appends();
+        // Open the record's durability window. ⚠ Under `FlushPolicy::CallerDriven`
+        // the ack lands after the caller's `fsync`, so counting here can include
+        // a record for the few microseconds before it is acked. That
+        // over-reports the window and never under-reports it — the safe
+        // direction for a durability signal.
+        self.unreplicated.on_append(shard);
 
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
@@ -524,6 +570,8 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_records,
                 self.config.flush,
             )?;
+            let mut writer = writer;
+            writer.set_seal_max_age(self.config.seal_max_age);
             // noetl/ai-meta#209 defect 2 — a writer that just recovered an
             // active part left by a crash holds records the manifest does not
             // know about, because the manifest lists sealed parts only. The
@@ -566,12 +614,17 @@ impl<D: Dataset> L0Engine<D> {
             .clone()
             .ok_or_else(|| EhdbError::InvalidState("sealed part missing local_path".into()))?;
         let part_id = sealed.meta.part_id.clone();
+        let shard = sealed.meta.partition;
+        let record_count = sealed.meta.record_count;
 
         {
             let mut m = self.manifest.lock().unwrap();
             m.push_part(sealed.meta);
         }
         self.metrics.incr_seals();
+        // The sealed part inherits the active part's first-append instant, so
+        // the window keeps measuring from the append rather than restarting.
+        self.unreplicated.on_seal(shard, &part_id, record_count);
 
         // Bump outstanding BEFORE sending so flush_and_wait never races a job.
         {
@@ -583,6 +636,7 @@ impl<D: Dataset> L0Engine<D> {
                 substrate_key,
                 local_path,
                 part_id,
+                shard,
                 sealed_at: Instant::now(),
             };
             if tx.send(job).is_err() {
@@ -631,6 +685,59 @@ impl<D: Dataset> L0Engine<D> {
     /// The superseded source objects are left in place for the retention/GC slice
     /// (L0.5) to reclaim; the manifest no longer references them, so reads never
     /// touch them.
+    /// **Seal every active part that has aged out** and enqueue its upload.
+    /// Returns how many parts were sealed.
+    ///
+    /// ⚠ This exists because [`PartWriter::should_seal`] is only consulted on
+    /// append, and the shard the age trigger protects is by definition the one
+    /// taking no appends. Setting `seal_max_age` without driving this on a timer
+    /// leaves the trigger **inert on exactly the shard it was added for** — the
+    /// flag would be present, the config would look correct, and nothing would
+    /// ever fire.
+    ///
+    /// A no-op when `seal_max_age` is `None`, so a caller can drive it
+    /// unconditionally.
+    pub fn seal_aged_parts(&mut self) -> Result<usize> {
+        // ⚠ A cheap short-circuit, NOT the enforcement point. Removing it
+        // changes no behavior — `PartWriter::aged_out` already returns false
+        // with no configured limit — and mutation testing confirms that. It is
+        // kept to avoid walking every writer on the default path; do not read it
+        // as the thing that keeps the trigger off.
+        if self.config.seal_max_age.is_none() {
+            return Ok(0);
+        }
+        let aged: Vec<u32> = self
+            .writers
+            .iter()
+            .filter(|(_, w)| w.aged_out())
+            .map(|(shard, _)| *shard)
+            .collect();
+        let mut sealed_count = 0;
+        for shard in aged {
+            let sealed = match self.writers.get_mut(&shard) {
+                Some(w) => w.seal()?,
+                None => None,
+            };
+            if let Some(sealed) = sealed {
+                self.register_and_upload(sealed)?;
+                sealed_count += 1;
+            }
+        }
+        Ok(sealed_count)
+    }
+
+    /// The age of the oldest un-sealed record per shard — what the age trigger
+    /// is comparing against.
+    pub fn active_ages(&self) -> Vec<(u32, Duration)> {
+        let mut out: Vec<(u32, Duration)> = self
+            .writers
+            .iter()
+            .filter_map(|(shard, w)| w.active_age().map(|age| (*shard, age)))
+            .collect();
+        out.sort_by_key(|(shard, _)| *shard);
+        out
+    }
+
     pub fn run_pending_merges(&mut self) -> Result<usize> {
         let mut count = 0;
         loop {
@@ -1102,6 +1209,16 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     /// The configured shard (partition) count.
+    /// Sample the **D1 durability window** per shard — the age of the oldest
+    /// acknowledged record not yet durable on the substrate, and how many such
+    /// records there are (noetl/ehdb#328).
+    ///
+    /// ⚠ Every shard gets a row even when nothing is pending, so `0` is
+    /// distinguishable from "this binary has no such metric".
+    pub fn unreplicated_snapshot(&self) -> Vec<ShardUnreplicated> {
+        self.unreplicated.snapshot()
+    }
+
     pub fn shard_count(&self) -> u32 {
         self.config.shard_count
     }

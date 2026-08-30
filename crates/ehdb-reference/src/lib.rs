@@ -106,6 +106,7 @@ pub use durable_eventlog_affinity::{
 /// [`durable_eventlog_shared`].
 pub mod durable_eventlog_shared;
 pub mod election;
+pub mod fencing;
 pub use durable_eventlog_shared::{
     exercise_shared_tier, exercise_shared_tier_gc, segment_digest, shared_segment_key,
     FilesystemSharedBackend, ShardHydrateOutcome, ShardPublishOutcome, SharedSegmentBackend,

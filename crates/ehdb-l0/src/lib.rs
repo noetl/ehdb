@@ -152,6 +152,7 @@ pub mod registry;
 pub mod retention;
 pub mod runtime;
 pub mod substrate;
+pub mod unreplicated;
 pub mod vector;
 pub mod wasm;
 
@@ -188,6 +189,7 @@ pub use runtime::{
     RuntimeDataset, RuntimeEvent, RuntimeOp, RuntimeState, RuntimeStore, DATASET_D8_RUNTIME,
 };
 pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
+pub use unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
 pub use wasm::{
     wasm_key, WasmBinding, WasmDataset, WasmModule, WasmOp, WasmOpKind, WasmStore, DATASET_D9_WASM,

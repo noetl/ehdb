@@ -10,6 +10,70 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Upper bounds, in **seconds**, for [`LagHistogram`]. Chosen around the
+/// durability SLO in `docs/spec/durability-window.md` §5 (p99 ≤ 10 s, max
+/// unreplicated age ≤ 30 s) so the buckets straddle the thresholds an alert
+/// actually reads, rather than being evenly spaced.
+pub const REPLICATED_LAG_BUCKETS_SECONDS: [f64; 9] =
+    [0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0];
+
+/// A fixed-bucket histogram of **append → substrate-durable** latency.
+///
+/// ⚠ A histogram rather than a mean, deliberately. The pre-existing
+/// [`L0MetricsSnapshot::mean_upload_lag_micros`] is an average, and a durability
+/// window is bounded by its **maximum** — a mean of 50 ms is entirely consistent
+/// with a p99 of 30 s. Quantiles are the only useful shape here.
+#[derive(Debug)]
+pub struct LagHistogram {
+    /// Cumulative counts, one per bound in [`REPLICATED_LAG_BUCKETS_SECONDS`],
+    /// plus a final `+Inf` slot.
+    buckets: [AtomicU64; REPLICATED_LAG_BUCKETS_SECONDS.len() + 1],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl Default for LagHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LagHistogram {
+    fn observe(&self, micros: u64) {
+        let secs = micros as f64 / 1_000_000.0;
+        let idx = REPLICATED_LAG_BUCKETS_SECONDS
+            .iter()
+            .position(|&b| secs <= b)
+            .unwrap_or(REPLICATED_LAG_BUCKETS_SECONDS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// `(cumulative_bucket_counts, count, sum_seconds)` — bucket counts are
+    /// already cumulative, as the Prometheus histogram exposition requires.
+    pub fn snapshot(&self) -> (Vec<u64>, u64, f64) {
+        let mut running = 0u64;
+        let cumulative = self
+            .buckets
+            .iter()
+            .map(|b| {
+                running += b.load(Ordering::Relaxed);
+                running
+            })
+            .collect();
+        (
+            cumulative,
+            self.count.load(Ordering::Relaxed),
+            self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        )
+    }
+}
+
 /// Shared L0 engine counters. Cloneable handle (`Arc`) so the append thread and
 /// the uploader thread bump the same counters.
 #[derive(Debug, Default)]
@@ -49,6 +113,15 @@ pub struct L0Metrics {
     /// Cumulative upload lag in **microseconds** (seal → object-store durable),
     /// summed across uploads. Mean lag = `upload_lag_micros_total / uploads`.
     pub upload_lag_micros_total: AtomicU64,
+    /// **Append → substrate-durable latency** (noetl/ehdb#328) — the D1
+    /// durability window, end to end.
+    ///
+    /// ⚠ Distinct from [`Self::upload_lag_micros_total`], which starts at the
+    /// **seal** and therefore cannot see a record waiting in an unsealed active
+    /// part. On a quiet shard that pre-seal term is the dominant one, so the two
+    /// numbers can disagree by an unbounded amount and only this one answers
+    /// "how much would we lose".
+    pub replicated_lag: LagHistogram,
     /// Merge/compaction operations performed (L0.3).
     pub merges: AtomicU64,
     /// Source parts consumed by merges (their count summed).
@@ -107,6 +180,10 @@ impl L0Metrics {
         self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.upload_lag_micros_total
             .fetch_add(lag_micros, Ordering::Relaxed);
+    }
+    /// Record one **append → substrate-durable** latency.
+    pub(crate) fn record_replicated_lag(&self, micros: u64) {
+        self.replicated_lag.observe(micros);
     }
     pub(crate) fn incr_cold_loads(&self) {
         self.cold_loads.fetch_add(1, Ordering::Relaxed);
