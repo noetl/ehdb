@@ -37,6 +37,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ehdb_l0::ShardUnreplicated;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -85,6 +86,8 @@ const LAG_METRIC: &str = "ehdb_feed_shard_lag";
 const TOTAL_METRIC: &str = "ehdb_feed_total_lag";
 const COMMITTED_METRIC: &str = "ehdb_feed_shard_committed";
 const SUBJECT_METRIC: &str = "ehdb_feed_subject_lag";
+const UNREPL_AGE_METRIC: &str = "ehdb_l0_unreplicated_age_seconds";
+const UNREPL_RECORDS_METRIC: &str = "ehdb_l0_unreplicated_records";
 
 /// Render shard lags as Prometheus exposition text (v0.0.4).
 pub fn render_prometheus(samples: &[ShardLag]) -> String {
@@ -148,6 +151,79 @@ pub fn render_snapshot(snapshot: &LagSnapshot) -> String {
             s.subject, s.lag
         ));
     }
+
+    out
+}
+
+/// Render the **D1 durability window** per shard (noetl/ehdb#328).
+///
+/// ⚠ These are NOT the `ehdb_feed_*_lag` families. Those measure **consumer
+/// backlog** — how far a reader is behind the writer. These measure
+/// **durability**: how long an acknowledged record has sat on one disk without
+/// reaching the substrate. The names are adjacent and the meanings unrelated,
+/// which is exactly the confusion an alert author falls into, so they carry a
+/// distinct prefix and explicit HELP text.
+///
+/// Headers are emitted unconditionally and the caller pins a row per shard, so a
+/// shard with nothing pending reads `0` rather than disappearing — absence would
+/// otherwise be indistinguishable from a binary too old to have the metric.
+pub fn render_unreplicated(rows: &[ShardUnreplicated]) -> String {
+    let mut unrepl = rows.to_vec();
+    unrepl.sort_by_key(|u| u.shard);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# HELP {UNREPL_AGE_METRIC} Age of the oldest acknowledged record not yet durable on the substrate, per shard. The D1 durability window, measured from the APPEND (not from the seal).\n"
+    ));
+    out.push_str(&format!("# TYPE {UNREPL_AGE_METRIC} gauge\n"));
+    for u in &unrepl {
+        out.push_str(&format!(
+            "{UNREPL_AGE_METRIC}{{shard=\"{}\"}} {:.3}\n",
+            u.shard,
+            u.oldest_age_millis as f64 / 1000.0
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP {UNREPL_RECORDS_METRIC} Acknowledged records not yet durable on the substrate, per shard.\n"
+    ));
+    out.push_str(&format!("# TYPE {UNREPL_RECORDS_METRIC} gauge\n"));
+    for u in &unrepl {
+        out.push_str(&format!(
+            "{UNREPL_RECORDS_METRIC}{{shard=\"{}\"}} {}\n",
+            u.shard, u.records
+        ));
+    }
+    out
+}
+
+/// Render the **append → substrate-durable** latency histogram (noetl/ehdb#328).
+///
+/// ⚠ A histogram, not the mean that already exists. A durability window is
+/// bounded by its **maximum**; `mean_upload_lag_micros` is an average *and* is
+/// measured from the seal, so it can read healthy while records sit unreplicated.
+pub fn render_replicated_lag(metrics: &ehdb_l0::L0Metrics) -> String {
+    let (cumulative, count, sum_seconds) = metrics.replicated_lag.snapshot();
+    let mut out = String::new();
+    out.push_str(
+        "# HELP ehdb_l0_replicated_lag_seconds Append to substrate-durable latency (the D1 durability window, end to end).\n",
+    );
+    out.push_str("# TYPE ehdb_l0_replicated_lag_seconds histogram\n");
+    for (i, bound) in ehdb_l0::metrics::REPLICATED_LAG_BUCKETS_SECONDS
+        .iter()
+        .enumerate()
+    {
+        out.push_str(&format!(
+            "ehdb_l0_replicated_lag_seconds_bucket{{le=\"{bound}\"}} {}\n",
+            cumulative[i]
+        ));
+    }
+    out.push_str(&format!(
+        "ehdb_l0_replicated_lag_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        cumulative[cumulative.len() - 1]
+    ));
+    out.push_str(&format!(
+        "ehdb_l0_replicated_lag_seconds_sum {sum_seconds:.6}\n"
+    ));
+    out.push_str(&format!("ehdb_l0_replicated_lag_seconds_count {count}\n"));
     out
 }
 
