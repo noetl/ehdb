@@ -161,6 +161,63 @@ measured part counts, not a constant to defend.
 **SLO D-3.** *p99 of `ehdb_l0_replicated_lag_seconds` ≤ **10 s**, and
 `max(ehdb_l0_unreplicated_age_seconds)` ≤ **30 s** across all owned shards.*
 
+### Where these numbers come from
+
+Measured, not chosen. `cargo run -p ehdb-l0 --example durability_soak`, four load
+shapes on separate shards, 20 s:
+
+| arm | age trigger **off** | `seal_max_age = 5 s` |
+| :-- | --: | --: |
+| A saturating | 5.5 s | 4.8 s |
+| **B quiet** | **20.0 s** — the entire run, still climbing | **5.0 s** |
+| **C trickle** | **20.0 s** | **5.1 s** |
+| D bursty | 20.0 s | 5.1 s |
+| seals | 4 | 10 |
+
+Three things follow, and each fixes a threshold:
+
+1. **The quiet and trickle arms are unbounded without the age trigger.** They did
+   not plateau at 20 s; 20 s is where the run stopped. So **no threshold on
+   `unreplicated_age` is satisfiable until [#329](https://github.com/noetl/ehdb/issues/329)
+   is enabled** — the SLO is *conditional on D-1*, not merely aspirational.
+2. **With `seal_max_age = 5 s` every arm lands at 4.8–5.1 s.** The observed
+   ceiling is ~`1.02 × seal_max_age`. **30 s is therefore 6× headroom over a 5 s
+   trigger** — wide enough that a page means something is wrong rather than
+   merely busy.
+3. **p99 ≤ 10 s is 2× the trigger.** The soak's mean append→durable was 4.87 s
+   with the trigger off and 4.93 s with it on: append→durable is dominated by the
+   *pre-seal* wait, so the trigger sets the p99 almost directly.
+
+⚠ These are **local-filesystem** numbers. They bound the *pre-seal* term, which is
+the dominant one; substrate latency on a real medium adds to the post-seal term
+and must be re-measured before the thresholds are trusted on prod hardware.
+
+### ⚠⚠ The number that decides which metric the SLO can use
+
+Same instant, same engine, from the same soak run:
+
+```
+mean append→durable             4.869 s   ← what D-3 measures
+seal-relative upload_lag mean   0.042 s   ← upload_lag_micros_total
+```
+
+**116× apart.** Not a calibration offset — a different quantity. An SLO written
+against `upload_lag_micros_total` would have been met continuously throughout the
+run in which two arms held records unreplicated for its entire duration.
+
+### The metric names D-3 is written against
+
+| threshold | metric |
+| :-- | :-- |
+| `max(...) ≤ 30 s` | `ehdb_l0_unreplicated_age_seconds{shard}` |
+| p99 ≤ 10 s | `ehdb_l0_replicated_lag_seconds` (histogram) |
+| — | `ehdb_l0_unreplicated_records{shard}` (how many, for triage) |
+| — | `ehdb_l0_durability_sample_ok` (⚠ 0 ⇒ readings in that window are **unknown**, not healthy) |
+
+⚠ **Not** `upload_lag_micros_total`, `mean_upload_lag_micros`, or any
+`ehdb_feed_*_lag` series — the first two are seal-relative and the third is
+consumer backlog. See §2.1.
+
 | alert | condition | meaning |
 | :-- | :-- | :-- |
 | `EhdbUnreplicatedWindowExceeded` | `max(ehdb_l0_unreplicated_age_seconds) > 30` for 2 m | events acked and on one disk beyond the window |
@@ -214,7 +271,9 @@ Before any further tier serves primary:
 - [ ] D-3 SLO alerts applied, including the `EhdbSealAgeTriggerInert` positive
       control, and each shown to fire once against an injected fault.
 - [ ] Measured p99 replication lag over a soak at target rate, recorded with its
-      as-of.
+      as-of. ⚠ The soak **must include a deliberately quiet arm** — a saturating
+      run cannot detect the defect it is being run to measure. Harness:
+      `cargo run -p ehdb-l0 --example durability_soak`.
 - [ ] [#321](https://github.com/noetl/ehdb/issues/321) merged and implemented —
       fencing prevents a fork; it does not prevent this loss. Both are required.
 
