@@ -102,6 +102,30 @@ impl UnreplicatedTracker {
         e.active_records += 1;
     }
 
+    /// Seed a shard from an active part **recovered on open** after an unclean
+    /// exit.
+    ///
+    /// ⚠⚠ Without this the window reads `0` immediately after a crash — exactly
+    /// when it matters most. Recovered records are `fsync`'d, acknowledged, and
+    /// still not on the substrate: they are pending by every definition the
+    /// gauge uses, and omitting them makes the instrument quietest at the moment
+    /// of greatest risk. That is the same "absent reads as healthy" shape the
+    /// whole metric exists to close.
+    ///
+    /// Their true append instants are not recoverable, so the clock starts now —
+    /// understating their age rather than inventing one. The count is exact.
+    pub fn on_recovered(&self, shard: u32, record_count: u64) {
+        if record_count == 0 {
+            return;
+        }
+        let mut g = self.shards.lock().unwrap();
+        let e = g.entry(shard).or_default();
+        if e.active_first_append.is_none() {
+            e.active_first_append = Some(Instant::now());
+        }
+        e.active_records += record_count;
+    }
+
     /// `shard`'s active part sealed as `part_id` with `record_count` records and
     /// was handed to the uploader. The part inherits the active part's
     /// first-append instant, so the window keeps measuring from the **append**
@@ -301,6 +325,40 @@ mod tests {
         let snap = t.snapshot();
         assert!(snap.iter().any(|s| s.shard == 7 && s.records == 1));
         assert!(snap.windows(2).all(|w| w[0].shard <= w[1].shard), "sorted");
+    }
+
+    #[test]
+    fn records_recovered_from_a_crash_are_pending_not_invisible() {
+        // ⚠⚠ The regression this closes: after an unclean exit the recovered
+        // active part holds acked, fsync'd records that are still not on the
+        // substrate. Reporting 0 would make the window quietest at the moment of
+        // greatest risk.
+        let t = UnreplicatedTracker::new(1);
+        t.on_recovered(0, 7);
+        assert_eq!(records(&t, 0), 7, "recovered records are pending");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(age(&t, 0) >= 15, "and their window is ageing");
+    }
+
+    #[test]
+    fn recovery_of_nothing_leaves_the_shard_at_zero() {
+        // The positive control: a clean restart recovers 0 records and must not
+        // open a window out of nothing.
+        let t = UnreplicatedTracker::new(1);
+        t.on_recovered(0, 0);
+        assert_eq!(records(&t, 0), 0);
+        assert_eq!(age(&t, 0), 0);
+    }
+
+    #[test]
+    fn recovered_records_seal_and_ship_like_any_other() {
+        let t = UnreplicatedTracker::new(1);
+        t.on_recovered(0, 3);
+        t.on_seal(0, "recovered-part", 3);
+        assert_eq!(records(&t, 0), 3, "still pending until it is durable");
+        assert!(t.on_upload_done(0, "recovered-part").is_some());
+        assert_eq!(records(&t, 0), 0);
+        assert_eq!(age(&t, 0), 0);
     }
 
     #[test]
