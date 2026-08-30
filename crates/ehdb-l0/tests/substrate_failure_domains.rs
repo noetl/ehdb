@@ -100,7 +100,7 @@ fn every_substrate_implementation_satisfies_the_same_contract() {
 
     // 1. the storage-backing filesystem impl
     conformance(
-        &LocalFsSubstrate::new(&unique_dir("conf-fs")).unwrap(),
+        &LocalFsSubstrate::new(unique_dir("conf-fs")).unwrap(),
         "LocalFsSubstrate",
     );
 
@@ -109,7 +109,7 @@ fn every_substrate_implementation_satisfies_the_same_contract() {
 
     // 3. the decorator, over each of them
     conformance(
-        &CountingSubstrate::new(LocalFsSubstrate::new(&unique_dir("conf-count-fs")).unwrap()),
+        &CountingSubstrate::new(LocalFsSubstrate::new(unique_dir("conf-count-fs")).unwrap()),
         "CountingSubstrate<LocalFsSubstrate>",
     );
     conformance(
