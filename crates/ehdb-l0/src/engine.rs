@@ -40,6 +40,7 @@ use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
 use crate::substrate::DurableSubstrate;
+use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 
 /// Back-compat alias: the D1 event-log engine is the generic [`L0Engine`]
 /// specialized to [`D1EventLog`]. It carries the D1 convenience API
@@ -169,6 +170,9 @@ struct UploadJob {
     substrate_key: String,
     local_path: String,
     part_id: String,
+    /// The part's shard — needed to close its durability window on the
+    /// [`UnreplicatedTracker`] when the upload lands (noetl/ehdb#328).
+    shard: u32,
     sealed_at: Instant,
 }
 
@@ -201,6 +205,10 @@ pub struct L0Engine<D: Dataset> {
     upload_handle: Option<JoinHandle<()>>,
     /// Outstanding upload count + condvar for `flush_and_wait_uploads`.
     outstanding: Arc<(Mutex<usize>, Condvar)>,
+    /// **The D1 durability window, measured from the append** (noetl/ehdb#328).
+    /// Shared with the uploader thread, which closes a part's window when it
+    /// becomes durable. Observability only — nothing here gates an append.
+    unreplicated: Arc<UnreplicatedTracker>,
 }
 
 impl<D: Dataset> L0Engine<D> {
@@ -343,6 +351,7 @@ impl<D: Dataset> L0Engine<D> {
         manifest: Manifest,
         global_sequence: u64,
     ) -> Self {
+        let shard_count = config.shard_count;
         Self {
             config,
             replicas,
@@ -354,6 +363,7 @@ impl<D: Dataset> L0Engine<D> {
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
+            unreplicated: Arc::new(UnreplicatedTracker::new(shard_count)),
         }
     }
 
@@ -363,6 +373,7 @@ impl<D: Dataset> L0Engine<D> {
         let manifest = Arc::clone(&self.manifest);
         let metrics = Arc::clone(&self.metrics);
         let outstanding = Arc::clone(&self.outstanding);
+        let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
@@ -408,6 +419,15 @@ impl<D: Dataset> L0Engine<D> {
 
                     let lag = job.sealed_at.elapsed().as_micros() as u64;
                     metrics.record_upload(bytes.len() as u64, lag);
+                    // Close this part's durability window and record the
+                    // **append→durable** latency. ⚠ `lag` above is measured from
+                    // the SEAL and cannot see the pre-seal term; this one can.
+                    // The failure paths above deliberately do NOT reach here —
+                    // a part that did not replicate is still pending, which is
+                    // what the window should keep reporting.
+                    if let Some(end_to_end) = unreplicated.on_upload_done(job.shard, &job.part_id) {
+                        metrics.record_replicated_lag(end_to_end.as_micros() as u64);
+                    }
                     decrement(&outstanding);
                 }
             })
@@ -445,6 +465,12 @@ impl<D: Dataset> L0Engine<D> {
             self.global_sequence = sort_key;
         }
         self.metrics.incr_appends();
+        // Open the record's durability window. ⚠ Under `FlushPolicy::CallerDriven`
+        // the ack lands after the caller's `fsync`, so counting here can include
+        // a record for the few microseconds before it is acked. That
+        // over-reports the window and never under-reports it — the safe
+        // direction for a durability signal.
+        self.unreplicated.on_append(shard);
 
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
@@ -566,12 +592,17 @@ impl<D: Dataset> L0Engine<D> {
             .clone()
             .ok_or_else(|| EhdbError::InvalidState("sealed part missing local_path".into()))?;
         let part_id = sealed.meta.part_id.clone();
+        let shard = sealed.meta.partition;
+        let record_count = sealed.meta.record_count;
 
         {
             let mut m = self.manifest.lock().unwrap();
             m.push_part(sealed.meta);
         }
         self.metrics.incr_seals();
+        // The sealed part inherits the active part's first-append instant, so
+        // the window keeps measuring from the append rather than restarting.
+        self.unreplicated.on_seal(shard, &part_id, record_count);
 
         // Bump outstanding BEFORE sending so flush_and_wait never races a job.
         {
@@ -583,6 +614,7 @@ impl<D: Dataset> L0Engine<D> {
                 substrate_key,
                 local_path,
                 part_id,
+                shard,
                 sealed_at: Instant::now(),
             };
             if tx.send(job).is_err() {
@@ -1102,6 +1134,16 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     /// The configured shard (partition) count.
+    /// Sample the **D1 durability window** per shard — the age of the oldest
+    /// acknowledged record not yet durable on the substrate, and how many such
+    /// records there are (noetl/ehdb#328).
+    ///
+    /// ⚠ Every shard gets a row even when nothing is pending, so `0` is
+    /// distinguishable from "this binary has no such metric".
+    pub fn unreplicated_snapshot(&self) -> Vec<ShardUnreplicated> {
+        self.unreplicated.snapshot()
+    }
+
     pub fn shard_count(&self) -> u32 {
         self.config.shard_count
     }
