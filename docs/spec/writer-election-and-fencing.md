@@ -4,8 +4,15 @@
 **Tracks:** [noetl/ehdb#321](https://github.com/noetl/ehdb/issues/321), under
 [#324](https://github.com/noetl/ehdb/issues/324).
 
-> ## ⛔ No tier is promoted to primary-serve until this document is merged
-> and its mechanism implemented. Shadow operation is unaffected.
+> ## ⛔ No **further** tier is promoted to primary-serve until this document is
+> merged and its mechanism implemented. Shadow operation is unaffected.
+>
+> ⚠⚠ Stated as an absolute this gate would be false: **the event-log tier has
+> been `primary` and serving on prod since 2026-08-13**, with no fencing, on the
+> `replicas: 1` posture §2 describes. That is not a reason to soften the gate —
+> it means the tier most dependent on single-writer ordering is the one already
+> running without it, so §4 is remediation of a live gap and not preparation for
+> a future one.
 
 ## 1. What rests on this
 
