@@ -592,8 +592,14 @@ impl<D: Dataset> L0Engine<D> {
                 if recovered_tip > *tail {
                     *tail = recovered_tip;
                 }
-                self.metrics
-                    .add_recovered_active_records(writer.pending_records().len() as u64);
+                let recovered = writer.pending_records().len() as u64;
+                self.metrics.add_recovered_active_records(recovered);
+                // ⚠⚠ Seed the durability window too. These records are acked and
+                // `fsync`'d but not on the substrate, so they are pending by
+                // every definition the gauge uses — and without this the window
+                // reads 0 immediately after a crash, i.e. it is quietest exactly
+                // when the most is at risk.
+                self.unreplicated.on_recovered(shard, recovered);
             }
             self.writers.insert(shard, writer);
         }

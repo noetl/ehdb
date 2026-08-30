@@ -161,3 +161,50 @@ fn a_quiet_shard_keeps_aging_because_nothing_seals_it() {
         "and it grows precisely because nothing sealed it"
     );
 }
+
+#[test]
+fn a_crash_recovered_active_part_still_reports_its_records_as_pending() {
+    // ⚠⚠ The regression this pins. Dropping the engine without sealing is the
+    // SIGKILL analogue: the active part is left on disk exactly as a crash
+    // leaves it, and reopening replays those records. They are acked, `fsync`'d
+    // and NOT on the substrate — so the window must still count them.
+    //
+    // Before this, the tracker was seeded only by `append_record`, so a
+    // recovered shard reported 0 pending and an age of 0: the instrument was
+    // quietest at the moment of greatest risk, which is the exact "absent reads
+    // as healthy" failure it exists to close.
+    let local = unique_dir("crash-local");
+    let sub = unique_dir("crash-sub");
+    let config = || L0Config::d1(&local).with_shard_count(1);
+
+    {
+        let mut engine = L0Engine::<D1EventLog>::open_replicated(config(), target(&sub)).unwrap();
+        for seq in 1..=6 {
+            engine.append_record(rec(seq, "exec-crash")).unwrap();
+        }
+        assert_eq!(row(&engine, 0).records, 6);
+        // Drop without sealing — no seal hook runs, no manifest is written.
+    }
+
+    let engine = L0Engine::<D1EventLog>::open_replicated(config(), target(&sub)).unwrap();
+    // Touch the shard so its writer is opened and recovery runs.
+    let recovered = engine.metrics().snapshot().recovered_active_records;
+    assert_eq!(
+        recovered, 6,
+        "precondition: the crash left 6 records to replay"
+    );
+
+    let after = row(&engine, 0);
+    assert_eq!(
+        after.records, 6,
+        "recovered records are still unreplicated and must be counted"
+    );
+    assert!(
+        after.oldest_age_millis < 60_000,
+        "their age restarts at the reopen rather than being invented: {}",
+        after.oldest_age_millis
+    );
+
+    let _ = std::fs::remove_dir_all(&local);
+    let _ = std::fs::remove_dir_all(&sub);
+}
