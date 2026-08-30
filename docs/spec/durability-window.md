@@ -32,10 +32,20 @@ is lost instead. See
 
 ### 1.2 `ehdb-l0` — where the real window is
 
-L0 uses posture A, `FlushPolicy::EveryAppend`: the local part is `fsync`'d before
-the append returns, and "the substrate replication adds N-way durability
-**asynchronously**". So an acknowledged event is on **one** disk, and reaches
-the durable substrate later.
+L0 defaults to posture A, `FlushPolicy::EveryAppend`, and "the substrate
+replication adds N-way durability **asynchronously**".
+
+⚠ The prod writer does **not** run that default: `FeedWriter` calls
+`engine.set_flush_policy(FlushPolicy::CallerDriven)` and pays **one `fsync` per
+batch itself** (group commit). Durability of the ack is unchanged — `append_batch`
+"returns only after the `fsync`" — but anyone reading `EveryAppend` in the L0
+docs and concluding that is what prod does would be wrong. The conclusion holds
+either way: **an acknowledged event is on one disk**, and reaches the durable
+substrate later.
+
+The append path is architecturally barred from closing this: "The append path
+**never** calls the substrate; only the background [uploader does]" — a
+deliberate property so appends do not regress when uploads are slow.
 
 **When is "later"? Only when the part seals.** And:
 
@@ -84,6 +94,33 @@ question than the one the reader is asking.
   durability lag.** They already exist, they are already scraped, and their names
   are the ones an alert author will reach for first. They measure unacked
   commands. Alerting on them tells you nothing about replication.
+
+## 2.2 ⚠⚠ In prod, the "durable substrate" is the same disk
+
+`LocalFsSubstrate` is the **only** `DurableSubstrate` implementation in the tree.
+There is no object-store substrate. The substrate is a filesystem path, so
+whether it is a distinct failure domain is decided entirely by what is mounted
+there — and nothing in the code enforces or checks that it is.
+
+In prod it is not. The writer StatefulSet sets:
+
+```
+NOETL_EVENT_BUS_WRITER_DIR   = /data/eventbus
+NOETL_EHDB_TIER_SERVICE_DIR  = /data/eventbus/ehdb-tier
+```
+
+and `/data/eventbus` is one PVC, `noetl-eventbus-writer-0-data`. **The substrate
+copy lives in a subdirectory of the same volume as the part it is a copy of.**
+
+So replication currently buys **no independent failure domain**. Losing the
+volume loses both copies; the upload converts an unsealed local part into a
+sealed local part beside it. GCE persistent disks are replicated within a zone
+by the platform, so this is not a claim that loss is likely — it is a claim that
+**the durability story the code tells and the one the deployment implements are
+different**, and only the deployment is load-bearing.
+
+⚠ This is why §6's RF > 1 is blocked on more than a `replicas` list: there is no
+second substrate implementation to replicate *to*.
 
 ## 3. Required: a time-based seal trigger
 
@@ -159,7 +196,17 @@ specifies a shape; it does not commit to building it.
 
 ## 7. Gate on primary-serve
 
-Before the event-log tier serves primary:
+⚠⚠ **This gate does not read on the event-log tier, which is already `primary`
+and serving on prod (since 2026-08-13).** Stating it as a precondition would be
+false. The honest reading is the uncomfortable one: **a tier is in production
+carrying the unbounded window of §2 and the same-disk substrate of §2.2.** That
+makes D-1 and D-2 remediation of a live gap, not preparation for a future one,
+and it raises their priority rather than lowering it.
+
+The gate below therefore binds **further promotions** — projection, KV, object —
+and the remediation items bind the event-log tier now.
+
+Before any further tier serves primary:
 
 - [ ] D-1 age-based seal trigger implemented, with a test that an idle shard
       seals on age alone.
