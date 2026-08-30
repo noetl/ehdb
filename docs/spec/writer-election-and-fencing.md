@@ -138,11 +138,23 @@ are legitimate — H genuinely still holds the lease as far as the store knows.
 store durably accepted before the new epoch's first append. Nothing accepted is
 lost, and nothing from a fenced epoch is admitted afterwards.*
 
-⚠ **What is not guaranteed:** appends H had accepted **locally** but not yet
-published are lost. This is the RF=1 window that
-[#322](https://github.com/noetl/ehdb/issues/322) bounds — the two issues meet
-here, and neither closes it alone. **Fencing prevents a fork; it does not
-prevent a loss.** Saying so plainly matters more than the spec reading cleanly.
+⚠ **What is not guaranteed:** an append H had committed **locally** but had not
+yet published to the shared store is invisible to C, which cold-loads from
+shared. This is *not* a publish backlog — publish is synchronous on the append
+path (`append` calls `publish_shard(shard)?` before returning), so the window is
+the gap between the local `fsync` and the shared `append_segment` returning,
+per append. It is narrow, and it is not zero.
+
+⚠⚠ **There is a shipped asymmetry here that the fencing design must not paper
+over.** `local.append` has *already committed* when `publish_shard` runs, so an
+append whose publish fails returns `Err` to the caller while remaining durable on
+the writer's local disk. If that writer survives, the next `publish_shard`
+recomputes from the segment's current length and the "failed" event is published
+after all. If it is fenced first, the event is lost instead. **The same failure
+therefore resolves two different ways depending on whether the writer keeps its
+lease.** Bounding and closing that is
+[#322](https://github.com/noetl/ehdb/issues/322)'s; **fencing prevents a fork, it
+does not prevent this loss**, and neither issue closes it alone.
 
 ### 5.3 Cold load and fungible writers
 
