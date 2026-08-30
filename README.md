@@ -10,8 +10,18 @@ workloads.
 EHDB is not a generic database first. It is a focused storage substrate
 for the NoETL multitenant distributed operating-system cloud platform.
 Over time it should absorb the platform roles currently served by
-PostgreSQL, NATS JetStream, external object stores, Qdrant, and
-ClickHouse.
+PostgreSQL, NATS JetStream, and external object stores.
+
+**Scope: four engines** — event log, projection, KV, object. See
+[`docs/SCOPE.md`](docs/SCOPE.md), which is normative.
+
+⚠ Qdrant and ClickHouse are **explicitly out of scope** (ehdb#320). Analytical
+views are projections; vector retrieval is a **vectorized projection** over
+bounded, execution-scoped candidate sets, where exact cosine is sufficient and no
+ANN index is needed. Neither is replaced by an external engine — both are
+removed. Earlier text describing ANN indexes, Qdrant adapters or distributed
+query execution as "future surfaces" is superseded: they are not deferred, they
+are out of scope.
 
 ## Goals
 
@@ -21,8 +31,10 @@ ClickHouse.
   state.
 - Provide EHDB-native event streams, durable consumers, replay cursors,
   and retention semantics for NoETL execution state.
-- Support RAG primitives: documents, chunks, embedding metadata, vector
-  index metadata, retrieval policy, tenant context, and lineage.
+- Support RAG primitives: documents, chunks, embedding metadata,
+  retrieval policy, tenant context, and lineage — served as a **vectorized
+  projection** over bounded candidate sets, not as an owned ANN engine
+  (`docs/SCOPE.md`).
 - Store NoETL system WASM library manifests and environment/channel
   bindings so system playbook functionality can be hot-replaced without
   crate semantic-version churn.
@@ -46,8 +58,9 @@ crates/
 `-- ehdb-transaction # transaction records, replay, local durable log
 ```
 
-Future workspace areas include network services, analytical execution,
-and NoETL integration surfaces.
+Future workspace areas include network services and NoETL integration
+surfaces. ⚠ **Analytical execution is not among them** — a new analytical view
+is a new projection, not a query engine (`docs/SCOPE.md`).
 
 ## Local Durability
 
