@@ -10,8 +10,16 @@ workloads.
 EHDB is not a generic database first. It is a focused storage substrate
 for the NoETL multitenant distributed operating-system cloud platform.
 Over time it should absorb the platform roles currently served by
-PostgreSQL, NATS JetStream, external object stores, Qdrant, and
-ClickHouse.
+PostgreSQL, NATS JetStream, and external object stores.
+
+**Scope: four engines** — event log, projection, KV, object. See
+[`docs/SCOPE.md`](docs/SCOPE.md), which is normative.
+
+⚠ Qdrant and ClickHouse are **explicitly out of scope** (ehdb#320). Analytical
+views are projections; vector retrieval is a **vectorized projection** over
+bounded, execution-scoped candidate sets, where exact cosine is sufficient and no
+ANN index is needed. Neither is replaced by an external engine — both are
+removed — they are not deferred.
 
 ## Goals
 
@@ -21,8 +29,10 @@ ClickHouse.
   state.
 - Provide EHDB-native event streams, durable consumers, replay cursors,
   and retention semantics for NoETL execution state.
-- Support RAG primitives: documents, chunks, embedding metadata, vector
-  index metadata, retrieval policy, tenant context, and lineage.
+- Support RAG primitives: documents, chunks, embedding metadata,
+  retrieval policy, tenant context, and lineage — served as a **vectorized
+  projection** over bounded candidate sets, not as an owned ANN engine
+  (`docs/SCOPE.md`).
 - Store NoETL system WASM library manifests and environment/channel
   bindings so system playbook functionality can be hot-replaced without
   crate semantic-version churn.
@@ -46,8 +56,9 @@ crates/
 `-- ehdb-transaction # transaction records, replay, local durable log
 ```
 
-Future workspace areas include network services, analytical execution,
-and NoETL integration surfaces.
+Future workspace areas include network services and NoETL integration
+surfaces. ⚠ **Analytical execution is not among them** — a new analytical view
+is a new projection, not a query engine (`docs/SCOPE.md`).
 
 ## Local Durability
 
@@ -346,9 +357,11 @@ over registered chunk embeddings. `VectorSearch` scopes candidates by
 tenant, namespace, and embedding model, validates finite non-zero query
 and embedding vectors, applies dimension compatibility, and returns
 deterministically ordered `VectorSearchHit` results. This is a local
-reference RAG primitive only; ANN indexes, retrieval services,
-production IAM, Qdrant adapters, and distributed query execution remain
-future surfaces.
+reference RAG primitive only. ⚠ ANN indexes, Qdrant adapters and
+distributed query execution are **out of scope** (ehdb#320), not deferred:
+retrieval is a vectorized projection over bounded candidate sets, so exact
+cosine is the design rather than a placeholder for one. Retrieval services and
+production IAM remain future surfaces.
 
 Retrieval metadata JSON decoding rejects unknown fields on documents,
 chunks, embeddings, registration requests, search requests, and local
@@ -364,8 +377,8 @@ gateway route, production retrieval API, or persistent daemon.
 The same service boundary also exposes exact local text matching through
 `SearchTextChunksRequest`, returning deterministic chunk hits with match
 counts for tenant/namespace-scoped RAG lookup fixtures. Full-text
-indexes, BM25 ranking, external search adapters, and distributed query
-execution remain future surfaces.
+indexes, BM25 ranking and external search adapters remain future surfaces;
+⚠ distributed query execution is **out of scope** (ehdb#320).
 `SearchHybridChunksRequest` combines exact cosine similarity and exact
 text match counts with caller-provided non-negative weights, producing
 deterministic hybrid RAG hits over replayed retrieval state. This is a

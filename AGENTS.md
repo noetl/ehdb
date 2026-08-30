@@ -13,7 +13,12 @@ event streams, RAG retrieval state, and historical analytical data.
 This is not a generic database project. Favor NoETL-specific storage
 semantics over broad database scope. The long-term target is to collapse
 NoETL's ordinary dependence on PostgreSQL, NATS JetStream, external
-object stores, Qdrant, and ClickHouse into EHDB-owned capabilities.
+object stores into EHDB-owned capabilities.
+
+⚠ Qdrant and ClickHouse are OUT OF SCOPE (ehdb#320) — analytical views are
+projections and vector retrieval is a vectorized projection over bounded
+candidate sets. The core set is four engines: event log, projection, KV, object.
+See docs/SCOPE.md, which is normative.
 
 ## Execution Model Boundary
 
