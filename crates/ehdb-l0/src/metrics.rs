@@ -93,6 +93,17 @@ pub struct L0Metrics {
     /// [`append_record`]: crate::engine::L0Engine::append_record
     /// [`append_writer_assigned`]: crate::engine::L0Engine::append_writer_assigned
     pub out_of_order_appends: AtomicU64,
+    /// Versioned manifest snapshots deleted by the retention policy
+    /// (noetl/ehdb#344).  Every manifest write emits a *full* snapshot under
+    /// `manifest/<dataset>/manifest-v<version>.json`; nothing ever read them, and
+    /// nothing pruned them, so cost grew **quadratically** in part count — 71.8 MB
+    /// of command data produced 19.4 GB of manifest and filled the volume, which
+    /// stopped every append and took prod dispatch down.
+    pub manifest_versions_pruned: AtomicU64,
+    /// Versioned manifest snapshots left on the substrate after the most recent
+    /// prune — the bound actually being enforced, as opposed to the one
+    /// configured.  A gauge: it is `store`d, not accumulated.
+    pub manifest_versions_retained: AtomicU64,
     /// Records recovered by replaying an unsealed active part left behind by a
     /// crash (noetl/ai-meta#209 defect 2). These were `fsync`ed and acked to a
     /// publisher but sat outside the durable manifest, which lists sealed parts
@@ -168,6 +179,14 @@ impl L0Metrics {
         self.out_of_order_appends.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn add_manifest_versions_pruned(&self, n: u64) {
+        self.manifest_versions_pruned
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn set_manifest_versions_retained(&self, n: u64) {
+        self.manifest_versions_retained.store(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn add_recovered_active_records(&self, n: u64) {
         self.recovered_active_records
             .fetch_add(n, Ordering::Relaxed);
@@ -219,6 +238,8 @@ impl L0Metrics {
         L0MetricsSnapshot {
             appends: self.appends.load(Ordering::Relaxed),
             out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
+            manifest_versions_pruned: self.manifest_versions_pruned.load(Ordering::Relaxed),
+            manifest_versions_retained: self.manifest_versions_retained.load(Ordering::Relaxed),
             recovered_active_records: self.recovered_active_records.load(Ordering::Relaxed),
             seals: self.seals.load(Ordering::Relaxed),
             uploads: self.uploads.load(Ordering::Relaxed),
@@ -246,6 +267,8 @@ impl L0Metrics {
 pub struct L0MetricsSnapshot {
     pub appends: u64,
     pub out_of_order_appends: u64,
+    pub manifest_versions_pruned: u64,
+    pub manifest_versions_retained: u64,
     pub recovered_active_records: u64,
     pub seals: u64,
     pub uploads: u64,
