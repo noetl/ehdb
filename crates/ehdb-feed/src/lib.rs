@@ -287,6 +287,13 @@ pub struct FeedWriter<D: Dataset> {
     /// the publisher gets an error and retries against the replacement writer
     /// rather than blocking until its own timeout.
     closed: Arc<AtomicBool>,
+    /// The engine's metrics handle, cloned at construction.
+    ///
+    /// `serve_ingest` bumps failure counters from its committer task, which must
+    /// not take the engine mutex to do it — the whole point of the counter is to
+    /// report that appends are failing, and contending for the append lock to say
+    /// so would make the reporting worst exactly when it matters most.
+    metrics: Arc<ehdb_l0::metrics::L0Metrics>,
 }
 
 impl<D> FeedWriter<D>
@@ -307,10 +314,12 @@ where
         let tip = engine.global_sequence();
         engine.set_flush_policy(FlushPolicy::CallerDriven);
         let (tip_tx, _rx) = watch::channel(tip);
+        let metrics = engine.metrics();
         Self {
             engine: Arc::new(Mutex::new(engine)),
             tip_tx,
             closed: Arc::new(AtomicBool::new(false)),
+            metrics,
         }
     }
 
@@ -450,6 +459,12 @@ where
     /// harnesses and (later) the writer's own compaction ticks.
     pub fn engine(&self) -> Arc<Mutex<L0Engine<D>>> {
         Arc::clone(&self.engine)
+    }
+
+    /// The engine's metrics handle, without taking the engine lock
+    /// (noetl/ehdb#345).
+    pub fn metrics(&self) -> &Arc<ehdb_l0::metrics::L0Metrics> {
+        &self.metrics
     }
 
     /// A watch receiver that fires whenever a record is appended (the tip
