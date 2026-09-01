@@ -53,6 +53,19 @@ pub const DEFAULT_GRANULE_SIZE: u32 = 16;
 pub const DEFAULT_SEAL_MAX_RECORDS: u64 = 1024;
 /// Default seal threshold by byte size (8 MiB — the #254 `DEFAULT_SEGMENT_MAX_BYTES`).
 pub const DEFAULT_SEAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Default number of **versioned manifest snapshots** kept on the substrate,
+/// besides `LATEST` (noetl/ehdb#344).
+///
+/// Each manifest write emits a full snapshot listing every part, so snapshot
+/// size grows with part count while the number of snapshots grows with write
+/// count — retaining all of them costs **O(parts x writes)**. On prod that was
+/// 6,770 snapshots totalling 19.4 GB behind 71.8 MB of actual data, which
+/// filled the volume and stopped every append.
+///
+/// Nothing reads these files; `LATEST` is the only manifest the engine loads.
+/// They are kept purely so a human can inspect recent manifest history, so the
+/// bound is small on purpose.
+pub const DEFAULT_MANIFEST_RETAIN: usize = 32;
 
 /// L0 engine configuration for one dataset.
 #[derive(Debug, Clone)]
@@ -85,6 +98,11 @@ pub struct L0Config {
     pub flush: FlushPolicy,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
+    /// How many versioned manifest snapshots to keep besides `LATEST`
+    /// (noetl/ehdb#344). `0` disables pruning entirely — the pre-fix behaviour,
+    /// which is unbounded and is what filled the prod volume. See
+    /// [`DEFAULT_MANIFEST_RETAIN`].
+    pub manifest_retain: usize,
 }
 
 impl L0Config {
@@ -101,6 +119,7 @@ impl L0Config {
             seal_max_age: None,
             flush: FlushPolicy::EveryAppend,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
+            manifest_retain: DEFAULT_MANIFEST_RETAIN,
         }
     }
 
@@ -136,6 +155,14 @@ impl L0Config {
     /// Set the L0.3 merge policy explicitly.
     pub fn with_merge_policy(mut self, merge_policy: MergePolicy) -> Self {
         self.merge_policy = merge_policy;
+        self
+    }
+
+    /// Set how many versioned manifest snapshots to retain besides `LATEST`
+    /// (noetl/ehdb#344). `0` restores the unbounded pre-fix behaviour and is
+    /// only useful for proving, in a test, that the bound is what does the work.
+    pub fn with_manifest_retain(mut self, manifest_retain: usize) -> Self {
+        self.manifest_retain = manifest_retain;
         self
     }
     /// Set the byte-size seal threshold.
@@ -395,6 +422,7 @@ impl<D: Dataset> L0Engine<D> {
         let outstanding = Arc::clone(&self.outstanding);
         let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
+        let manifest_retain = self.config.manifest_retain;
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
             .spawn(move || {
@@ -435,7 +463,7 @@ impl<D: Dataset> L0Engine<D> {
                     };
                     // The durable manifest must exist on EVERY replica so any one
                     // of them can serve a cold-load alone.
-                    write_manifest_to_all(&replicas, &dataset, &durable);
+                    write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
 
                     let lag = job.sealed_at.elapsed().as_micros() as u64;
                     metrics.record_upload(bytes.len() as u64, lag);
@@ -826,7 +854,13 @@ impl<D: Dataset> L0Engine<D> {
             m.version += 1;
             m.durable_view()
         };
-        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
+        write_manifest_to_all(
+            &self.replicas,
+            &self.config.dataset,
+            &durable,
+            self.config.manifest_retain,
+            &self.metrics,
+        );
 
         self.metrics
             .record_merge(sources.len() as u64, bytes.len() as u64);
@@ -925,7 +959,13 @@ impl<D: Dataset> L0Engine<D> {
             m.version += 1;
             m.durable_view()
         };
-        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
+        write_manifest_to_all(
+            &self.replicas,
+            &self.config.dataset,
+            &durable,
+            self.config.manifest_retain,
+            &self.metrics,
+        );
 
         let dropped = plan.drop_ids.len();
         self.metrics.record_parts_dropped(dropped as u64);
@@ -1385,7 +1425,13 @@ fn replicate_bytes(
 /// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
 /// replica, so any one of them can serve a cold-load alone. Best-effort per
 /// replica (a down replica is skipped; the survivors carry the manifest).
-fn write_manifest_to_all(replicas: &[ReplicaTarget], dataset: &str, durable: &Manifest) {
+fn write_manifest_to_all(
+    replicas: &[ReplicaTarget],
+    dataset: &str,
+    durable: &Manifest,
+    manifest_retain: usize,
+    metrics: &L0Metrics,
+) {
     let Ok(ser) = serde_json::to_vec(durable) else {
         return;
     };
@@ -1397,6 +1443,118 @@ fn write_manifest_to_all(replicas: &[ReplicaTarget], dataset: &str, durable: &Ma
             .substrate
             .put_if_absent(&manifest_version_key(dataset, durable.version), &ser);
     }
+    prune_manifest_versions(replicas, dataset, durable.version, manifest_retain, metrics);
+}
+
+/// Delete versioned manifest snapshots older than the retention bound
+/// (noetl/ehdb#344).
+///
+/// **Why this exists.** Every manifest write emits a *full* snapshot listing
+/// every part. Nothing has ever read one — [`manifest_latest_key`] is the only
+/// manifest the engine loads — and before this nothing deleted one, so the cost
+/// was the product of two growing quantities: snapshot size grows with part
+/// count, snapshot count grows with write count. On prod that reached 6,770
+/// snapshots / 19.4 GB behind 71.8 MB of real data, filled the volume, and made
+/// every append fail. Retention turns that from quadratic into linear.
+///
+/// **Two paths, and the sweep is the one that guarantees the bound.** The
+/// per-write delete is an O(1) fast path: version `v - retain` is the one that
+/// just fell out of the window. It is *best-effort only*. Manifest versions are
+/// allocated under the manifest lock, so every integer is produced exactly once,
+/// but the substrate writes are issued by two producers — the uploader thread
+/// and the merge/drop path — so a version's file can land **after** the delete
+/// that was meant to evict it already looked and found nothing. Those stragglers
+/// then survive forever. Removing the sweep and keeping only the fast path
+/// leaves 6 snapshots instead of 4 after 40 writes at `retain = 4`, and the
+/// stragglers are arbitrarily old (`v6` and `v49` among `v77..v80`) — so the
+/// fast path alone does not bound anything.
+///
+/// The periodic sweep is therefore the actual guarantee, and it doubles as the
+/// only way to converge a backlog that predates this policy: a sliding window
+/// can never reach below its own lower edge, so without the sweep an engine
+/// upgraded onto an existing store would keep its 19.4 GB forever. It is
+/// throttled to one pass per `retain` writes because
+/// [`DurableSubstrate::list_prefix`] walks the whole substrate root, not just
+/// the prefix. Every multiple of `retain` is produced exactly once, so the
+/// throttle cannot be skipped by the same race.
+///
+/// `LATEST` is never a candidate: it does not carry the `manifest-v` prefix that
+/// [`parse_manifest_version`] requires, and it is filtered again by name.
+fn prune_manifest_versions(
+    replicas: &[ReplicaTarget],
+    dataset: &str,
+    latest_version: u64,
+    manifest_retain: usize,
+    metrics: &L0Metrics,
+) {
+    if manifest_retain == 0 {
+        // Retention disabled — the unbounded pre-fix behaviour. Kept reachable so
+        // a test can prove the bound is what does the work.
+        return;
+    }
+    let retain = manifest_retain as u64;
+    let mut pruned = 0u64;
+
+    // O(1) steady-state path: the version that just fell out of the window.
+    if let Some(evicted) = latest_version.checked_sub(retain) {
+        if evicted > 0 {
+            let key = manifest_version_key(dataset, evicted);
+            for target in replicas {
+                if target.substrate.exists(&key).unwrap_or(false)
+                    && target.substrate.delete(&key).is_ok()
+                {
+                    pruned += 1;
+                }
+            }
+        }
+    }
+
+    // Backlog-convergence sweep, amortised one pass per `retain` writes.
+    if latest_version % retain == 0 {
+        let prefix = format!("manifest/{dataset}/");
+        let latest_name = manifest_latest_key(dataset);
+        for target in replicas {
+            let Ok(keys) = target.substrate.list_prefix(&prefix) else {
+                continue;
+            };
+            let mut versions: Vec<(u64, String)> = keys
+                .into_iter()
+                .filter(|k| k != &latest_name)
+                .filter_map(|k| parse_manifest_version(&k).map(|v| (v, k)))
+                .collect();
+            metrics.set_manifest_versions_retained(versions.len() as u64);
+            if versions.len() <= manifest_retain {
+                continue;
+            }
+            versions.sort_unstable_by_key(|(v, _)| *v);
+            let drop_count = versions.len() - manifest_retain;
+            for (_, key) in versions.into_iter().take(drop_count) {
+                if target.substrate.delete(&key).is_ok() {
+                    pruned += 1;
+                }
+            }
+            metrics.set_manifest_versions_retained(manifest_retain as u64);
+        }
+    }
+
+    if pruned > 0 {
+        metrics.add_manifest_versions_pruned(pruned);
+    }
+}
+
+/// Parse the version out of a `manifest/<dataset>/manifest-v<020>.json` key.
+///
+/// Returns `None` for anything that is not a versioned snapshot — `LATEST` most
+/// importantly, but also any unrelated key the substrate walk turns up. A prune
+/// candidate must round-trip through here, so a key that does not parse can
+/// never be deleted.
+fn parse_manifest_version(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let digits = name.strip_prefix("manifest-v")?.strip_suffix(".json")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 /// Load the durable manifest from the **first replica that has it** (L0.6): a
