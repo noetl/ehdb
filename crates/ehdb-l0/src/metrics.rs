@@ -104,6 +104,24 @@ pub struct L0Metrics {
     /// prune — the bound actually being enforced, as opposed to the one
     /// configured.  A gauge: it is `store`d, not accumulated.
     pub manifest_versions_retained: AtomicU64,
+    /// Ingest batches the writer refused to append (noetl/ehdb#345).
+    ///
+    /// `serve_ingest` responds to an `append_batch` error by dropping the
+    /// connection, which the publisher sees only as `connection closed before
+    /// ack`. Before this counter existed that error was discarded, so a **full
+    /// volume** and a **serde-incompatible record** produced a byte-identical
+    /// symptom at the publisher and no signal whatsoever at the writer. A prod
+    /// writer sat at `Ready`, 0 restarts, 0 ERROR and 0 WARN lines while every
+    /// command publish on the platform failed.
+    ///
+    /// Non-zero means the writer is refusing writes. It is never expected.
+    pub ingest_append_failed: AtomicU64,
+    /// Ingest frames that did not deserialize into the dataset's record type
+    /// (noetl/ehdb#345). Same silent-drop path as
+    /// [`ingest_append_failed`](Self::ingest_append_failed); counted separately
+    /// because the remedy is completely different — a version/schema mismatch
+    /// between publisher and writer, not a sick volume.
+    pub ingest_decode_failed: AtomicU64,
     /// Records recovered by replaying an unsealed active part left behind by a
     /// crash (noetl/ai-meta#209 defect 2). These were `fsync`ed and acked to a
     /// publisher but sat outside the durable manifest, which lists sealed parts
@@ -186,6 +204,12 @@ impl L0Metrics {
     pub(crate) fn set_manifest_versions_retained(&self, n: u64) {
         self.manifest_versions_retained.store(n, Ordering::Relaxed);
     }
+    pub fn incr_ingest_append_failed(&self) {
+        self.ingest_append_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn incr_ingest_decode_failed(&self) {
+        self.ingest_decode_failed.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub(crate) fn add_recovered_active_records(&self, n: u64) {
         self.recovered_active_records
@@ -240,6 +264,8 @@ impl L0Metrics {
             out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
             manifest_versions_pruned: self.manifest_versions_pruned.load(Ordering::Relaxed),
             manifest_versions_retained: self.manifest_versions_retained.load(Ordering::Relaxed),
+            ingest_append_failed: self.ingest_append_failed.load(Ordering::Relaxed),
+            ingest_decode_failed: self.ingest_decode_failed.load(Ordering::Relaxed),
             recovered_active_records: self.recovered_active_records.load(Ordering::Relaxed),
             seals: self.seals.load(Ordering::Relaxed),
             uploads: self.uploads.load(Ordering::Relaxed),
@@ -269,6 +295,8 @@ pub struct L0MetricsSnapshot {
     pub out_of_order_appends: u64,
     pub manifest_versions_pruned: u64,
     pub manifest_versions_retained: u64,
+    pub ingest_append_failed: u64,
+    pub ingest_decode_failed: u64,
     pub recovered_active_records: u64,
     pub seals: u64,
     pub uploads: u64,

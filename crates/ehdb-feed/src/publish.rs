@@ -44,6 +44,29 @@ use crate::{io_err, read_frame, write_frame, FeedWriter};
 /// batch, so latency is never traded for batching — under light load a batch is
 /// one record and behaves exactly as before.
 const MAX_COMMIT_BATCH: usize = 512;
+/// Consecutive-failure counters behind the ingest warn-throttle
+/// (noetl/ehdb#345).
+///
+/// A failing writer fails *every* publish, and the control plane retries nine
+/// times per request before giving up, so logging unconditionally would turn one
+/// outage into thousands of lines a second. Logging only the first would then
+/// hide an outage that starts after the log buffer has rolled. These log the
+/// first occurrence and then a geometrically-thinning sample, so the signal is
+/// always present and never floods.
+static APPEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECODE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `true` for the 1st failure and every 256th after it.
+///
+/// The counter is never reset: this throttles log volume, it does not track
+/// health. The counter that reports health is
+/// [`L0Metrics::ingest_append_failed`](ehdb_l0::metrics::L0Metrics::ingest_append_failed),
+/// which is incremented on every failure regardless of what this returns — so a
+/// throttled log can never mean an undercounted metric.
+fn should_log_ingest_failure(counter: &std::sync::atomic::AtomicU64) -> bool {
+    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    n == 0 || n % 256 == 0
+}
 
 /// Accept publisher connections on `listener` and append each published record
 /// to `writer`, returning its assigned sort key. Runs until the listener errors;
@@ -85,6 +108,7 @@ where
         tokio::spawn(async move {
             let (mut rd, mut wr) = sock.into_split();
             let (tx, mut rx) = mpsc::channel::<D::Record>(MAX_COMMIT_BATCH);
+            let reader_metrics = Arc::clone(writer.metrics());
 
             // Reader: decode frames off the wire as fast as they land.
             tokio::spawn(async move {
@@ -93,8 +117,24 @@ where
                         Ok(b) => b,
                         Err(_) => return, // publisher disconnected
                     };
-                    let Ok(record) = serde_json::from_slice::<D::Record>(&body) else {
-                        return;
+                    let record = match serde_json::from_slice::<D::Record>(&body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // noetl/ehdb#345 — this used to be a bare `return`, so
+                            // a publisher speaking a shape this writer cannot parse
+                            // was indistinguishable from a healthy idle connection.
+                            reader_metrics.incr_ingest_decode_failed();
+                            if should_log_ingest_failure(&DECODE_FAILURES) {
+                                tracing::warn!(
+                                    error = %e,
+                                    bytes = body.len(),
+                                    "publish: record did not deserialize; dropping the \
+                                     connection with no ack. Publisher and writer disagree \
+                                     on the record shape"
+                                );
+                            }
+                            return;
+                        }
                     };
                     if tx.send(record).await.is_err() {
                         return;
@@ -116,9 +156,28 @@ where
                         Err(_) => break,
                     }
                 }
+                let batch_len = batch.len();
                 let seqs = match writer.append_batch(std::mem::take(&mut batch)) {
                     Ok(s) => s,
-                    Err(_) => return,
+                    Err(e) => {
+                        // noetl/ehdb#345 — this used to discard `e` and `return`.
+                        // The publisher then saw only `connection closed before
+                        // ack`, and the writer said nothing at all: a **full
+                        // volume** and a sealed writer produced the same symptom.
+                        // On 2026-09-01 that hid a 100%-full `/data/cmdbus` while
+                        // the pod reported Ready with zero WARN lines, and every
+                        // command publish on the platform failed.
+                        writer.metrics().incr_ingest_append_failed();
+                        if should_log_ingest_failure(&APPEND_FAILURES) {
+                            tracing::warn!(
+                                error = %e,
+                                records = batch_len,
+                                "publish: append failed; dropping the connection with no \
+                                 ack. Check free space on the writer's volume first"
+                            );
+                        }
+                        return;
+                    }
                 };
                 for seq in seqs {
                     if wr.write_all(&seq.to_be_bytes()).await.is_err() {
