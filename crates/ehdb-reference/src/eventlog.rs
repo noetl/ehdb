@@ -118,21 +118,66 @@ pub struct EventLogAppendRequest {
     pub execution_id: String,
     pub transaction_id: String,
     pub payload: String,
+    /// **The idempotency key** — the producer's `event_id` (noetl/ai-meta#313).
+    ///
+    /// `None` means "no idempotency for this append", which is exactly today's
+    /// behaviour and is what every existing caller gets. A record is deduplicated
+    /// only when a key is supplied AND a record carrying the same key is already
+    /// in the log.
+    ///
+    /// ⚠ Supplied explicitly rather than parsed out of `payload` by the driver.
+    /// The append is on the write path of a `primary`-serving tier, and a driver
+    /// that dug the key out of an opaque body would put a JSON parse in that path
+    /// and would silently stop deduplicating the day the payload shape changed —
+    /// degrading to "never matches", which is indistinguishable from working.
+    ///
+    /// ⚠ This struct has no serde derive, so adding the field is a pure Rust
+    /// change: no wire format moves and no deploy ordering is implied by it. The
+    /// ordering constraint comes from [`EventLogAppendOutcome`] instead.
+    pub event_id: Option<String>,
 }
 
 /// Secret-free result of an append: the assigned global sequence + record shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// ⚠ `deny_unknown_fields` was REMOVED, and removing it is a migration step in its
+// own right (noetl/ai-meta#313).
+//
+// This outcome crosses a process boundary: the tier service serialises it and the
+// worker parses it. With `deny_unknown_fields`, a binary that predates a new
+// field **errors** when it reads one carrying it — so a rollback after activation
+// could not read what the newer binary wrote, on a tier that serves `primary`.
+// Tolerating unknown fields must therefore ship and be deployed BEFORE anything
+// writes one. Same expand-first sequence the L0 `EventRecord` needed.
 pub struct EventLogAppendOutcome {
     pub action: String,
     pub execution_id: String,
     /// The global sequence assigned to this event (monotonic, gapless).
+    ///
+    /// ⚠ When `deduplicated` is true this is the position of the record that was
+    /// **already there**, not a newly assigned one — so it is NOT greater than the
+    /// previous append's, and `log_record_count` has not advanced. A caller that
+    /// checks either invariant must consult `deduplicated` first.
     pub global_sequence: u64,
     pub byte_len: usize,
     /// Whether the canonical event-log stream was created on this append.
     pub created_stream: bool,
     /// Total records in the log after this append (== the highest sequence).
     pub log_record_count: usize,
+    /// **True when this append was an acknowledgement, not a write.**
+    ///
+    /// The key was already present, so nothing was appended and `global_sequence`
+    /// names the existing record.
+    ///
+    /// ⚠ `skip_serializing_if` keeps a `false` outcome **byte-identical to before
+    /// the field existed**, which is what makes the pre-activation deploy
+    /// rollback-safe in both directions: only a genuine dedupe changes the wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deduplicated: bool,
+}
+
+/// `skip_serializing_if` predicate — a `false` bool is omitted entirely.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Bounded ordered scan of the whole log by global sequence.
@@ -304,11 +349,35 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
             // Create-on-first-use + next global sequence from replayed state.  A
             // missing stream replays as an error — that is the create signal, not a
             // failure.  next = count + 1 keeps the sequence monotonic + gapless.
-            let (created_stream, next_sequence) = match runtime
+            let replayed = runtime
                 .state()
                 .streams
-                .replay(&tenant, &namespace, &stream, None)
-            {
+                .replay(&tenant, &namespace, &stream, None);
+
+            // ⚠ Idempotency FIRST (noetl/ai-meta#313).  A duplicate must not
+            // publish a mutation, must not consume a sequence, and must not change
+            // the record count — it is an acknowledgement of a record that is
+            // already there, not an append.
+            //
+            // Before this, a redelivery appended a second copy: #313 observed 11
+            // duplicates in exactly this store.
+            if let Some(key) = request.event_id.as_deref() {
+                if let Ok(records) = replayed.as_ref() {
+                    if let Some(seq) = existing_sequence_for_event_id(records, key) {
+                        return Ok(EventLogAppendOutcome {
+                            action: "eventlog-append".to_string(),
+                            execution_id: request.execution_id.trim().to_string(),
+                            global_sequence: seq,
+                            byte_len,
+                            created_stream: false,
+                            log_record_count: records.len(),
+                            deduplicated: true,
+                        });
+                    }
+                }
+            }
+
+            let (created_stream, next_sequence) = match replayed {
                 Ok(records) => (false, records.len() as u64 + 1),
                 Err(_) => (true, StreamSequence::first().value()),
             };
@@ -349,6 +418,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                 byte_len,
                 created_stream,
                 log_record_count,
+                deduplicated: false,
             })
         })
     }
@@ -421,6 +491,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                     // so the batch does not reintroduce a per-record O(store)
                     // read.
                     log_record_count: sequence as usize,
+                    deduplicated: false,
                 });
             }
 
@@ -616,6 +687,34 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
             })
         })
     }
+}
+
+/// The sequence of an already-stored record carrying `event_id`, if any.
+///
+/// Scans the records the caller **has already replayed** — the append path
+/// replays the stream anyway to compute the next sequence and the record count,
+/// so this adds no I/O and no second pass over storage.
+///
+/// ⚠ Matches on the raw payload bytes rather than parsing each record as JSON.
+/// This runs inside the append path of a `primary`-serving tier; a per-record
+/// `serde_json::from_slice` there would be a parse per stored record per append.
+/// The needle is the exact `"event_id":"<id>"` / `"event_id":<id>` shape the
+/// producer emits, so a substring hit is the key and not an accident of prose —
+/// the payload is machine-generated JSON, not free text.
+fn existing_sequence_for_event_id(
+    records: &[ehdb_stream::StreamRecord],
+    event_id: &str,
+) -> Option<u64> {
+    let quoted = format!("\"event_id\":\"{event_id}\"");
+    let bare = format!("\"event_id\":{event_id}");
+    records.iter().find_map(|r| {
+        let hay = String::from_utf8_lossy(&r.payload);
+        if hay.contains(quoted.as_str()) || hay.contains(bare.as_str()) {
+            Some(r.sequence.value())
+        } else {
+            None
+        }
+    })
 }
 
 fn project_record(record: ehdb_stream::StreamRecord) -> EventLogRecordView {
@@ -836,6 +935,7 @@ pub fn exercise_primary_serve(
             execution_id: event.execution_id.clone(),
             transaction_id: event.transaction_id.clone(),
             payload: event.payload.clone(),
+            event_id: None,
         })?;
         if i == 0 {
             first_sequence = outcome.global_sequence;
@@ -1000,6 +1100,7 @@ mod tests {
             execution_id: exec.to_string(),
             transaction_id: format!("txn-{exec}-{n}"),
             payload: payload.to_string(),
+            event_id: None,
         })
         .unwrap()
     }
@@ -1171,6 +1272,7 @@ mod tests {
                 execution_id: "bad id!".to_string(),
                 transaction_id: "t".to_string(),
                 payload: "x".to_string(),
+                event_id: None,
             })
             .unwrap_err();
         assert!(err.to_string().starts_with("invalid identifier"));
@@ -1199,6 +1301,7 @@ mod tests {
             byte_len: 1,
             created_stream: false,
             log_record_count: 7,
+            deduplicated: false,
         };
         // Authoritative said 5, EHDB assigned 7 → divergence.
         let report = compare_shadow_parity(Some(5), &outcome, 6, 7);
@@ -1216,6 +1319,7 @@ mod tests {
             byte_len: 1,
             created_stream: false,
             log_record_count: 3,
+            deduplicated: false,
         };
         // Sequence + order fine, but only 2 mirrored so far → count divergence.
         let report = compare_shadow_parity(Some(3), &outcome, 2, 2);
@@ -1233,6 +1337,7 @@ mod tests {
             byte_len: 1,
             created_stream: false,
             log_record_count: 9,
+            deduplicated: false,
         };
         // No authoritative sequence → sequence check passes, count+order still enforced.
         let report = compare_shadow_parity(None, &outcome, 8, 9);
@@ -1400,6 +1505,7 @@ mod runtime_cache_tests {
                 execution_id: "exec1".to_string(),
                 transaction_id: format!("tx-{i}"),
                 payload: format!("{{\"i\":{i}}}"),
+                event_id: None,
             })
             .expect("append");
         }
@@ -1497,6 +1603,7 @@ mod append_batch_driver_tests {
                 execution_id: format!("exec{}", i % 3),
                 transaction_id: format!("tx-{i}"),
                 payload: format!("{{\"i\":{i}}}"),
+                event_id: None,
             })
             .collect()
     }
@@ -1561,6 +1668,7 @@ mod append_batch_driver_tests {
             execution_id: "exec0".to_string(),
             transaction_id: "seed".to_string(),
             payload: "{\"seed\":true}".to_string(),
+            event_id: None,
         })
         .expect("seed");
 

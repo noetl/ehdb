@@ -1355,6 +1355,7 @@ pub fn exercise_shared_tier_gc(
             execution_id: exec0.clone(),
             transaction_id: format!("gc-{i:05}"),
             payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+            event_id: None,
         })?;
         if !served.is_served() {
             record_first(&mut divergence, format!("owner did not serve append {i}"));
@@ -1492,6 +1493,7 @@ pub fn exercise_shared_tier_gc(
         execution_id: exec0.clone(),
         transaction_id: "gc-post".to_string(),
         payload: "post-hydrate".to_string(),
+        event_id: None,
     })?;
     let next_seq = next.served().map(|o| o.global_sequence).unwrap_or(0);
     let new_owner_hydrate_coherent = hydrated.served_by == ServedBy::OwnerResident
@@ -1647,6 +1649,7 @@ pub fn exercise_shared_tier(
             execution_id: execution_id.clone(),
             transaction_id: format!("shared-{execution_id}"),
             payload: format!("{{\"exec\":\"{execution_id}\"}}"),
+            event_id: None,
         })?;
         if !served.is_served() {
             owner_published_ok = false;
@@ -1839,6 +1842,7 @@ pub fn exercise_shared_tier(
                 .unwrap_or_default(),
             transaction_id: "shared-continue".to_string(),
             payload: "{\"cont\":true}".to_string(),
+            event_id: None,
         })?;
         match cont.served() {
             Some(outcome) if outcome.global_sequence == expected0 as u64 + 1 => {}
@@ -1887,6 +1891,7 @@ mod tests {
             execution_id: exec.to_string(),
             transaction_id: format!("txn-{exec}"),
             payload: payload.to_string(),
+            event_id: None,
         }
     }
 
@@ -2565,6 +2570,7 @@ mod tests {
                     execution_id: exec0.clone(),
                     transaction_id: format!("c-{i:05}"),
                     payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+                    event_id: None,
                 })
                 .unwrap();
         }

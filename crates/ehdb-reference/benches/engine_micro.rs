@@ -152,6 +152,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                     execution_id: format!("{}", 300_000_000_000u64 + i),
                                     transaction_id: format!("txn-{i}"),
                                     payload: event_payload(i, "exec-a"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
@@ -176,6 +177,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                     execution_id: format!("{}", 300_000_000_000u64 + i),
                                     transaction_id: format!("txn-{i}"),
                                     payload: event_payload(i, "exec-a"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
@@ -200,6 +202,7 @@ fn bench_eventlog(c: &mut Criterion) {
                     execution_id: format!("{}", 400_000_000_000u64 + i),
                     transaction_id: format!("seed-{i}"),
                     payload: event_payload(i, "exec-seed"),
+                    event_id: None,
                 })
                 .unwrap();
         }
@@ -216,6 +219,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                 execution_id: format!("{}", 400_000_000_000u64 + i),
                                 transaction_id: format!("hot-{i}"),
                                 payload: event_payload(i, "exec-seed"),
+                                event_id: None,
                             })
                             .unwrap(),
                     );
@@ -233,6 +237,7 @@ fn bench_eventlog(c: &mut Criterion) {
                     execution_id: format!("{}", 400_000_000_000u64 + i),
                     transaction_id: format!("seed-{i}"),
                     payload: event_payload(i, "exec-seed"),
+                    event_id: None,
                 })
                 .unwrap();
         }
@@ -249,6 +254,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                 execution_id: format!("{}", 400_000_000_000u64 + i),
                                 transaction_id: format!("hot-{i}"),
                                 payload: event_payload(i, "exec-seed"),
+                                event_id: None,
                             })
                             .unwrap(),
                     );
@@ -281,6 +287,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                     execution_id: format!("{}", 500_000_000_000u64 + i),
                                     transaction_id: format!("txn-{i}"),
                                     payload: event_payload(i, "exec-rot"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
@@ -305,6 +312,7 @@ fn bench_eventlog(c: &mut Criterion) {
                     execution_id: format!("{}", 600_000_000_000u64 + (i % 500)),
                     transaction_id: format!("txn-{i}"),
                     payload: event_payload(i, "exec-replay"),
+                    event_id: None,
                 })
                 .unwrap();
         }
@@ -348,6 +356,7 @@ fn bench_eventlog(c: &mut Criterion) {
                         execution_id: format!("{}", 400_000_000_000u64 + i),
                         transaction_id: format!("seed-{i}"),
                         payload: event_payload(i, "exec-seed"),
+                        event_id: None,
                     })
                     .unwrap();
             }
@@ -368,6 +377,7 @@ fn bench_eventlog(c: &mut Criterion) {
                                 execution_id: format!("{}", 400_000_000_000u64 + i),
                                 transaction_id: format!("hot-{i}"),
                                 payload: event_payload(i, "exec-seed"),
+                                event_id: None,
                             })
                             .unwrap(),
                     );
@@ -848,6 +858,7 @@ fn bench_shared_tier_append(c: &mut Criterion) {
                 execution_id: exec.clone(),
                 transaction_id: format!("seed-{i}"),
                 payload: event_payload(i, "exec-shared"),
+                event_id: None,
             })
             .unwrap();
         }
@@ -863,6 +874,7 @@ fn bench_shared_tier_append(c: &mut Criterion) {
                             execution_id: exec.clone(),
                             transaction_id: format!("hot-{i}"),
                             payload: event_payload(i, "exec-shared"),
+                            event_id: None,
                         })
                         .unwrap(),
                     );
@@ -900,6 +912,7 @@ fn bench_shared_tier_append(c: &mut Criterion) {
                     execution_id: exec.clone(),
                     transaction_id: format!("seed-{i}"),
                     payload: event_payload(i, "exec-shared"),
+                    event_id: None,
                 })
                 .unwrap();
             }
@@ -926,6 +939,7 @@ fn bench_shared_tier_append(c: &mut Criterion) {
                             execution_id: exec.clone(),
                             transaction_id: format!("hot-{i}"),
                             payload: event_payload(i, "exec-shared"),
+                            event_id: None,
                         })
                         .unwrap(),
                     );
@@ -983,6 +997,7 @@ fn bench_segment_gc(c: &mut Criterion) {
                                     execution_id: exec.clone(),
                                     transaction_id: format!("seed-{i}"),
                                     payload: event_payload(i, "exec-gc"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
@@ -1041,6 +1056,7 @@ fn bench_segment_gc(c: &mut Criterion) {
                                     execution_id: exec.clone(),
                                     transaction_id: format!("seed-{i}"),
                                     payload: event_payload(i, "exec-gc-ret"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
@@ -1121,6 +1137,7 @@ fn bench_shared_tier_gc(c: &mut Criterion) {
                                     execution_id: exec.clone(),
                                     transaction_id: format!("seed-{i}"),
                                     payload: event_payload(i, "exec-shared-gc"),
+                                    event_id: None,
                                 })
                                 .unwrap();
                         }
