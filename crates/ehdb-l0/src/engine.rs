@@ -96,6 +96,9 @@ pub struct L0Config {
     pub seal_max_age: Option<Duration>,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
+    /// Keys remembered per shard for append-time idempotency (noetl/ai-meta#313).
+    /// `0` disables dedupe entirely.
+    pub dedupe_capacity: usize,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
     /// How many versioned manifest snapshots to keep besides `LATEST`
@@ -118,6 +121,7 @@ impl L0Config {
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             seal_max_age: None,
             flush: FlushPolicy::EveryAppend,
+            dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
             manifest_retain: DEFAULT_MANIFEST_RETAIN,
         }
@@ -134,6 +138,17 @@ impl L0Config {
     }
 
     /// Set the partition (shard) count.
+    /// Keys remembered per shard for append-time idempotency (#313).
+    ///
+    /// `0` disables dedupe and is byte-for-byte today's behaviour. Default is
+    /// [`crate::dedupe::DEFAULT_DEDUPE_CAPACITY`]; it is inert regardless until a
+    /// record actually carries a [`crate::dataset::Dataset::dedupe_key`], which
+    /// no producer sends yet.
+    pub fn with_dedupe_capacity(mut self, capacity: usize) -> Self {
+        self.dedupe_capacity = capacity;
+        self
+    }
+
     pub fn with_shard_count(mut self, shard_count: u32) -> Self {
         self.shard_count = shard_count;
         self
@@ -247,6 +262,8 @@ pub struct L0Engine<D: Dataset> {
     /// not advance its shard's tail — the ascending-contract-violation canary
     /// behind [`L0Metrics::out_of_order_appends`] (noetl/ai-meta#203).
     shard_tail_max: HashMap<u32, u64>,
+    /// Append-time idempotency window (noetl/ai-meta#313).
+    dedupe: crate::dedupe::DedupeIndex,
     /// Sender to the uploader thread (dropped on close to stop it).
     upload_tx: Option<Sender<UploadJob>>,
     upload_handle: Option<JoinHandle<()>>,
@@ -399,6 +416,8 @@ impl<D: Dataset> L0Engine<D> {
         global_sequence: u64,
     ) -> Self {
         let shard_count = config.shard_count;
+        let dedupe_capacity_init =
+            crate::dedupe::DedupeIndex::with_capacity(config.dedupe_capacity);
         Self {
             config,
             replicas,
@@ -407,6 +426,7 @@ impl<D: Dataset> L0Engine<D> {
             writers: HashMap::new(),
             global_sequence,
             shard_tail_max: HashMap::new(),
+            dedupe: dedupe_capacity_init,
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
@@ -490,7 +510,30 @@ impl<D: Dataset> L0Engine<D> {
     /// fully-formed record whose sort key is `>=` every prior record in its
     /// partition (the single-writer ascending-sort-key contract). Never touches
     /// the substrate. Returns the record's sort key.
+    /// Has this record's idempotency key already landed? Returns its position.
+    ///
+    /// `None` whenever the dataset has no key for the record — which is every
+    /// dataset except D1, and every D1 record whose producer has not been updated
+    /// to send one. So this is a no-op until something actually sends an
+    /// `event_id`, which is what makes the change inert on arrival.
+    fn dedupe_hit(&self, record: &D::Record) -> Option<u64> {
+        let key = D::dedupe_key(record)?;
+        let shard = D::partition(record, self.config.shard_count);
+        match self.dedupe.check(shard, key) {
+            crate::dedupe::DedupeVerdict::Duplicate(seq) => Some(seq),
+            crate::dedupe::DedupeVerdict::Fresh => None,
+        }
+    }
+
     pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
+        // ⚠ Before anything else. A duplicate must not touch the shard tail, must
+        // not trip the ascending canary, must not seal, and must not advance the
+        // durability window — it is not an append, it is an acknowledgement of one
+        // that already happened.
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok(existing);
+        }
         let sort_key = D::sort_key(&record);
         let shard = D::partition(&record, self.config.shard_count);
         // Ascending-contract canary: an append that does not advance its shard's
@@ -505,9 +548,19 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
         self.ensure_writer(shard)?;
+        let dedupe_key = D::dedupe_key(&record).map(str::to_string);
         {
             let writer = self.writers.get_mut(&shard).unwrap();
             writer.append(record)?;
+        }
+        // ⚠ AFTER the append, never before. Remembering first would make a failed
+        // append poison its key: the retry that the failure exists to invite would
+        // then be answered "already present" for a record that is not there —
+        // silent loss, the exact class this removes.
+        if let Some(key) = dedupe_key {
+            self.dedupe.remember(shard, &key, sort_key);
+            self.metrics
+                .set_dedupe_window_evictions(self.dedupe.evictions());
         }
         if sort_key > self.global_sequence {
             self.global_sequence = sort_key;
@@ -548,6 +601,23 @@ impl<D: Dataset> L0Engine<D> {
     /// increases, the shard log is ascending by construction: a follower cursor
     /// never advances past an un-read record, and no append can land behind it.
     pub fn append_writer_assigned(&mut self, record: D::Record) -> Result<u64> {
+        // An early-out, NOT the enforcement point — and the distinction is
+        // recorded because the comment here first claimed otherwise.
+        //
+        // It originally said this check was needed so a duplicate would not burn
+        // a global sequence and leave a gap. A mutation removing it left every
+        // test green, which is how the claim was found to be false: `seq` here is
+        // only a candidate, and `self.global_sequence` advances *inside*
+        // `append_record` after its own dedupe check. So gaplessness is enforced
+        // there, and this guard only saves the `assign_sort_key` work.
+        //
+        // Both guards are kept because both entry points are public and reached:
+        // `append_record` is called directly by callers that own their sort keys.
+        // Each is covered by its own test — see `event_id_idempotency.rs`.
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok(existing);
+        }
         let seq = self.global_sequence + 1;
         self.append_record(D::assign_sort_key(record, seq))
     }
@@ -622,6 +692,21 @@ impl<D: Dataset> L0Engine<D> {
                 }
                 let recovered = writer.pending_records().len() as u64;
                 self.metrics.add_recovered_active_records(recovered);
+                // ⚠⚠ Re-seed the idempotency window from the recovered records
+                // (noetl/ai-meta#313). Without this, a crash makes every record in
+                // the active part deduplicable-no-more: the retry that a crash
+                // most reliably produces would be answered "fresh" and appended a
+                // second time. The window would be emptiest at exactly the moment
+                // redelivery is most likely — the same "quietest when the most is
+                // at risk" shape the durability window was fixed for.
+                let seeds: Vec<(String, u64)> = writer
+                    .pending_records()
+                    .iter()
+                    .filter_map(|r| D::dedupe_key(r).map(|k| (k.to_string(), D::sort_key(r))))
+                    .collect();
+                for (key, seq) in seeds {
+                    self.dedupe.remember(shard, &key, seq);
+                }
                 // ⚠⚠ Seed the durability window too. These records are acked and
                 // `fsync`'d but not on the substrate, so they are pending by
                 // every definition the gauge uses — and without this the window

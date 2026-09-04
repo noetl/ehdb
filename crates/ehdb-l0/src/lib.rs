@@ -139,6 +139,7 @@ pub mod catalog;
 pub mod columnar;
 pub mod command_queue;
 pub mod dataset;
+pub mod dedupe;
 pub mod engine;
 pub mod failure_domain;
 pub mod feed;
