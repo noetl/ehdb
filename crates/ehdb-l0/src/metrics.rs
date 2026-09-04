@@ -99,6 +99,17 @@ pub struct L0Metrics {
     /// nothing pruned them, so cost grew **quadratically** in part count — 71.8 MB
     /// of command data produced 19.4 GB of manifest and filled the volume, which
     /// stopped every append and took prod dispatch down.
+    /// Appends answered from the idempotency window instead of being written
+    /// (noetl/ai-meta#313). A redelivery lands here rather than becoming a
+    /// duplicate in the log or a record silently behind the follower cursor.
+    pub dedupe_hits: AtomicU64,
+    /// Keys the idempotency window has forgotten because it reached capacity.
+    ///
+    /// ⚠ The window is a capacity, not a guarantee: a redelivery arriving after
+    /// this many intervening appends on its shard is NOT deduplicated. Non-zero
+    /// means the window is undersized for the redelivery pattern — without this
+    /// an undersized window is indistinguishable from a working one.
+    pub dedupe_window_evictions: AtomicU64,
     pub manifest_versions_pruned: AtomicU64,
     /// Versioned manifest snapshots left on the substrate after the most recent
     /// prune — the bound actually being enforced, as opposed to the one
@@ -192,6 +203,12 @@ impl L0Metrics {
 
     pub(crate) fn incr_appends(&self) {
         self.appends.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_dedupe_hits(&self) {
+        self.dedupe_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn set_dedupe_window_evictions(&self, n: u64) {
+        self.dedupe_window_evictions.store(n, Ordering::Relaxed);
     }
     pub(crate) fn incr_out_of_order_appends(&self) {
         self.out_of_order_appends.fetch_add(1, Ordering::Relaxed);

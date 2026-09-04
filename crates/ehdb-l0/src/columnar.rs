@@ -308,6 +308,17 @@ pub fn decode_columnar(bytes: &[u8]) -> Result<Vec<EventRecord>> {
             execution_id: execs[i].clone(),
             transaction_id: txns[i].clone(),
             payload: payloads[i].clone(),
+            // ⚠ The columnar codec's on-disk layout is a FIXED four-column
+            // header and does not carry `event_id` (noetl/ai-meta#313). A
+            // record round-tripped through it therefore loses its idempotency
+            // key and stops being deduplicable.
+            //
+            // Safe today only because the engine's part writer uses the
+            // serde_json frame codec, not this one — this is exported but not on
+            // the write path. `columnar_does_not_carry_the_idempotency_key`
+            // pins that limitation so it is a known gap rather than a surprise
+            // the first time D1 parts move to this layout.
+            event_id: None,
         });
     }
     Ok(out)
