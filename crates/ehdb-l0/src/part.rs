@@ -273,6 +273,16 @@ impl<D: Dataset> PartWriter<D> {
     /// store — durability rides the async uploader on seal. Returns the byte
     /// offset the frame was written at (its mark).
     pub fn append(&mut self, record: D::Record) -> Result<u64> {
+        // Deterministic fault-injection seam (noetl/ai-meta#313, ehdb#345).
+        // Disarmed unless a test explicitly arms it; one relaxed atomic load
+        // otherwise. Placed FIRST so an injected failure happens before any state
+        // is mutated — a partial append would test something other than the
+        // failure path.
+        if crate::fault::should_fail_append() {
+            return Err(EhdbError::Storage(
+                "injected append failure (ehdb-l0 fault seam)".to_string(),
+            ));
+        }
         let sort_key = D::sort_key(&record);
         let body = serde_json::to_vec(&record)
             .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
