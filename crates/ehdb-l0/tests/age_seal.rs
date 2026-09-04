@@ -189,14 +189,29 @@ fn the_part_count_cost_is_bounded_and_measured() {
     // ⚠ The honest cost: sealing on age produces small parts on idle shards,
     // raising part count and merge pressure. Measured rather than asserted away
     // — N quiet intervals produce at most N parts, not one per record.
-    let mut engine = open("cost", Some(AGE));
+    // ⚠ This test uses its OWN, much longer age than the rest of the file, and the
+    // reason is a real CI failure rather than caution.
+    //
+    // With the shared 50 ms `AGE`, the five appends in a round must complete inside
+    // 50 ms or the age trigger fires *during* the loop and that round produces two
+    // parts instead of one. Each append `fsync`s under the default posture, so on a
+    // loaded runner five of them exceed 50 ms easily — the assertion then reads 4+
+    // seals and reports a defect that is not there. It passed locally and on `main`
+    // and failed on CI, which is the signature of a timing race, not a regression.
+    //
+    // 750 ms is not a magic number: far longer than five `fsync`s can plausibly
+    // take, far shorter than the explicit sleep, so the only thing that can cross
+    // the threshold is the sleep. The property under test is unchanged — N quiet
+    // intervals produce N parts, not one per record.
+    const COST_AGE: Duration = Duration::from_millis(750);
+    let mut engine = open("cost", Some(COST_AGE));
     for round in 0..3 {
         for seq in 0..5 {
             engine
                 .append_record(rec(round * 10 + seq + 1, "exec-a"))
                 .unwrap();
         }
-        std::thread::sleep(AGE + Duration::from_millis(20));
+        std::thread::sleep(COST_AGE + Duration::from_millis(20));
         engine.seal_aged_parts().unwrap();
     }
     let seals = engine.metrics().snapshot().seals;
