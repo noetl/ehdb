@@ -525,6 +525,38 @@ impl<D: Dataset> L0Engine<D> {
         }
     }
 
+    /// [`append_record`](Self::append_record), reporting **whether the record was
+    /// actually written**.
+    ///
+    /// `(sort_key, appended)`. `appended == false` means the key was already
+    /// present and the returned position is the existing record's — the caller
+    /// must treat it as an acknowledgement, not a new append.
+    ///
+    /// ⚠ This exists because the plain `append_record` return is indistinguishable
+    /// between the two cases, and the difference is load-bearing upstream: the
+    /// tier-append reply is checked for **strictly increasing** sequences and for
+    /// `log_record_count == global_sequence`. A deduplicated redelivery returns an
+    /// OLDER position and does not advance the count, so a caller that cannot tell
+    /// the two apart reports a parity **divergence** for a working dedupe
+    /// (noetl/ai-meta#313).
+    pub fn append_record_reporting(&mut self, record: D::Record) -> Result<(u64, bool)> {
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok((existing, false));
+        }
+        self.append_record(record).map(|seq| (seq, true))
+    }
+
+    /// [`append_writer_assigned`](Self::append_writer_assigned), reporting whether
+    /// the record was actually written. See [`Self::append_record_reporting`].
+    pub fn append_writer_assigned_reporting(&mut self, record: D::Record) -> Result<(u64, bool)> {
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok((existing, false));
+        }
+        self.append_writer_assigned(record).map(|seq| (seq, true))
+    }
+
     pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
         // ⚠ Before anything else. A duplicate must not touch the shard tail, must
         // not trip the ascending canary, must not seal, and must not advance the
