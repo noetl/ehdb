@@ -153,6 +153,7 @@ fn run_eventlog_append(args: &[String]) -> Result<(String, i32), String> {
         execution_id,
         transaction_id,
         payload,
+        event_id: None,
     }) {
         Ok(outcome) => Ok((json(&outcome)?, 0)),
         Err(err) => Ok((json_error(&err)?, eventlog_exit_code(&err))),
@@ -246,6 +247,7 @@ fn run_eventlog_suite(args: &[String]) -> Result<(String, i32), String> {
                 execution_id: exec.to_string(),
                 transaction_id: format!("suite-{exec}-{auth_seq}"),
                 payload: format!("{{\"exec\":\"{exec}\",\"seq\":{auth_seq}}}"),
+                event_id: None,
             })
             .map_err(|err| err.to_string())?;
         mirrored += 1;
@@ -383,6 +385,7 @@ fn run_durable_eventlog_recovery(args: &[String]) -> Result<(String, i32), Strin
             execution_id: exec.to_string(),
             transaction_id: format!("durable-{exec}-{seq}"),
             payload: format!("{{\"exec\":\"{exec}\",\"seq\":{seq}}}"),
+            event_id: None,
         })
         .collect();
 
@@ -478,6 +481,7 @@ fn run_durable_eventlog_affinity_append(args: &[String]) -> Result<(String, i32)
         execution_id: execution_id.clone(),
         transaction_id,
         payload,
+        event_id: None,
     }) {
         Ok(Routed::Served(outcome)) => {
             let output = serde_json::to_string(&serde_json::json!({

@@ -924,6 +924,20 @@ impl DurableSegmentStore {
     }
 
     /// Append one authorized event, assigning the next gapless global sequence.
+    /// ⚠ **This driver does NOT deduplicate**, and that is deliberate rather than
+    /// an omission (noetl/ai-meta#313).
+    ///
+    /// `request.event_id` is accepted and ignored here. The tier store — the
+    /// surface where #313's duplicates were actually observed — is served by
+    /// [`crate::eventlog::LocalReferenceEventLogDriver`], which replays the stream
+    /// on every append and can therefore check the key for free. This driver
+    /// keeps only an offset index (`by_execution`), so the same check would mean a
+    /// disk read per append on the write path.
+    ///
+    /// Building it here would be building for a path that does not produce the
+    /// defect. `the_durable_driver_does_not_deduplicate` pins the behaviour so it
+    /// is a known limitation rather than an assumed capability — if this backend
+    /// ever fronts the tier, that test fails and says so.
     pub fn append(&mut self, request: &EventLogAppendRequest) -> Result<EventLogAppendOutcome> {
         validate_execution_id(&request.execution_id)?;
         if request.transaction_id.trim().is_empty() {
@@ -966,6 +980,7 @@ impl DurableSegmentStore {
             byte_len,
             created_stream,
             log_record_count: self.event_count as usize,
+            deduplicated: false,
         })
     }
 
@@ -2156,6 +2171,7 @@ pub fn exercise_segment_gc(
             // rollover fires often (many reclaim candidates).
             transaction_id: format!("gc-txn-{i:05}"),
             payload: format!("payload-{i:05}-0123456789abcdef0123456789abcdef"),
+            event_id: None,
         })?;
     }
 
@@ -2279,12 +2295,49 @@ mod tests {
         dir
     }
 
+    /// ⚠ The durable store accepts `event_id` and IGNORES it — pinned so the
+    /// limitation is known rather than assumed (noetl/ai-meta#313).
+    ///
+    /// The tier, where #313's duplicates were observed, is served by
+    /// `LocalReferenceEventLogDriver`, which replays the stream on every append
+    /// and can check the key for free. This store keeps only an offset index, so
+    /// the same check would mean a disk read per append on the write path — work
+    /// for a path that does not produce the defect.
+    ///
+    /// If this backend ever fronts the tier, this test fails and says why.
+    #[test]
+    fn the_durable_driver_does_not_deduplicate() {
+        let dir = tmp_root("no-dedupe");
+        let mut store = DurableSegmentStore::open(&dir).expect("open");
+        let req = |id: &str| EventLogAppendRequest {
+            execution_id: "exec-d".to_string(),
+            transaction_id: "txn-d".to_string(),
+            payload: format!(r#"{{"event_id":"{id}"}}"#),
+            event_id: Some(id.to_string()),
+        };
+        let first = store.append(&req("evt-1")).expect("first");
+        let second = store.append(&req("evt-1")).expect("second");
+
+        assert!(
+            !first.deduplicated && !second.deduplicated,
+            "this store never reports a dedupe"
+        );
+        assert_eq!(
+            second.global_sequence,
+            first.global_sequence + 1,
+            "the redelivery is APPENDED here, not acknowledged — that is the \
+             documented limitation. If this now dedupes, the tier's guarantee and \
+             this store's have diverged and the doc comment on `append` is stale"
+        );
+    }
+
     fn append(store: &mut DurableSegmentStore, exec: &str, n: u64, payload: &str) -> u64 {
         store
             .append(&EventLogAppendRequest {
                 execution_id: exec.to_string(),
                 transaction_id: format!("txn-{exec}-{n}"),
                 payload: payload.to_string(),
+                event_id: None,
             })
             .unwrap()
             .global_sequence
@@ -2626,6 +2679,7 @@ mod tests {
                 execution_id: "bad id!".to_string(),
                 transaction_id: "t".to_string(),
                 payload: "x".to_string(),
+                event_id: None,
             })
             .unwrap_err();
         assert!(matches!(err, EhdbError::InvalidIdentifier(_)));
@@ -2660,6 +2714,7 @@ mod tests {
                     execution_id: exec.to_string(),
                     transaction_id: format!("txn-{i}"),
                     payload: payload.to_string(),
+                    event_id: None,
                 })
                 .unwrap();
             let l = local
@@ -2667,6 +2722,7 @@ mod tests {
                     execution_id: exec.to_string(),
                     transaction_id: format!("txn-{i}"),
                     payload: payload.to_string(),
+                    event_id: None,
                 })
                 .unwrap();
             assert_eq!(d.global_sequence, l.global_sequence);
@@ -2767,6 +2823,7 @@ mod tests {
                 execution_id: exec.to_string(),
                 transaction_id: format!("txn-{i}"),
                 payload: payload.to_string(),
+                event_id: None,
             })
             .collect();
         let report = exercise_durable_recovery(&root, &events, "projector").unwrap();
@@ -2843,6 +2900,7 @@ mod tests {
                 execution_id: "100".to_string(),
                 transaction_id: "t".to_string(),
                 payload: "nope".to_string(),
+                event_id: None,
             })
             .unwrap_err();
         assert!(matches!(err, EhdbError::InvalidState(_)));

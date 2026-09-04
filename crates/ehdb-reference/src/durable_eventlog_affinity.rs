@@ -555,6 +555,7 @@ pub fn exercise_affinity_single_writer(
                 execution_id: execution_id.clone(),
                 transaction_id: format!("aff-{execution_id}"),
                 payload: format!("{{\"exec\":\"{execution_id}\"}}"),
+                event_id: None,
             };
             match replica.append(&request)? {
                 Routed::Served(outcome) => {
@@ -759,6 +760,7 @@ mod tests {
             execution_id: exec.to_string(),
             transaction_id: format!("txn-{exec}"),
             payload: payload.to_string(),
+            event_id: None,
         }
     }
 
