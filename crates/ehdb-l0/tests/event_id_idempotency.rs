@@ -446,3 +446,39 @@ fn the_reporting_variants_distinguish_a_write_from_an_acknowledgement() {
     assert!(wrote_a && !wrote_b && a == b);
     assert_eq!(read_all(&e, "exec-r2").len(), 1);
 }
+
+/// ⭐ GATE 6 — the dedupe counters reach the SNAPSHOT, which is the only thing a
+/// metrics endpoint can read.
+///
+/// A counter the engine keeps internally but that no snapshot exposes is not
+/// observability: in production "the dedupe is working" and "the dedupe never
+/// fires" produce identical scrapes. This is the same absent-is-not-zero shape
+/// this repo keeps finding, so it gets a test rather than a comment.
+///
+/// ⚠ Mutation verified: hard-coding `dedupe_hits: 0` in the snapshot fails here.
+#[test]
+fn the_dedupe_counters_are_visible_in_the_snapshot() {
+    let tmp = scratch("snap");
+    let mut e = engine(&tmp);
+
+    assert_eq!(e.metrics().snapshot().dedupe_hits, 0, "starts at zero");
+
+    e.append_writer_assigned(ev("exec-s", "evt-s", "p"))
+        .unwrap();
+    e.append_writer_assigned(ev("exec-s", "evt-s", "p"))
+        .unwrap();
+    e.append_writer_assigned(ev("exec-s", "evt-s", "p"))
+        .unwrap();
+
+    assert_eq!(
+        e.metrics().snapshot().dedupe_hits,
+        2,
+        "two redeliveries must be readable from the snapshot, not just from the \
+         engine's private counter"
+    );
+    assert_eq!(
+        e.metrics().snapshot().dedupe_window_evictions,
+        0,
+        "a window this size forgets nothing"
+    );
+}

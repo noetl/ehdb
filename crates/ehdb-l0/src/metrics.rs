@@ -278,6 +278,8 @@ impl L0Metrics {
     pub fn snapshot(&self) -> L0MetricsSnapshot {
         L0MetricsSnapshot {
             appends: self.appends.load(Ordering::Relaxed),
+            dedupe_hits: self.dedupe_hits.load(Ordering::Relaxed),
+            dedupe_window_evictions: self.dedupe_window_evictions.load(Ordering::Relaxed),
             out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
             manifest_versions_pruned: self.manifest_versions_pruned.load(Ordering::Relaxed),
             manifest_versions_retained: self.manifest_versions_retained.load(Ordering::Relaxed),
@@ -309,6 +311,15 @@ impl L0Metrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L0MetricsSnapshot {
     pub appends: u64,
+    /// Appends answered from the idempotency window (noetl/ai-meta#313).
+    ///
+    /// ⚠ On the snapshot because a counter the engine keeps but nothing can read
+    /// is not observability. Without this the dedupe is invisible in production:
+    /// "working" and "never firing" produce identical scrapes.
+    pub dedupe_hits: u64,
+    /// Keys the idempotency window has forgotten at capacity (noetl/ai-meta#313).
+    /// Non-zero means the window is undersized for the redelivery pattern.
+    pub dedupe_window_evictions: u64,
     pub out_of_order_appends: u64,
     pub manifest_versions_pruned: u64,
     pub manifest_versions_retained: u64,
