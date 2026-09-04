@@ -418,6 +418,46 @@ where
     /// Followers are woken **once**, at the batch tip — a [`watch`] signal
     /// carries the latest value, and a woken follower drains its feed to the tip
     /// before parking again, so one wake per batch delivers every record in it.
+    /// [`append_batch`](Self::append_batch), reporting per record whether it was
+    /// actually written.
+    ///
+    /// `(sort_key, appended)` per record, in request order. `appended == false`
+    /// is a deduplicated redelivery: the position is the existing record's.
+    ///
+    /// ⚠ The `fsync` still covers the batch, and it is still taken **before** any
+    /// ack — a deduplicated record needs no new durability because the record it
+    /// refers to was made durable by the append that first wrote it.
+    ///
+    /// ⚠ A batch of nothing but duplicates produces no handles, so `commit`
+    /// fsyncs nothing. That is correct rather than a skipped step: there are no
+    /// new bytes to flush.
+    pub fn append_batch_reporting(&self, records: Vec<D::Record>) -> io::Result<Vec<(u64, bool)>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_open()?;
+        let (seqs, handles) = {
+            let mut engine = self.engine.lock().unwrap();
+            self.ensure_open()?;
+            let mut seqs = Vec::with_capacity(records.len());
+            for record in records {
+                seqs.push(
+                    engine
+                        .append_writer_assigned_reporting(record)
+                        .map_err(io_err)?,
+                );
+            }
+            (seqs, engine.take_sync_handles().map_err(io_err)?)
+        };
+        commit(&handles)?;
+        // Advertise the tip from the newest record that was actually written; a
+        // duplicate must not move the tip backwards.
+        if let Some(tip) = seqs.iter().filter(|(_, w)| *w).map(|(s, _)| *s).max() {
+            let _ = self.tip_tx.send(tip);
+        }
+        Ok(seqs)
+    }
+
     pub fn append_batch(&self, records: Vec<D::Record>) -> io::Result<Vec<u64>> {
         if records.is_empty() {
             return Ok(Vec::new());

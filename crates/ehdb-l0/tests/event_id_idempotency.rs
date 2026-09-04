@@ -397,3 +397,52 @@ impl TapSeq for EventRecord {
         self
     }
 }
+
+/// ⭐ GATE 5 — the dedupe verdict is REPORTED, not just applied.
+///
+/// The plain `append_*` return cannot distinguish "written at N" from
+/// "already present at N", and the difference is load-bearing upstream: the
+/// tier-append reply is checked for **strictly increasing** sequences and for
+/// `log_record_count == global_sequence`. A deduplicated redelivery returns an
+/// OLDER position and does not advance the count, so a caller that cannot tell
+/// them apart reports a parity **divergence** for a dedupe that worked.
+///
+/// ⚠ Mutation verified: making `append_record_reporting` return `true`
+/// unconditionally fails this on the second assertion — which is exactly the
+/// false-divergence bug it exists to prevent.
+#[test]
+fn the_reporting_variants_distinguish_a_write_from_an_acknowledgement() {
+    let tmp = scratch("report");
+    let mut e = engine(&tmp);
+
+    let (first, wrote_first) = e
+        .append_writer_assigned_reporting(ev("exec-r", "evt-r", "body"))
+        .unwrap();
+    assert!(
+        wrote_first,
+        "a genuinely new record must report appended=true"
+    );
+
+    let (second, wrote_second) = e
+        .append_writer_assigned_reporting(ev("exec-r", "evt-r", "body"))
+        .unwrap();
+    assert_eq!(
+        second, first,
+        "the acknowledgement carries the existing position"
+    );
+    assert!(
+        !wrote_second,
+        "a redelivery must report appended=FALSE. Reporting true is what makes a \
+         working dedupe look like a parity divergence upstream"
+    );
+
+    // And the caller-supplied path reports the same way.
+    let (a, wrote_a) = e
+        .append_record_reporting(ev("exec-r2", "evt-r2", "b").tap_seq(500))
+        .unwrap();
+    let (b, wrote_b) = e
+        .append_record_reporting(ev("exec-r2", "evt-r2", "b").tap_seq(500))
+        .unwrap();
+    assert!(wrote_a && !wrote_b && a == b);
+    assert_eq!(read_all(&e, "exec-r2").len(), 1);
+}
