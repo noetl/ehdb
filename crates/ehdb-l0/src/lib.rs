@@ -142,6 +142,7 @@ pub mod dataset;
 pub mod dedupe;
 pub mod engine;
 pub mod failure_domain;
+pub mod fault;
 pub mod feed;
 pub mod frame;
 pub mod kv;
