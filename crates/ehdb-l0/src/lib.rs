@@ -144,6 +144,7 @@ pub mod engine;
 pub mod failure_domain;
 pub mod fault;
 pub mod feed;
+pub mod format_version;
 pub mod frame;
 pub mod kv;
 pub mod merge;

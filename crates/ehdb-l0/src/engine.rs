@@ -314,6 +314,17 @@ impl<D: Dataset> L0Engine<D> {
                 "L0 engine needs at least one replica target".into(),
             ));
         }
+        // noetl/ai-meta#332 — the on-disk format gate, BEFORE anything is read
+        // or written.  Every `open*` funnels here, so this is the one place it
+        // can be enforced.
+        //
+        // ⚠ Checked on EVERY replica, not just the first: each is an independent
+        // substrate with its own layout, and a replica written by a different
+        // build is exactly the case a single-replica check would wave through.
+        for replica in &replicas {
+            crate::format_version::verify_or_initialise(replica.substrate.as_ref())
+                .map_err(|err| EhdbError::Storage(format!("replica {}: {err}", replica.id)))?;
+        }
         // The dataset id is authoritative from the type — keep the config in sync
         // so a generic dataset's substrate keys / manifest keys are correct.
         config.dataset = D::NAME.to_string();
