@@ -158,3 +158,162 @@ impl ProjectionStore {
         &self.engine
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::substrate::LocalFsSubstrate;
+    use std::sync::Arc;
+
+    fn store(dir: &std::path::Path) -> ProjectionStore {
+        let sub: Arc<dyn DurableSubstrate> =
+            Arc::new(LocalFsSubstrate::new(dir.join("substrate")).unwrap());
+        ProjectionStore::open(ProjectionStore::config(dir.join("local")), sub).unwrap()
+    }
+
+    /// The basic contract the embedded design assumes: append snapshots, read
+    /// back the LATEST per execution.
+    #[test]
+    fn append_then_read_returns_the_latest_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store(tmp.path());
+        s.record_state("exec-a", "running", "{}").unwrap();
+        s.record_state("exec-a", "completed", "{\"n\":2}").unwrap();
+        s.record_state("exec-b", "running", "{}").unwrap();
+
+        let a = s.get_state("exec-a").unwrap().expect("exec-a must exist");
+        assert_eq!(
+            a.status, "completed",
+            "the fold must return the LATEST snapshot"
+        );
+        // ⚠ proj_seq is assigned by the ENGINE from a GLOBAL sequence, not per
+        // execution — so it is 2 here only because exec-a wrote the first two.
+        assert_eq!(a.proj_seq, 2);
+        let b = s.get_state("exec-b").unwrap().expect("exec-b must exist");
+        assert_eq!(b.status, "running");
+        assert_eq!(s.get_state("exec-missing").unwrap(), None);
+    }
+
+    /// Enumeration — the fan-out surface.
+    #[test]
+    fn list_executions_enumerates_distinct_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store(tmp.path());
+        for i in 1..=3u64 {
+            s.record_state(&format!("exec-{i}"), "running", "{}")
+                .unwrap();
+        }
+        s.record_state("exec-1", "completed", "{}").unwrap();
+        let mut ids = s.list_executions().unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["exec-1", "exec-2", "exec-3"],
+            "distinct ids, not snapshots"
+        );
+    }
+
+    /// ⚠⚠ THE ONE THE RFC RESTS ON: recovery = reopen from durable state and see
+    /// what was there. If this does not hold, "restore snapshot + replay tail" has
+    /// no foundation and the embedded design needs a different story.
+    #[test]
+    fn state_survives_a_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = store(tmp.path());
+            s.record_state("exec-a", "running", "{}").unwrap();
+            s.record_state("exec-a", "completed", "{\"done\":true}")
+                .unwrap();
+            s.flush_and_wait().unwrap();
+        } // dropped — simulating a restart
+
+        let s2 = store(tmp.path());
+        let a = s2
+            .get_state("exec-a")
+            .unwrap()
+            .expect("state must survive a restart — this is the recovery premise");
+        assert_eq!(a.status, "completed");
+        // ⚠ proj_seq is assigned by the ENGINE from a GLOBAL sequence, not per
+        // execution — so it is 2 here only because exec-a wrote the first two.
+        assert_eq!(a.proj_seq, 2);
+    }
+
+    /// `cold_load` is the RFC's "restore" primitive. Does it actually restore?
+    #[test]
+    fn cold_load_recovers_state_without_a_prior_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = store(tmp.path());
+            s.record_state("exec-c", "completed", "{}").unwrap();
+            s.flush_and_wait().unwrap();
+        }
+        let sub: Arc<dyn DurableSubstrate> =
+            Arc::new(LocalFsSubstrate::new(tmp.path().join("substrate")).unwrap());
+        let cold =
+            ProjectionStore::cold_load(ProjectionStore::config(tmp.path().join("local2")), sub)
+                .unwrap();
+        let c = cold
+            .get_state("exec-c")
+            .unwrap()
+            .expect("cold_load must see durable state written by another process");
+        // Engine-assigned: the first record in a fresh store is seq 1.
+        assert_eq!(c.proj_seq, 1);
+    }
+
+    /// ⚠⚠ THE CURSOR RECONCILIATION (noetl/ai-meta#332 step 2/3).
+    ///
+    /// `ProjectionStore` has **no** `checkpoint()`. The durable
+    /// `ProjectionCheckpoint` lives on the OTHER lineage
+    /// (`ehdb-reference::ProjectionDriver`), and it is derived by replaying the
+    /// whole log.
+    ///
+    /// What `ehdb-l0` has instead is the engine's own `global_sequence()`. This
+    /// pins whether it can serve as the cursor — i.e. whether it is monotonic
+    /// AND survives a restart. If it does, a stored cursor is a small addition;
+    /// if it does not, step 3 needs a different foundation.
+    #[test]
+    fn the_engine_sequence_is_monotonic_and_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let last = {
+            let mut s = store(tmp.path());
+            let a = s.record_state("exec-a", "running", "{}").unwrap();
+            let b = s.record_state("exec-b", "running", "{}").unwrap();
+            assert!(
+                b > a,
+                "proj_seq must be monotonic across executions: {a} then {b}"
+            );
+            s.flush_and_wait().unwrap();
+            s.engine().global_sequence()
+        };
+        assert!(
+            last >= 2,
+            "expected at least 2 records, engine reports {last}"
+        );
+
+        let s2 = store(tmp.path());
+        assert_eq!(
+            s2.engine().global_sequence(),
+            last,
+            "the engine sequence must survive a restart to serve as a resume cursor"
+        );
+        // And the next append continues rather than restarting at 1.
+        let mut s2 = s2;
+        let next = s2.record_state("exec-c", "running", "{}").unwrap();
+        assert!(
+            next > last,
+            "a restarted engine must not reissue sequences: {last} then {next}"
+        );
+    }
+
+    /// The manifest snapshot is storage bookkeeping, not the read model. Pinned
+    /// because the RFC initially conflated the two.
+    #[test]
+    fn the_manifest_snapshot_is_storage_layout_not_read_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store(tmp.path());
+        s.record_state("exec-a", "running", "{}").unwrap();
+        s.flush_and_wait().unwrap();
+        let m = s.engine().manifest_snapshot();
+        assert_eq!(m.dataset, DATASET_D3_PROJECTION);
+    }
+}
