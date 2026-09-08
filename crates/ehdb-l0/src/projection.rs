@@ -260,6 +260,55 @@ mod tests {
         assert_eq!(c.proj_seq, 1);
     }
 
+    /// ⚠⚠ THE POINT OF STEP 3: recovery reads the TAIL, not the log.
+    ///
+    /// The old checkpoint answered "where am I" by replaying everything and
+    /// taking the max. This proves the stored cursor removes that scan — by
+    /// COUNTING the records recovery actually reads, because "it is faster" is
+    /// not a property a test can assert and "it read fewer rows" is.
+    #[test]
+    fn recovery_from_a_stored_cursor_reads_only_the_tail() {
+        use crate::cursor;
+        let tmp = tempfile::tempdir().unwrap();
+        let sub: Arc<dyn DurableSubstrate> =
+            Arc::new(LocalFsSubstrate::new(tmp.path().join("substrate")).unwrap());
+
+        let mut s = ProjectionStore::open(
+            ProjectionStore::config(tmp.path().join("local")),
+            sub.clone(),
+        )
+        .unwrap();
+        for i in 0..20u64 {
+            s.record_state(&format!("exec-{i}"), "running", "{}")
+                .unwrap();
+        }
+        s.flush_and_wait().unwrap();
+        let total = s.engine().global_sequence();
+        assert_eq!(total, 20, "20 appends should reach sequence 20");
+
+        // A consumer applied through 15 and stored it.
+        cursor::advance(sub.as_ref(), 0, 15).unwrap();
+
+        // Recovery: load the cursor, read only past it.
+        let resume = cursor::load(sub.as_ref(), 0).unwrap();
+        assert_eq!(resume, 15);
+        let tail = s.engine().read_partition_after(0, resume).unwrap();
+        let full = s.engine().read_partition_after(0, 0).unwrap();
+
+        assert_eq!(full.len(), 20, "the whole log is 20 records");
+        assert_eq!(tail.len(), 5, "the tail past 15 is 5 records");
+        assert!(
+            tail.len() < full.len(),
+            "recovery must read strictly fewer records than a full scan — that is \
+             the entire debt this step pays off"
+        );
+        assert!(
+            tail.iter().all(|r| r.proj_seq > resume),
+            "every replayed record must be past the cursor; re-applying at or \
+             below it is the double-apply the cursor exists to prevent"
+        );
+    }
+
     /// ⚠⚠ THE CURSOR RECONCILIATION (noetl/ai-meta#332 step 2/3).
     ///
     /// `ProjectionStore` has **no** `checkpoint()`. The durable

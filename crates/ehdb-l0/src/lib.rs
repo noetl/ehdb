@@ -138,6 +138,7 @@ pub mod bloom;
 pub mod catalog;
 pub mod columnar;
 pub mod command_queue;
+pub mod cursor;
 pub mod dataset;
 pub mod dedupe;
 pub mod engine;
