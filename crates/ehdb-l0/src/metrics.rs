@@ -93,6 +93,13 @@ pub struct L0Metrics {
     /// [`append_record`]: crate::engine::L0Engine::append_record
     /// [`append_writer_assigned`]: crate::engine::L0Engine::append_writer_assigned
     pub out_of_order_appends: AtomicU64,
+    /// Failure-domain violations found in the replica set at open (#332 F5).
+    ///
+    /// ⚠ **Set unconditionally at every 2+-replica open, including to 0**, so a
+    /// healthy set reads `0` rather than being absent. An absent series and a
+    /// zero are different readings, and the absent one is indistinguishable from
+    /// a build that cannot report at all.
+    pub replica_domain_violations: AtomicU64,
     /// Versioned manifest snapshots deleted by the retention policy
     /// (noetl/ehdb#344).  Every manifest write emits a *full* snapshot under
     /// `manifest/<dataset>/manifest-v<version>.json`; nothing ever read them, and
@@ -210,6 +217,11 @@ impl L0Metrics {
     pub(crate) fn set_dedupe_window_evictions(&self, n: u64) {
         self.dedupe_window_evictions.store(n, Ordering::Relaxed);
     }
+    /// Record the replica-set domain-violation count observed at open.
+    pub fn set_replica_domain_violations(&self, n: u64) {
+        self.replica_domain_violations.store(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn incr_out_of_order_appends(&self) {
         self.out_of_order_appends.fetch_add(1, Ordering::Relaxed);
     }
@@ -281,6 +293,7 @@ impl L0Metrics {
             dedupe_hits: self.dedupe_hits.load(Ordering::Relaxed),
             dedupe_window_evictions: self.dedupe_window_evictions.load(Ordering::Relaxed),
             out_of_order_appends: self.out_of_order_appends.load(Ordering::Relaxed),
+            replica_domain_violations: self.replica_domain_violations.load(Ordering::Relaxed),
             manifest_versions_pruned: self.manifest_versions_pruned.load(Ordering::Relaxed),
             manifest_versions_retained: self.manifest_versions_retained.load(Ordering::Relaxed),
             ingest_append_failed: self.ingest_append_failed.load(Ordering::Relaxed),
@@ -321,6 +334,8 @@ pub struct L0MetricsSnapshot {
     /// Non-zero means the window is undersized for the redelivery pattern.
     pub dedupe_window_evictions: u64,
     pub out_of_order_appends: u64,
+    /// Failure-domain violations in the replica set at open (#332 F5).
+    pub replica_domain_violations: u64,
     pub manifest_versions_pruned: u64,
     pub manifest_versions_retained: u64,
     pub ingest_append_failed: u64,

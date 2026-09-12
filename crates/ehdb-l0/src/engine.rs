@@ -99,6 +99,16 @@ pub struct L0Config {
     /// Keys remembered per shard for append-time idempotency (noetl/ai-meta#313).
     /// `0` disables dedupe entirely.
     pub dedupe_capacity: usize,
+    /// **Refuse a replica set that does not spread failure domains** (#332 F5).
+    ///
+    /// `false` — the default — is today's behaviour: violations are *counted and
+    /// logged* but the open succeeds. Shadow first, enforce deliberately, the
+    /// same shape `seal_max_age` and the fencing work use.
+    ///
+    /// ⚠ Only consulted for a set of **two or more** replicas. A single replica
+    /// makes no spreading claim, so there is nothing to falsify; enforcing there
+    /// would only reject substrates that decline to declare a domain.
+    pub require_distinct_domains: bool,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
     /// How many versioned manifest snapshots to keep besides `LATEST`
@@ -120,6 +130,7 @@ impl L0Config {
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             seal_max_age: None,
+            require_distinct_domains: false,
             flush: FlushPolicy::EveryAppend,
             dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
@@ -185,6 +196,12 @@ impl L0Config {
     /// the size/count-only default.
     pub fn with_seal_max_age(mut self, seal_max_age: Option<Duration>) -> Self {
         self.seal_max_age = seal_max_age;
+        self
+    }
+
+    /// Enforce failure-domain spread across the replica set (#332 F5).
+    pub fn with_require_distinct_domains(mut self, require: bool) -> Self {
+        self.require_distinct_domains = require;
         self
     }
 
@@ -324,6 +341,57 @@ impl<D: Dataset> L0Engine<D> {
         for replica in &replicas {
             crate::format_version::verify_or_initialise(replica.substrate.as_ref())
                 .map_err(|err| EhdbError::Storage(format!("replica {}: {err}", replica.id)))?;
+        }
+        // noetl/ehdb#332 F5 — the failure-domain check, wired.
+        //
+        // ⚠ This guard existed and had NO production caller: `validate_replica_domains`
+        // was referenced only from its own tests, so a replica set that shared one
+        // disk was refused by nothing. An RF of N over one domain is an RF of 1
+        // wearing a larger number, and until this call site existed the larger
+        // number is all anyone could see.
+        //
+        // Only for a set of 2+: one replica makes no spreading claim.
+        if replicas.len() >= 2 {
+            let domains: Vec<crate::failure_domain::ReplicaDomain> = replicas
+                .iter()
+                .map(|r| {
+                    let domain = r.substrate.failure_domain();
+                    // The nesting check needs the path; only LocalDevice carries
+                    // one. A Remote replica has no local root and cannot nest.
+                    let root = match &domain {
+                        crate::failure_domain::FailureDomain::LocalDevice { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    };
+                    crate::failure_domain::ReplicaDomain {
+                        replica: r.id.clone(),
+                        domain,
+                        root,
+                    }
+                })
+                .collect();
+            let violations = crate::failure_domain::check_replica_domains(&domains);
+            if !violations.is_empty() {
+                metrics.set_replica_domain_violations(violations.len() as u64);
+                if config.require_distinct_domains {
+                    let joined = violations
+                        .iter()
+                        .map(|v| v.message())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(EhdbError::InvalidState(format!(
+                        "replica set does not spread failure domains: {joined}"
+                    )));
+                }
+                // Shadow: observable, not fatal. ⚠ The signal is the COUNTER,
+                // not a log line — this crate takes no `tracing` dependency and
+                // adding one for a warning is a dependency decision, not a
+                // detail. The counter is pinned at 0 below on the healthy path
+                // so absence and zero stay distinguishable.
+            } else {
+                metrics.set_replica_domain_violations(0);
+            }
         }
         // The dataset id is authoritative from the type — keep the config in sync
         // so a generic dataset's substrate keys / manifest keys are correct.
