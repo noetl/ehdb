@@ -506,8 +506,7 @@ impl LocalJsonlTransactionLog {
                         }
                         let mut has_more = false;
                         for rest in lines.by_ref() {
-                            let rest =
-                                rest.map_err(|e| EhdbError::Storage(e.to_string()))?;
+                            let rest = rest.map_err(|e| EhdbError::Storage(e.to_string()))?;
                             if !rest.trim().is_empty() {
                                 has_more = true;
                                 break;
@@ -744,7 +743,8 @@ mod torn_record_tests {
         append_n(&p, 3);
         // Simulate the crash: a partial JSON object, no trailing newline.
         let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten").unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
         drop(f);
 
         let log = LocalJsonlTransactionLog::open(p).expect("a torn TAIL must not fail the open");
@@ -769,7 +769,10 @@ mod torn_record_tests {
         let mut lines: Vec<&str> = existing.lines().collect();
         assert!(lines.len() >= 2, "fixture needs at least two records");
         // Corrupt the FIRST record, leaving a well-formed one after it.
-        let corrupted = format!("{{\"transaction_id\":\"tx-broken\",\"ten\n{}\n", lines.pop().unwrap());
+        let corrupted = format!(
+            "{{\"transaction_id\":\"tx-broken\",\"ten\n{}\n",
+            lines.pop().unwrap()
+        );
         fs::write(&p, corrupted).unwrap();
 
         let err = LocalJsonlTransactionLog::open(p)
@@ -798,7 +801,8 @@ mod torn_record_tests {
         append_n(&p, 2);
         let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
         // Complete JSON, terminated, with a field the record type refuses.
-        f.write_all(b"{\"not_a_transaction_record\": true}\n").unwrap();
+        f.write_all(b"{\"not_a_transaction_record\": true}\n")
+            .unwrap();
         drop(f);
         assert!(
             LocalJsonlTransactionLog::open(p).is_err(),
@@ -825,7 +829,8 @@ mod torn_record_tests {
         let p = tmp("blanks");
         append_n(&p, 2);
         let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten\n\n\n").unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten\n\n\n")
+            .unwrap();
         drop(f);
         let log = LocalJsonlTransactionLog::open(p)
             .expect("blank lines after a torn tail must not turn it into a middle");

@@ -1195,14 +1195,12 @@ mod torn_tail_on_the_wire {
         // The crash: a partial record with no trailing newline, exactly what
         // `to_writer` leaves when `write_all(b"\n")` never runs.
         let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten").unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
         drop(f);
 
-        let fresh = LocalReferenceEventLogDriver::new(
-            log,
-            "tenant-a".to_string(),
-            "system".to_string(),
-        );
+        let fresh =
+            LocalReferenceEventLogDriver::new(log, "tenant-a".to_string(), "system".to_string());
         let out = fresh
             .read_execution(&EventLogReadExecutionRequest {
                 execution_id: "e1".to_string(),
