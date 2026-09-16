@@ -712,8 +712,8 @@ mod torn_record_tests {
         d.join("log.jsonl")
     }
 
-    fn append_n(path: &PathBuf, n: usize) {
-        let mut log = LocalJsonlTransactionLog::open(path.clone()).unwrap();
+    fn append_n(path: &Path, n: usize) {
+        let mut log = LocalJsonlTransactionLog::open(path.to_path_buf()).unwrap();
         for i in 0..n {
             let tx = super::tests::stream_transaction(
                 &format!("tx-{i}"),
