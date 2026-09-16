@@ -435,6 +435,14 @@ fn validate_placement(placement: &ehdb_storage::ObjectPlacement) -> Result<()> {
 pub struct LocalJsonlTransactionLog {
     path: PathBuf,
     inner: InMemoryTransactionLog,
+    /// Torn **tail** records skipped when this log was opened (noetl/ehdb#262).
+    ///
+    /// ⚠ Surfaced, not merely logged. A scan that returns 811 of 812 records
+    /// reads exactly like a complete one unless the skip is visible from
+    /// outside the process, and a skip that is not in the reply is strictly
+    /// worse than failing — it turns a loud corruption signal into a quiet
+    /// wrong answer. Callers must propagate this.
+    torn_tail_skipped: usize,
 }
 
 impl LocalJsonlTransactionLog {
@@ -442,20 +450,95 @@ impl LocalJsonlTransactionLog {
         let path = path.into();
         let mut inner = InMemoryTransactionLog::default();
 
+        let mut torn_tail_skipped = 0usize;
+
         if path.exists() {
             let file = File::open(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-            for (index, line) in BufReader::new(file).lines().enumerate() {
+            let mut lines = BufReader::new(file).lines();
+            let mut index = 0usize;
+            while let Some(line) = lines.next() {
+                index += 1;
                 let line = line.map_err(|err| EhdbError::Storage(err.to_string()))?;
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record: TransactionRecord = serde_json::from_str(&line)
-                    .map_err(|err| map_transaction_log_decode_error(index + 1, err))?;
+                let record: TransactionRecord = match serde_json::from_str(&line) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        // noetl/ehdb#262 — a torn record is skipped ONLY when it is
+                        // the tail, and never silently.
+                        //
+                        // The asymmetry is derived from the append protocol, not
+                        // chosen by taste. `append_record_to_disk` is
+                        // `to_writer` -> `write_all(b"\n")` -> `sync_data()`, so a
+                        // crash between the JSON and the newline leaves a partial
+                        // FINAL line whose `sync_data` never completed. No writer
+                        // was ever told that record was durable, and the mirror's
+                        // retrying drain re-delivers it. Skipping it loses nothing
+                        // that was promised.
+                        //
+                        // A torn record with well-formed records AFTER it is the
+                        // opposite case: that record WAS acknowledged and is now
+                        // unreadable. Serving the log without it would be serving
+                        // an edited history, so it still fails the whole open —
+                        // which is the behaviour this function has always had.
+                        //
+                        // ⚠ The previous posture failed on BOTH. On prod
+                        // 2026-08-12 one torn record at line 45 of 46 made every
+                        // execution unreadable and the comparator answered
+                        // `ehdb_unavailable` for all 12 in the batch, 11 of which
+                        // were perfectly intact.
+                        // ⚠ ONLY a TRUNCATED record may be skipped, and only at
+                        // the tail. A line that is complete JSON but fails
+                        // validation — an unknown field, an invalid identifier —
+                        // is not an interrupted append: it is a well-formed record
+                        // with bad content, which means corruption or a version
+                        // skew. Skipping that would discard a record someone
+                        // successfully wrote.
+                        //
+                        // Found by the existing suite: five tests
+                        // (`..._rejects_invalid_record_identifiers_on_open` and
+                        // friends) failed when this checked only "is it the tail",
+                        // because their fixtures are single complete-but-invalid
+                        // records. They were right and the rule was too broad.
+                        if !err.is_eof() {
+                            return Err(map_transaction_log_decode_error(index, err));
+                        }
+                        let mut has_more = false;
+                        for rest in lines.by_ref() {
+                            let rest = rest.map_err(|e| EhdbError::Storage(e.to_string()))?;
+                            if !rest.trim().is_empty() {
+                                has_more = true;
+                                break;
+                            }
+                        }
+                        if has_more {
+                            return Err(map_transaction_log_decode_error(index, err));
+                        }
+                        // Counted on the struct rather than logged here: this
+                        // crate has no tracing dependency, and a low-level store
+                        // acquiring one to emit a single line is worse layering
+                        // than handing the fact to the caller that already has a
+                        // logger and a reply to put it in.
+                        torn_tail_skipped += 1;
+                        break;
+                    }
+                };
                 inner.insert_record(record)?;
             }
         }
 
-        Ok(Self { path, inner })
+        Ok(Self {
+            path,
+            inner,
+            torn_tail_skipped,
+        })
+    }
+
+    /// Torn tail records skipped at open — see [`Self::torn_tail_skipped`].
+    /// `0` on a clean log, which is the overwhelmingly common case.
+    pub fn torn_tail_skipped(&self) -> usize {
+        self.torn_tail_skipped
     }
 
     pub fn append(&mut self, request: CommitTransaction) -> Result<TransactionRecord> {
@@ -612,6 +695,150 @@ fn map_transaction_log_decode_error(line: usize, err: serde_json::Error) -> Ehdb
 }
 
 #[cfg(test)]
+mod torn_record_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ehdb-torn-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d.join("log.jsonl")
+    }
+
+    fn append_n(path: &Path, n: usize) {
+        let mut log = LocalJsonlTransactionLog::open(path.to_path_buf()).unwrap();
+        for i in 0..n {
+            let tx = super::tests::stream_transaction(
+                &format!("tx-{i}"),
+                TenantId::new("tenant-a").unwrap(),
+                NamespaceName::new("system").unwrap(),
+                "events",
+                i as u64 + 1,
+            );
+            log.append(tx).unwrap();
+        }
+    }
+
+    /// ⭐ A torn TAIL is skipped, counted, and the rest of the log is readable.
+    ///
+    /// ⚠ THE PROD INCIDENT THIS CLOSES. On 2026-08-12 one torn record at line 45
+    /// of 46 made **every** execution unreadable: the comparator answered
+    /// `ehdb_unavailable` for all 12 executions in the batch, 11 of which were
+    /// perfectly intact.
+    ///
+    /// Skipping is safe here and only here: `append_record_to_disk` is
+    /// `to_writer` -> `write_all(b"\n")` -> `sync_data()`, so a partial FINAL
+    /// line is one whose `sync_data` never completed. Nothing was ever told it
+    /// was durable.
+    #[test]
+    fn a_torn_tail_is_skipped_counted_and_the_rest_still_reads() {
+        let p = tmp("tail");
+        append_n(&p, 3);
+        // Simulate the crash: a partial JSON object, no trailing newline.
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
+        drop(f);
+
+        let log = LocalJsonlTransactionLog::open(p).expect("a torn TAIL must not fail the open");
+        assert_eq!(
+            log.torn_tail_skipped(),
+            1,
+            "the skip must be COUNTED — a scan that silently returns n-1 records \
+             reads exactly like a complete one"
+        );
+    }
+
+    /// A torn record with well-formed records AFTER it still fails the open.
+    ///
+    /// That record WAS acknowledged and is now unreadable, so serving the log
+    /// without it would be serving an edited history. This is the half of the
+    /// old posture that was right.
+    #[test]
+    fn a_torn_middle_still_fails_the_whole_open() {
+        let p = tmp("middle");
+        append_n(&p, 2);
+        let existing = fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<&str> = existing.lines().collect();
+        assert!(lines.len() >= 2, "fixture needs at least two records");
+        // Corrupt the FIRST record, leaving a well-formed one after it.
+        let corrupted = format!(
+            "{{\"transaction_id\":\"tx-broken\",\"ten\n{}\n",
+            lines.pop().unwrap()
+        );
+        fs::write(&p, corrupted).unwrap();
+
+        let err = LocalJsonlTransactionLog::open(p)
+            .expect_err("a torn record with records after it must still fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("invalid transaction log record"),
+            "the failure must name the torn record: {msg}"
+        );
+    }
+
+    /// ⭐ A COMPLETE record that fails validation is never skipped — not even
+    /// at the tail.
+    ///
+    /// ⚠ This is the narrowing the existing suite forced. The first cut of this
+    /// change skipped any tail that failed to deserialize, which broke five
+    /// tests whose fixtures are single complete-but-invalid records
+    /// (`..._rejects_invalid_record_identifiers_on_open` and friends). They were
+    /// right: an unknown field or a bad identifier is a well-formed record with
+    /// bad content — corruption or a version skew — not an interrupted append.
+    /// Only a TRUNCATED record (`serde_json::Error::is_eof`) can be the torn
+    /// tail this skip exists for.
+    #[test]
+    fn a_complete_but_invalid_tail_record_still_fails() {
+        let p = tmp("invalid-tail");
+        append_n(&p, 2);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        // Complete JSON, terminated, with a field the record type refuses.
+        f.write_all(b"{\"not_a_transaction_record\": true}\n")
+            .unwrap();
+        drop(f);
+        assert!(
+            LocalJsonlTransactionLog::open(p).is_err(),
+            "a COMPLETE record that fails validation must not be mistaken for a \
+             torn tail — it was written successfully, so discarding it would \
+             drop a record someone wrote"
+        );
+    }
+
+    /// The counter is a measurement, not a constant.
+    #[test]
+    fn a_clean_log_reports_no_skips() {
+        let p = tmp("clean");
+        append_n(&p, 3);
+        let log = LocalJsonlTransactionLog::open(p).unwrap();
+        assert_eq!(log.torn_tail_skipped(), 0);
+    }
+
+    /// Trailing blank lines after a torn record do not make it look like a tail
+    /// with records after it, nor a middle. The "is anything real after this?"
+    /// question is about NON-EMPTY lines.
+    #[test]
+    fn blank_lines_after_a_torn_tail_do_not_change_the_verdict() {
+        let p = tmp("blanks");
+        append_n(&p, 2);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten\n\n\n")
+            .unwrap();
+        drop(f);
+        let log = LocalJsonlTransactionLog::open(p)
+            .expect("blank lines after a torn tail must not turn it into a middle");
+        assert_eq!(log.torn_tail_skipped(), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         fs,
@@ -631,7 +858,7 @@ mod tests {
         )
     }
 
-    fn stream_transaction(
+    pub(super) fn stream_transaction(
         transaction_id: &str,
         tenant: TenantId,
         namespace: NamespaceName,

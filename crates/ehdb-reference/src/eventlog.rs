@@ -187,6 +187,11 @@ pub struct EventLogScanRequest {
     pub limit: usize,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Secret-free result of a global ordered scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +203,19 @@ pub struct EventLogScanOutcome {
     pub record_count: usize,
     pub returned: usize,
     pub records: Vec<EventLogRecordView>,
+    /// Truncated **tail** records skipped when the underlying log was opened
+    /// (noetl/ehdb#262).
+    ///
+    /// ⚠ On the wire so a remote reader can tell "complete" from "complete
+    /// except one torn tail". A scan that returns 811 of 812 records reads
+    /// exactly like a complete one unless the skip is visible from outside the
+    /// process, and a skip that is not in the reply is strictly worse than
+    /// failing — it turns a loud corruption signal into a quiet wrong answer.
+    ///
+    /// Absent from the JSON when zero, which is the overwhelmingly common case,
+    /// so a clean reply is byte-identical to what it was before this existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub torn_tail_skipped: usize,
 }
 
 /// Bounded ordered read scoped to a single execution.
@@ -218,6 +236,19 @@ pub struct EventLogReadExecutionOutcome {
     pub record_count: usize,
     pub returned: usize,
     pub records: Vec<EventLogRecordView>,
+    /// Truncated **tail** records skipped when the underlying log was opened
+    /// (noetl/ehdb#262).
+    ///
+    /// ⚠ On the wire so a remote reader can tell "complete" from "complete
+    /// except one torn tail". A scan that returns 811 of 812 records reads
+    /// exactly like a complete one unless the skip is visible from outside the
+    /// process, and a skip that is not in the reply is strictly worse than
+    /// failing — it turns a loud corruption signal into a quiet wrong answer.
+    ///
+    /// Absent from the JSON when zero, which is the overwhelmingly common case,
+    /// so a clean reply is byte-identical to what it was before this existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub torn_tail_skipped: usize,
 }
 
 /// Bounded tail pull for a durable consumer (offset/subscribe).
@@ -525,6 +556,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                         record_count,
                         returned: projected.len(),
                         records: projected,
+                        torn_tail_skipped: runtime.torn_tail_skipped(),
                     })
                 }
                 Err(_) => Ok(EventLogScanOutcome {
@@ -533,6 +565,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                     record_count: 0,
                     returned: 0,
                     records: Vec::new(),
+                    torn_tail_skipped: runtime.torn_tail_skipped(),
                 }),
             }
         })
@@ -570,6 +603,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                         record_count,
                         returned: projected.len(),
                         records: projected,
+                        torn_tail_skipped: runtime.torn_tail_skipped(),
                     })
                 }
                 // A missing stream (no event ever appended) is an absent probe, not
@@ -581,6 +615,7 @@ impl EventLogDriver for LocalReferenceEventLogDriver {
                     record_count: 0,
                     returned: 0,
                     records: Vec::new(),
+                    torn_tail_skipped: runtime.torn_tail_skipped(),
                 }),
             }
         })
@@ -1067,6 +1102,141 @@ pub fn exercise_primary_serve(
         dual_run_holds,
         divergence,
     })
+}
+
+#[cfg(test)]
+mod torn_tail_on_the_wire {
+    use super::*;
+
+    /// ⭐ THE POINT OF noetl/ehdb#262: the skip must be visible from OUTSIDE the
+    /// process.
+    ///
+    /// A scan that returns 811 of 812 records reads exactly like a complete one
+    /// unless the skip is in the reply. The issue is explicit that a skip which
+    /// is not surfaced is **strictly worse than failing** — it turns a loud
+    /// corruption signal into a quiet wrong answer. Counting it on the struct
+    /// inside the process is not enough; a remote reader is the one who needs to
+    /// know.
+    #[test]
+    fn a_skipped_torn_tail_reaches_the_json_reply() {
+        let out = EventLogReadExecutionOutcome {
+            action: "eventlog-read-exec".to_string(),
+            execution_id: "e1".to_string(),
+            exists: true,
+            record_count: 811,
+            returned: 811,
+            records: Vec::new(),
+            torn_tail_skipped: 1,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v.get("torn_tail_skipped").and_then(|x| x.as_u64()),
+            Some(1),
+            "the skip must be on the wire, not only on the struct: {v}"
+        );
+    }
+
+    /// …and a clean reply is byte-identical to what it was before the field
+    /// existed, so this cannot quietly change every healthy response.
+    #[test]
+    fn a_clean_reply_does_not_carry_the_field_at_all() {
+        let out = EventLogScanOutcome {
+            action: "eventlog-scan".to_string(),
+            exists: true,
+            record_count: 3,
+            returned: 3,
+            records: Vec::new(),
+            torn_tail_skipped: 0,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("torn_tail_skipped").is_none(),
+            "a clean reply gained a field; every healthy response would change \
+             shape for a number that is always zero: {v}"
+        );
+    }
+
+    /// ⭐ END-TO-END through the real driver: a torn tail on disk must reach the
+    /// outcome the driver returns.
+    ///
+    /// ⚠ This test exists because a negative control found the gap. The two
+    /// tests above construct the outcome struct directly, so they pass happily
+    /// while the DRIVER hard-codes `torn_tail_skipped: 0` — the propagation
+    /// could be deleted and nothing would notice. A test that cannot fail for
+    /// the reason you care about is not coverage.
+    #[test]
+    fn the_driver_propagates_a_real_torn_tail_from_disk() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "ehdb-wire-torn-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+
+        let driver = LocalReferenceEventLogDriver::new(
+            log.clone(),
+            "tenant-a".to_string(),
+            "system".to_string(),
+        );
+        driver
+            .append(&EventLogAppendRequest {
+                execution_id: "e1".to_string(),
+                transaction_id: "tx-1".to_string(),
+                payload: "{\"event_id\":\"1\"}".to_string(),
+                event_id: Some("1".to_string()),
+            })
+            .expect("seed append");
+
+        // The crash: a partial record with no trailing newline, exactly what
+        // `to_writer` leaves when `write_all(b"\n")` never runs.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
+        drop(f);
+
+        let fresh =
+            LocalReferenceEventLogDriver::new(log, "tenant-a".to_string(), "system".to_string());
+        let out = fresh
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "e1".to_string(),
+                after: None,
+                limit: 100,
+            })
+            .expect("a torn TAIL must not fail the read");
+        assert_eq!(
+            out.torn_tail_skipped, 1,
+            "the driver dropped the torn-tail count on its way to the outcome — \
+             a remote reader would see a complete-looking reply"
+        );
+        assert!(
+            out.returned >= 1,
+            "the intact record must still be returned: {out:?}"
+        );
+    }
+
+    /// An older reply — one with no `torn_tail_skipped` — still deserialises.
+    ///
+    /// Both outcome types are `deny_unknown_fields`, so this direction is the
+    /// one that matters during a rolling upgrade: a new reader must accept an
+    /// old writer's JSON.
+    #[test]
+    fn an_older_reply_without_the_field_still_parses() {
+        let old = serde_json::json!({
+            "action": "eventlog-scan",
+            "exists": true,
+            "record_count": 2,
+            "returned": 2,
+            "records": []
+        });
+        let parsed: EventLogScanOutcome =
+            serde_json::from_value(old).expect("a pre-#262 reply must still parse");
+        assert_eq!(parsed.torn_tail_skipped, 0);
+    }
 }
 
 #[cfg(test)]

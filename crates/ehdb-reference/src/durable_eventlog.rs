@@ -996,6 +996,12 @@ impl DurableSegmentStore {
                 record_count: 0,
                 returned: 0,
                 records: Vec::new(),
+                // 0, and that is a statement rather than a placeholder: this is the
+                // segment store, not the JSONL log, so it has no partial-final-line
+                // case (noetl/ehdb#262). Segment recovery is its own mechanism; if
+                // that ever changes this must report it rather than keep asserting
+                // a clean read.
+                torn_tail_skipped: 0,
             });
         }
         // Never scan below the reclaimed base — those sequences are gone from
@@ -1018,6 +1024,11 @@ impl DurableSegmentStore {
             record_count,
             returned: records.len(),
             records,
+            // 0 — a statement, not a placeholder: this is the segment store,
+            // not the JSONL log, so it has no partial-final-line case
+            // (noetl/ehdb#262). Segment recovery is its own mechanism; if that
+            // changes, this must report it rather than keep asserting a clean read.
+            torn_tail_skipped: 0,
         })
     }
 
@@ -1039,6 +1050,12 @@ impl DurableSegmentStore {
                 record_count: 0,
                 returned: 0,
                 records: Vec::new(),
+                // 0, and that is a statement rather than a placeholder: this is the
+                // segment store, not the JSONL log, so it has no partial-final-line
+                // case (noetl/ehdb#262). Segment recovery is its own mechanism; if
+                // that ever changes this must report it rather than keep asserting
+                // a clean read.
+                torn_tail_skipped: 0,
             });
         }
         let after = request.after.unwrap_or(0);
@@ -1062,6 +1079,11 @@ impl DurableSegmentStore {
             record_count,
             returned: records.len(),
             records,
+            // 0 — a statement, not a placeholder: this is the segment store,
+            // not the JSONL log, so it has no partial-final-line case
+            // (noetl/ehdb#262). Segment recovery is its own mechanism; if that
+            // changes, this must report it rather than keep asserting a clean read.
+            torn_tail_skipped: 0,
         })
     }
 
