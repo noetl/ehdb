@@ -321,6 +321,15 @@ pub fn invalidate_cached_runtime(path: &Path) {
 }
 
 impl LocalReferenceRuntime {
+    /// Truncated tail records the underlying log skipped at open
+    /// (noetl/ehdb#262). `0` on a clean log.
+    ///
+    /// Exposed so a driver can put the number in its reply: the skip is only
+    /// honest if it is visible from outside the process.
+    pub fn torn_tail_skipped(&self) -> usize {
+        self.log.torn_tail_skipped()
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let log = LocalJsonlTransactionLog::open(path)?;
         let mut state = ReferenceDatabase::default();
