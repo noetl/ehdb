@@ -234,7 +234,13 @@ mod tests {
         let at = src
             .find("pub fn open_replicated_with_metrics")
             .expect("chokepoint not found — the extraction broke");
-        let body: String = src[at..].chars().take(2000).collect();
+        // ⚠ Window widened 2000 → 5000 (resilient-core Phase 3). The
+        // chokepoint grew: the failure-domain check now sits between the format
+        // gate and the manifest load, which pushed `load_durable_manifest` out
+        // of the old window and tripped this guard's own "widen it" branch.
+        // Widening the window preserves the property (gate present, and BEFORE
+        // the manifest read); it does not relax it.
+        let body: String = src[at..].chars().take(5000).collect();
         assert!(
             body.contains("verify_or_initialise"),
             "the format gate is not called from the open chokepoint; an engine \

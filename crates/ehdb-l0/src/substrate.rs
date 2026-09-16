@@ -384,6 +384,21 @@ impl<S: DurableSubstrate> DurableSubstrate for CountingSubstrate<S> {
 /// [`DurableSubstrate`] — the engine holds the store as a trait object shared
 /// across threads.
 impl DurableSubstrate for Arc<dyn DurableSubstrate> {
+    /// ⚠ **Forwarding is not optional for a defaulted method.**
+    ///
+    /// This impl silently omitted `failure_domain`, so it fell through to the
+    /// trait default and every `Arc<dyn DurableSubstrate>` reported
+    /// [`FailureDomain::Undeclared`] — whatever the inner substrate declared.
+    /// The engine holds its replicas as exactly that type, so the failure-domain
+    /// mechanism was inert twice over: nothing called it, and the value it would
+    /// have returned was wrong.
+    ///
+    /// It compiled precisely *because* the method has a default. A required
+    /// method left out is a compile error; a defaulted one left out is a plausible
+    /// wrong answer. `the_arc_forwards_every_trait_method` pins the whole set.
+    fn failure_domain(&self) -> crate::failure_domain::FailureDomain {
+        (**self).failure_domain()
+    }
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         (**self).put_if_absent(key, bytes)
     }
