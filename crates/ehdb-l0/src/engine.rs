@@ -109,6 +109,12 @@ pub struct L0Config {
     /// makes no spreading claim, so there is nothing to falsify; enforcing there
     /// would only reject substrates that decline to declare a domain.
     pub require_distinct_domains: bool,
+    /// How much loss the replica set must survive (M4).
+    ///
+    /// [`SurvivalGoal::Zone`] — the default — is exactly today's behaviour:
+    /// `check_region_survival` returns no violations for it, so the region
+    /// check below is a strict no-op unless an operator asks for `Region`.
+    pub survival_goal: crate::failure_domain::SurvivalGoal,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
     /// How many versioned manifest snapshots to keep besides `LATEST`
@@ -131,6 +137,7 @@ impl L0Config {
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             seal_max_age: None,
             require_distinct_domains: false,
+            survival_goal: crate::failure_domain::SurvivalGoal::Zone,
             flush: FlushPolicy::EveryAppend,
             dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
@@ -205,6 +212,13 @@ impl L0Config {
         self
     }
 
+    /// Set the survival goal (M4). `Zone` (default) leaves the region check
+    /// inert; `Region` requires copies in distinct **declared** regions.
+    pub fn with_survival_goal(mut self, goal: crate::failure_domain::SurvivalGoal) -> Self {
+        self.survival_goal = goal;
+        self
+    }
+
     pub fn with_seal_max_bytes(mut self, seal_max_bytes: u64) -> Self {
         self.seal_max_bytes = seal_max_bytes;
         self
@@ -232,15 +246,38 @@ pub struct ReplicaTarget {
     pub id: String,
     /// The replica's durable byte-sink.
     pub substrate: Arc<dyn DurableSubstrate>,
+    /// Where this replica physically lives (M1).
+    ///
+    /// ⭐ **Undeclared by default, and that is the safe direction.** A replica
+    /// that declares nothing is never *assumed* to be in a distinct region —
+    /// `check_region_survival` refuses an undeclared replica under
+    /// [`SurvivalGoal::Region`] rather than counting it as spread. Same posture
+    /// as `FailureDomain::Undeclared`: silence is not independence.
+    ///
+    /// Consulted only by the [`SurvivalGoal::Region`] check, which is a strict
+    /// no-op under the default `Zone` goal — so a caller that never sets this
+    /// gets byte-identical behaviour.
+    pub locality: crate::placement::Locality,
 }
 
 impl ReplicaTarget {
-    /// Construct a replica target.
+    /// Construct a replica target with **undeclared** locality.
+    ///
+    /// The signature is unchanged on purpose: every existing call site keeps
+    /// compiling and keeps its current behaviour. Locality is opt-in through
+    /// [`ReplicaTarget::with_locality`].
     pub fn new(id: impl Into<String>, substrate: Arc<dyn DurableSubstrate>) -> Self {
         Self {
             id: id.into(),
             substrate,
+            locality: crate::placement::Locality::undeclared(),
         }
+    }
+
+    /// Declare where this replica lives (M1).
+    pub fn with_locality(mut self, locality: crate::placement::Locality) -> Self {
+        self.locality = locality;
+        self
     }
 }
 
@@ -371,6 +408,38 @@ impl<D: Dataset> L0Engine<D> {
                     }
                 })
                 .collect();
+            // M4 — the REGION survival check, at the same call site as the
+            // device/zone one.
+            //
+            // Deliberately here rather than inside `check_replica_domains`:
+            // the two ask different questions and `failure_domain`'s module
+            // note is explicit that "the two are combined by the caller, not by
+            // this module". A device-id comparison cannot establish region
+            // spread — two disks in one region are two domains and one region.
+            //
+            // ⭐ Inert by default. `check_region_survival` returns no
+            // violations for `SurvivalGoal::Zone`, so a deployment that has not
+            // asked for `Region` sees byte-identical behaviour and an
+            // undeclared `locality` costs nothing.
+            let placements: Vec<crate::failure_domain::RegionPlacement> = replicas
+                .iter()
+                .map(|r| crate::failure_domain::RegionPlacement {
+                    replica: r.id.clone(),
+                    region: r.locality.region.clone(),
+                })
+                .collect();
+            if let Err(e) =
+                crate::failure_domain::validate_region_survival(&placements, config.survival_goal)
+            {
+                // Enforced, not shadowed, and that asymmetry with the domain
+                // check below is intentional: the domain check defaults to ON
+                // for everyone and so needs a shadow rung, whereas `Region` is
+                // never reached unless an operator explicitly asked for it.
+                // Asking for a survival goal and silently not getting it is the
+                // failure this phase exists to prevent.
+                return Err(e);
+            }
+
             let violations = crate::failure_domain::check_replica_domains(&domains);
             if !violations.is_empty() {
                 metrics.set_replica_domain_violations(violations.len() as u64);
