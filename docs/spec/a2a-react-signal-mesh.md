@@ -36,18 +36,37 @@ exist cannot be checked by its reader.
 | Multi-region primitives | `noetl/ehdb@feat/mr-cluster-a` — `crates/ehdb-core/src/hlc.rs` (188 L), `crates/ehdb-l0/src/membership.rs` (270 L), `placement.rs` (105 L) |
 | D1 event log / D6 vector datasets | `crates/ehdb-l0/src/dataset.rs` (`DATASET_D1_EVENT_LOG`), `src/vector.rs` (`DATASET_D6_VECTOR`) |
 
-### Corrected or unverified
+### ⚠ Corrections — including three of my own
+
+**I got three of these wrong first, and the error is worth stating.** I searched
+`noetl/ehdb` for *paths* named `design/slm-ehdb-context` and
+`docs/multiregion-ehdb-plan`, found nothing, and wrote them up as "does not
+exist". They are **ai-meta branch names**, not paths, and both carry substantial
+specs. Searching one repo for a name that lives in another, then reporting the
+absence as fact, is the same "wrong denominator" failure this programme keeps
+producing — here applied to my own verification.
 
 | Seeded claim | Finding |
 | :-- | :-- |
-| branch `design/slm-ehdb-context` | **Does not exist.** The real branches are `feat/slm-context-s0-frame-invariants` and `feat/slm-context-s1-s2-events-fold`. |
-| `docs/multiregion-ehdb-plan` | **Does not exist.** The multi-region work is code-only on `feat/mr-cluster-a|b`; there is no plan doc in the tree. |
-| A2A "v0.3.0 / v1.0.1 May 2026" | Latest release is **1.0.0**. Version negotiation uses `Major.Minor`; patch is excluded. |
-| Agent Card at `/.well-known/agent.json` | Renamed to **`/.well-known/agent-card.json`** in v0.3 (2025-07-30); registered as an RFC 8615 well-known URI in v1.0. |
-| Task states "submitted/working/completed/failed/canceled" | **Eight** states. The five omit `input-required`, `auth-required` (both *interrupted*, NOT terminal) and `rejected` (terminal). Collapsing interrupted into failed is the most common A2A dispatcher bug. |
-| "gemma3/gemma4" | The pin in the tree is `gemma3:4b`. No `gemma4` anywhere. |
-| SLM crate has "7 payload kinds" | **Correct** — 7 variants. ⚠ Its own module doc says "Six"; the doc is stale by one (`ContextSummarised`). |
-| Runtime-**chosen child playbook** (templated `path:`) | **NOT VERIFIED.** `kind: playbook` + literal `path:` exists; no templated `path:` appears anywhere in the tree. Treat dynamic child-playbook selection as an open fork (§10), not a given. |
+| branch `design/slm-ehdb-context` | ✅ **EXISTS** — an **ai-meta** branch carrying `specs/active/2026-09-19-slm-ehdb-context/` (S0–S6, 1,473 lines). The *code* lives on `noetl/ehdb@feat/slm-context-s*`. |
+| `docs/multiregion-ehdb-plan`, M0/M3 | ✅ **EXISTS** — an **ai-meta** branch carrying `specs/active/2026-09-18-multiregion-ehdb/` (M0–M8, 2,448 lines), incl. `M3-closed-timestamp.md`. |
+| "gemma4" | ✅ **EXISTS** as a milestone — `S6-gemma4-serving.md`. ⚠ The *deployed pin* is `gemma3:4b` (`diagnose_execution.yaml:75`); the two are different things and the doc should not conflate them. |
+| A2A "v0.3.0 / v1.0.1 May 2026" | ❌ Latest release is **1.0.0**. Version negotiation uses `Major.Minor`; patch is excluded. |
+| Agent Card at `/.well-known/agent.json` | ❌ Renamed to **`/.well-known/agent-card.json`** in v0.3 (2025-07-30); registered as an RFC 8615 well-known URI in v1.0. |
+| Task states "submitted/working/completed/failed/canceled" | ❌ **Eight** states. The five omit `input-required`, `auth-required` (both *interrupted*, NOT terminal) and `rejected` (terminal). Collapsing interrupted into failed is the most common A2A dispatcher bug. |
+| SLM crate has "7 payload kinds" | ✅ **Correct** — 7 variants. ⚠ Its own module doc says "Six"; the doc is stale by one (`ContextSummarised`). |
+| Runtime-**chosen child playbook** (templated `path:`) | ❌ **NOT VERIFIED.** `kind: playbook` + literal `path:` exists; no templated `path:` appears anywhere in the tree. Treat dynamic child-playbook selection as an open fork (§10). |
+
+**M3 already defines the bounded read this design needs**, and the mesh should
+adopt its vocabulary rather than invent a parallel one:
+
+| M3 flag | Values | Default |
+| :-- | :-- | :-- |
+| `NOETL_EHDB_READ_CONSISTENCY` | `strong` \| `bounded` \| `exact` | `strong` |
+| `NOETL_EHDB_MAX_STALENESS_MS` | integer ms | `0` |
+
+The mesh's `up_to_seq` is the single-engine, sequence-valued form of the same
+idea: a read that names its bound instead of asking for "latest".
 
 ### Framework citations
 
@@ -179,7 +198,7 @@ confident aggregate over a partial prefix.
 | `NOETL_SIGNAL_MESH` | *(unset)* = off | Master arm | unset |
 | `NOETL_SIGNAL_MESH_REASONER` | *(unset)* = deterministic | `ollama` selects a model-backed reasoner | unset |
 | `NOETL_SIGNAL_MESH_MAX_TIER` | `3` | Caps cascade depth | lower it |
-| `NOETL_SIGNAL_MESH_STALENESS_MAX` | `0` | Refuse to emit above this staleness | raise it |
+| `NOETL_EHDB_MAX_STALENESS_MS` | `0` | **M3's flag, reused** — refuse to emit above this staleness. ⚠ Do not invent a mesh-private staleness knob; a second name for one concept is a second thing to keep true. | raise it |
 
 Only the exact string `"true"` arms — the house convention (`seal_max_age`,
 fencing, the repair sweep).
