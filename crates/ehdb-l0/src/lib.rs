@@ -152,6 +152,7 @@ pub mod membership;
 pub mod merge;
 pub mod metrics;
 pub mod part;
+pub mod placement;
 pub mod projection;
 pub mod provider;
 pub mod registry;
