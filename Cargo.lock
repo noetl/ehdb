@@ -722,6 +722,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ehdb-slm-context"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ehdb-storage"
 version = "0.1.0"
 dependencies = [
