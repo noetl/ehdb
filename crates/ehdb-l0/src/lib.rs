@@ -148,6 +148,7 @@ pub mod feed;
 pub mod format_version;
 pub mod frame;
 pub mod kv;
+pub mod membership;
 pub mod merge;
 pub mod metrics;
 pub mod part;
