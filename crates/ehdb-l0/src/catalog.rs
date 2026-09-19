@@ -31,7 +31,23 @@ use crate::bloom::Bloom;
 /// never conflict, so replication is a plain write-once N-way copy (HDFS /
 /// block-replication model) with **no consensus / no Raft**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// ⚠ `deny_unknown_fields` was REMOVED here deliberately, and removing it is a
+// migration step in its own right (multi-region spec M1, Release A).
+//
+// Manifests persist as JSON and are read back by whatever binary is running.
+// With `deny_unknown_fields`, a binary that predates a new field **errors** on
+// a manifest a newer binary wrote — and because this type is nested inside
+// `PartMeta` inside `Manifest`, that error fails the *whole manifest parse*, so
+// the node cannot open the dataset at all. On a tier serving `primary` that is
+// not a degraded read, it is an outage.
+//
+// M1 adds a `locality` field here. Tolerating unknown fields must therefore
+// ship and be DEPLOYED EVERYWHERE before anything writes one. Same expand-first
+// sequence, and same reasoning, as `EventRecord` in `dataset.rs`.
+//
+// ⚠ Tolerance is not laxity: `replica` and `key` remain required, and
+// `tests/manifest_forward_compat.rs` carries a negative control proving a
+// manifest missing `replica` is still refused.
 pub struct ReplicaLocation {
     /// The id of the durable-substrate replica holding this copy (e.g.
     /// `replica-0`). A read resolves this to the substrate handle and, on
