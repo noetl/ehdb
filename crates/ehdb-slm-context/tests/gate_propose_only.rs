@@ -54,7 +54,7 @@ fn spec(kind: &str) -> serde_json::Value {
 fn nothing_executes_even_in_execute_mode() {
     // ⛔ The owner gate. `Execute` parses and behaves as `Propose` because this
     // crate contains no execution path at all.
-    let d = admit(&spec("python"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Execute);
+    let d = admit(&spec("noop"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Execute);
     match d {
         Decision::Admitted(a) => assert!(
             !a.executed,
@@ -66,7 +66,7 @@ fn nothing_executes_even_in_execute_mode() {
 
 #[test]
 fn off_considers_nothing() {
-    let d = admit(&spec("python"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Off);
+    let d = admit(&spec("noop"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Off);
     assert_eq!(d, Decision::NotConsidered);
 }
 
@@ -101,7 +101,7 @@ fn exactly_one_outcome_per_proposal() {
 
 #[test]
 fn an_allowed_kind_is_admitted() {
-    for kind in ["python", "http", "noop"] {
+    for kind in ["noop"] {
         let d = admit(&spec(kind), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Propose);
         match d {
             Decision::Admitted(a) => {
@@ -137,7 +137,7 @@ fn with_the_human_gate_off_a_disallowed_kind_is_rejected_not_admitted() {
 #[test]
 fn a_schema_failure_is_rejected_with_the_schema_rule() {
     let bad = StubValidator { accept: false };
-    let d = admit(&spec("python"), &empty_ctx(), &Policy::default(), &bad, StepGenMode::Propose);
+    let d = admit(&spec("noop"), &empty_ctx(), &Policy::default(), &bad, StepGenMode::Propose);
     assert_eq!(d.rejection_rule(), Some(RejectionRule::SchemaInvalid));
 }
 
@@ -145,7 +145,7 @@ fn a_schema_failure_is_rejected_with_the_schema_rule() {
 fn an_auth_block_is_refused_however_it_is_nested() {
     let nested = serde_json::json!({
         "step": "x",
-        "tool": { "kind": "http", "request": { "auth": { "type": "bearer" } } }
+        "tool": { "kind": "noop", "request": { "auth": { "type": "bearer" } } }
     });
     let d = admit(&nested, &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Propose);
     assert_eq!(d.rejection_rule(), Some(RejectionRule::CredentialReach));
@@ -153,7 +153,7 @@ fn an_auth_block_is_refused_however_it_is_nested() {
 
 #[test]
 fn a_keychain_alias_off_the_allowlist_is_refused() {
-    let s = serde_json::json!({ "step": "x", "tool": { "kind": "http" }, "credential": "pg_k8s" });
+    let s = serde_json::json!({ "step": "x", "tool": { "kind": "noop" }, "credential": "pg_k8s" });
     let d = admit(&s, &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Propose);
     assert_eq!(d.rejection_rule(), Some(RejectionRule::KeychainAliasNotAllowed));
 
@@ -185,14 +185,14 @@ fn a_non_object_proposal_is_malformed() {
 #[test]
 fn an_exhausted_budget_refuses_before_validating() {
     let spent = Budget { steps_admitted: 8, ..Budget::default() };
-    let d = admit(&spec("python"), &ctx_with(spent), &Policy::default(), &ok(), StepGenMode::Propose);
+    let d = admit(&spec("noop"), &ctx_with(spent), &Policy::default(), &ok(), StepGenMode::Propose);
     assert_eq!(d.rejection_rule(), Some(RejectionRule::BudgetExhausted));
 }
 
 #[test]
 fn depth_exhaustion_reports_the_depth_rule() {
     let deep = Budget { max_depth_seen: 2, ..Budget::default() };
-    let d = admit(&spec("python"), &ctx_with(deep), &Policy::default(), &ok(), StepGenMode::Propose);
+    let d = admit(&spec("noop"), &ctx_with(deep), &Policy::default(), &ok(), StepGenMode::Propose);
     assert_eq!(d.rejection_rule(), Some(RejectionRule::DepthExceeded));
 }
 
@@ -208,7 +208,7 @@ fn every_rejection_rule_is_enumerable_and_labelled() {
     labels.sort_unstable();
     labels.dedup();
     assert_eq!(before, labels.len(), "duplicate labels: {labels:?}");
-    assert_eq!(before, 8, "ALL must stay exhaustive when a rule is added");
+    assert_eq!(before, 10, "ALL must stay exhaustive when a rule is added");
 }
 
 #[test]
@@ -220,28 +220,31 @@ fn all_covers_every_rule_the_gate_can_actually_emit() {
     let spent = Budget { steps_admitted: 8, ..Budget::default() };
     let deep = Budget { max_depth_seen: 2, ..Budget::default() };
     let p_off = Policy { human_gate: HumanGate::Off, ..Policy::default() };
+    let p_http = Policy { allowed_tool_kinds: vec!["http".into()], ..Policy::default() };
 
     let emitted: Vec<RejectionRule> = vec![
         admit(&serde_json::json!("x"), &ctx, &p, &ok(), StepGenMode::Propose),
-        admit(&spec("python"), &ctx_with(spent), &p, &ok(), StepGenMode::Propose),
-        admit(&spec("python"), &ctx_with(deep), &p, &ok(), StepGenMode::Propose),
-        admit(&spec("python"), &ctx, &p, &StubValidator { accept: false }, StepGenMode::Propose),
+        admit(&spec("noop"), &ctx_with(spent), &p, &ok(), StepGenMode::Propose),
+        admit(&spec("noop"), &ctx_with(deep), &p, &ok(), StepGenMode::Propose),
+        admit(&spec("noop"), &ctx, &p, &StubValidator { accept: false }, StepGenMode::Propose),
         admit(
-            &serde_json::json!({"step":"x","tool":{"kind":"http"},"auth":{}}),
+            &serde_json::json!({"step":"x","tool":{"kind":"noop"},"auth":{}}),
             &ctx, &p, &ok(), StepGenMode::Propose,
         ),
         admit(
-            &serde_json::json!({"step":"x","tool":{"kind":"http"},"credential":"nope"}),
+            &serde_json::json!({"step":"x","tool":{"kind":"noop"},"credential":"nope"}),
             &ctx, &p, &ok(), StepGenMode::Propose,
         ),
         admit(&serde_json::json!({"step":"x"}), &ctx, &p, &ok(), StepGenMode::Propose),
+        admit(&spec("python"), &ctx, &p, &ok(), StepGenMode::Propose),
+        admit(&spec("http"), &ctx, &p_http, &ok(), StepGenMode::Propose),
         admit(&spec("postgres"), &ctx, &p_off, &ok(), StepGenMode::Propose),
     ]
     .into_iter()
     .filter_map(|d| d.rejection_rule())
     .collect();
 
-    assert_eq!(emitted.len(), 8, "one rejection per case: {emitted:?}");
+    assert_eq!(emitted.len(), 10, "one rejection per case: {emitted:?}");
     for rule in &emitted {
         assert!(RejectionRule::ALL.contains(rule), "{rule:?} is emitted but missing from ALL");
     }
@@ -306,7 +309,106 @@ fn the_human_gate_defaults_to_required() {
 }
 
 #[test]
-fn the_default_allowlist_is_the_approved_three() {
-    assert_eq!(Policy::default().allowed_tool_kinds, vec!["python", "http", "noop"]);
+fn the_default_allowlist_is_noop_only() {
+    assert_eq!(
+        Policy::default().allowed_tool_kinds,
+        vec!["noop"],
+        "owner decision 2026-09-19: no python, and http is not cleanly constrainable"
+    );
+    assert_eq!(Policy::default().denied_tool_kinds, vec!["python"]);
+    assert!(Policy::default().http_allowed_hosts.is_empty());
     assert!(Policy::default().allowed_keychain_aliases.is_empty());
+}
+
+// --- fork F4 as decided by the owner, 2026-09-19 --------------------------
+
+#[test]
+fn python_is_denied_and_cannot_be_approved() {
+    // ⛔ Not merely off the allowlist: a denied kind is terminal, so it never
+    // reaches the human gate. "Not allowlisted" would leave it one approval
+    // click away from running.
+    let d = admit(&spec("python"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Propose);
+    assert_eq!(d.rejection_rule(), Some(RejectionRule::ToolKindDenied));
+    assert!(!matches!(d, Decision::AwaitingApproval { .. }), "python must not be approvable");
+    assert!(!d.is_admitted());
+}
+
+#[test]
+fn deny_beats_allow_even_if_an_operator_allowlists_python() {
+    let p = Policy {
+        allowed_tool_kinds: vec!["python".into(), "noop".into()],
+        ..Policy::default()
+    };
+    let d = admit(&spec("python"), &empty_ctx(), &p, &ok(), StepGenMode::Propose);
+    assert_eq!(
+        d.rejection_rule(),
+        Some(RejectionRule::ToolKindDenied),
+        "the deny list must win over an allowlist entry"
+    );
+}
+
+#[test]
+fn http_is_not_on_the_default_allowlist() {
+    // Not constrainable: the URL permits exfiltration and SSRF regardless of
+    // method, and GET-safety is a server-side convention.
+    assert!(!Policy::default().allowed_tool_kinds.iter().any(|k| k == "http"));
+    let d = admit(&spec("http"), &empty_ctx(), &Policy::default(), &ok(), StepGenMode::Propose);
+    assert!(!d.is_admitted(), "http must not admit by default: {d:?}");
+}
+
+#[test]
+fn an_opted_in_http_still_fails_without_a_host_allowlist() {
+    // Defence in depth: even an explicit opt-in cannot pass while the host
+    // allowlist is empty, which is the default.
+    let p = Policy { allowed_tool_kinds: vec!["http".into()], ..Policy::default() };
+    let s = serde_json::json!({ "step": "x", "tool": { "kind": "http", "url": "https://example.com/x" } });
+    let d = admit(&s, &empty_ctx(), &p, &ok(), StepGenMode::Propose);
+    assert_eq!(d.rejection_rule(), Some(RejectionRule::HttpNotReadShaped));
+
+    // Pin the DETAIL, not just the rule. Without this the empty-allowlist early
+    // return is an equivalent mutant: removing it still rejects, because an
+    // empty allowlist fails the membership check anyway. The message is the
+    // operator-facing explanation and is worth distinguishing.
+    match d {
+        Decision::Rejected { detail, .. } => assert!(
+            detail.contains("NOETL_SLM_HTTP_ALLOWED_HOSTS is empty"),
+            "the empty-allowlist case must say so explicitly; got: {detail}"
+        ),
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_opted_in_http_refuses_non_read_shapes() {
+    let p = Policy {
+        allowed_tool_kinds: vec!["http".into()],
+        http_allowed_hosts: vec!["example.com".into()],
+        ..Policy::default()
+    };
+    let cases = vec![
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://example.com/x","method":"POST"}}),
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://example.com/x","body":{"a":1}}}),
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://example.com/x","json":{"a":1}}}),
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://example.com/x","form":{"a":"1"}}}),
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://evil.test/x"}}),
+        serde_json::json!({"step":"x","tool":{"kind":"http","url":"http://169.254.169.254/latest/meta-data"}}),
+    ];
+    for c in cases {
+        let d = admit(&c, &empty_ctx(), &p, &ok(), StepGenMode::Propose);
+        assert_eq!(d.rejection_rule(), Some(RejectionRule::HttpNotReadShaped), "for {c}");
+    }
+}
+
+#[test]
+fn an_opted_in_get_to_an_allowlisted_host_can_pass() {
+    // The positive control. Without it, the previous test could be passing
+    // because http is rejected unconditionally rather than by read-shape.
+    let p = Policy {
+        allowed_tool_kinds: vec!["http".into()],
+        http_allowed_hosts: vec!["example.com".into()],
+        ..Policy::default()
+    };
+    let s = serde_json::json!({"step":"x","tool":{"kind":"http","url":"https://example.com/x","method":"GET"}});
+    let d = admit(&s, &empty_ctx(), &p, &ok(), StepGenMode::Propose);
+    assert!(d.is_admitted(), "an explicitly opted-in, host-allowlisted GET should pass: {d:?}");
 }

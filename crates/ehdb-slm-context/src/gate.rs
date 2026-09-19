@@ -27,7 +27,37 @@
 //!    (`noetl-server`'s `playbook::parser::{parse_playbook, validate_playbook}`,
 //!    both `pub`) is the one that admits real executions.
 //! 4. **Credential reach** — no `auth:`, no keychain alias off the allowlist.
-//! 5. **Tool-kind allowlist** — then the human gate for anything off it.
+//! 5. **Tool-kind deny list** — `python`. Terminal: no human may approve it.
+//! 6. **Read-shape** — for kinds that need it (`http`).
+//! 7. **Tool-kind allowlist** — then the human gate for anything off it.
+//!
+//! # Fork F4, as decided by the owner (2026-09-19)
+//!
+//! ⛔ **`python` is DENIED, not merely un-allowlisted.** It sits on a deny list
+//! checked before the allowlist and before the human gate, so it cannot be
+//! approved into existence. "Not on the allowlist" would leave it reachable by
+//! a human clicking approve; a deny list makes the decision structural.
+//!
+//! ⛔ **`http` is not on the default allowlist either, and the reason is the
+//! URL.** Method and body are mechanically checkable — `HttpConfig` exposes
+//! `method`, `body`, `json`, `form` (`noetl/tools` `http.rs:47-77`) — but the
+//! URL is not. A side-effect-free GET still permits:
+//!
+//! - **exfiltration** — arbitrary data in the query string to an arbitrary host;
+//! - **SSRF** — `169.254.169.254` and any in-cluster service;
+//! - and GET-safety is a **server-side convention**, not a property this gate
+//!   can verify.
+//!
+//! Constraining that needs a host allowlist, which would default to empty and
+//! so admit nothing anyway. The honest answer to "can `http` be cleanly
+//! constrained to side-effect-free GETs" is **no**, so the default allowlist is
+//! **`noop` alone**.
+//!
+//! The read-shape machinery is nonetheless implemented and tested, as
+//! defence-in-depth for an operator who explicitly opts `http` in: it then
+//! additionally requires GET/HEAD, no body/json/form, and a **non-empty** host
+//! allowlist. With the default empty host list, an allowlisted `http` still
+//! cannot pass.
 //!
 //! # Carrier (fork F2, approved)
 //!
@@ -105,6 +135,8 @@ pub enum RejectionRule {
     CredentialReach,
     KeychainAliasNotAllowed,
     MissingToolKind,
+    ToolKindDenied,
+    HttpNotReadShaped,
     ToolKindNotAllowed,
 }
 
@@ -117,6 +149,8 @@ impl RejectionRule {
         RejectionRule::CredentialReach,
         RejectionRule::KeychainAliasNotAllowed,
         RejectionRule::MissingToolKind,
+        RejectionRule::ToolKindDenied,
+        RejectionRule::HttpNotReadShaped,
         RejectionRule::ToolKindNotAllowed,
     ];
 
@@ -129,6 +163,8 @@ impl RejectionRule {
             RejectionRule::CredentialReach => "credential_reach",
             RejectionRule::KeychainAliasNotAllowed => "keychain_alias_not_allowed",
             RejectionRule::MissingToolKind => "missing_tool_kind",
+            RejectionRule::ToolKindDenied => "tool_kind_denied",
+            RejectionRule::HttpNotReadShaped => "http_not_read_shaped",
             RejectionRule::ToolKindNotAllowed => "tool_kind_not_allowed",
         }
     }
@@ -152,6 +188,13 @@ pub trait DslValidator {
 pub struct Policy {
     /// `NOETL_SLM_ALLOWED_TOOL_KINDS`. Kinds off this list need the human gate.
     pub allowed_tool_kinds: Vec<String>,
+    /// `NOETL_SLM_DENIED_TOOL_KINDS`. ⛔ Terminal — a denied kind is rejected
+    /// before the allowlist and before the human gate, so it cannot be approved
+    /// into existence. Deny beats allow if a kind appears on both.
+    pub denied_tool_kinds: Vec<String>,
+    /// `NOETL_SLM_HTTP_ALLOWED_HOSTS`. Empty by default, which means an
+    /// allowlisted `http` step still cannot pass the read-shape check.
+    pub http_allowed_hosts: Vec<String>,
     /// `NOETL_SLM_HUMAN_GATE`.
     pub human_gate: HumanGate,
     /// Keychain aliases a generated step may name. Empty = none.
@@ -164,7 +207,11 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            allowed_tool_kinds: vec!["python".into(), "http".into(), "noop".into()],
+            // Owner decision 2026-09-19: no python, and http is not cleanly
+            // constrainable (see the module doc). `noop` alone.
+            allowed_tool_kinds: vec!["noop".into()],
+            denied_tool_kinds: vec!["python".into()],
+            http_allowed_hosts: Vec::new(),
             human_gate: HumanGate::Required,
             allowed_keychain_aliases: Vec::new(),
             catalog_prefix: "generated/slm/".into(),
@@ -185,6 +232,24 @@ impl Policy {
                         .collect()
                 })
                 .unwrap_or(d.allowed_tool_kinds),
+            denied_tool_kinds: std::env::var("NOETL_SLM_DENIED_TOOL_KINDS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or(d.denied_tool_kinds),
+            http_allowed_hosts: std::env::var("NOETL_SLM_HTTP_ALLOWED_HOSTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or(d.http_allowed_hosts),
             human_gate: std::env::var("NOETL_SLM_HUMAN_GATE")
                 .map(|v| HumanGate::parse(&v))
                 .unwrap_or_default(),
@@ -321,6 +386,61 @@ fn credential_reach(spec: &serde_json::Value, policy: &Policy) -> Option<(Reject
     found
 }
 
+/// Read-shape check for `http`. Returns the failing reason, if any.
+///
+/// ⚠ This is defence-in-depth for an explicit opt-in, **not** a claim that a
+/// constrained `http` is safe. The URL remains the unconstrainable part; the
+/// host allowlist is what bounds it, and it is empty by default.
+fn http_not_read_shaped(spec: &serde_json::Value, policy: &Policy) -> Option<String> {
+    let tool = spec.get("tool")?;
+
+    for body_field in ["body", "json", "form"] {
+        if tool.get(body_field).map(|v| !v.is_null()).unwrap_or(false) {
+            return Some(format!("`{body_field}` present: not a read-shaped request"));
+        }
+    }
+
+    let method = tool
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("GET")
+        .trim()
+        .to_ascii_uppercase();
+    if method != "GET" && method != "HEAD" {
+        return Some(format!("method {method} is not GET or HEAD"));
+    }
+
+    let url = match tool.get("url").and_then(|u| u.as_str()) {
+        Some(u) => u,
+        None => return Some("no url".to_string()),
+    };
+    if policy.http_allowed_hosts.is_empty() {
+        return Some(
+            "NOETL_SLM_HTTP_ALLOWED_HOSTS is empty: an arbitrary-host GET still \
+             permits exfiltration and SSRF, so no host is admissible"
+                .to_string(),
+        );
+    }
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !policy.http_allowed_hosts.iter().any(|h| h == &host) {
+        return Some(format!("host {host:?} is not on NOETL_SLM_HTTP_ALLOWED_HOSTS"));
+    }
+    None
+}
+
 fn tool_kind_of(spec: &serde_json::Value) -> Option<String> {
     spec.get("tool")
         .and_then(|t| t.get("kind"))
@@ -373,6 +493,22 @@ pub fn admit(
     let Some(kind) = tool_kind_of(spec) else {
         return reject(RejectionRule::MissingToolKind, "no tool.kind on the proposal".into());
     };
+    // 5 — deny list. Terminal: NOT routed to the human gate, because a denied
+    // kind must not be approvable into existence.
+    if policy.denied_tool_kinds.iter().any(|k| k == &kind) {
+        return reject(
+            RejectionRule::ToolKindDenied,
+            format!("tool kind {kind:?} is denied and cannot be approved"),
+        );
+    }
+
+    // 6 — read-shape, for kinds that need it
+    if kind == "http" {
+        if let Some(why) = http_not_read_shaped(spec, policy) {
+            return reject(RejectionRule::HttpNotReadShaped, why);
+        }
+    }
+
     let allowed = policy.allowed_tool_kinds.iter().any(|k| k == &kind);
     let carrier = carrier(spec, policy);
 
