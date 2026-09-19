@@ -37,12 +37,17 @@
 
 pub mod event;
 pub mod fold;
+pub mod gate;
 
 pub use event::{
     Rejection, SlmContextEvent, StepSpecRef, Summary, TurnCompleted, TurnDegraded, TurnPrompted,
     SLM_CONTEXT_PAYLOAD_VERSION,
 };
 pub use fold::{fold, Budget, BudgetLimit, FoldError, FoldVersion, Turn, WorkingContext};
+pub use gate::{
+    admit, Admission, CatalogCarrier, Decision, DslValidator, HumanGate, Policy, RejectionRule,
+    StepGenMode,
+};
 
 /// Tri-state gate shared by every SLM-context capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
