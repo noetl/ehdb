@@ -115,6 +115,12 @@ pub struct L0Config {
     /// `check_region_survival` returns no violations for it, so the region
     /// check below is a strict no-op unless an operator asks for `Region`.
     pub survival_goal: crate::failure_domain::SurvivalGoal,
+    /// M2 clock mode. `None` — the default — reads `NOETL_EHDB_HLC`.
+    ///
+    /// Injectable so tests choose the mode WITHOUT touching the process env:
+    /// `cargo test` does not serialise tests, so an env-driven test would race
+    /// every other test in the binary.
+    pub hlc_mode: Option<crate::hlc_policy::HlcMode>,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
     /// How many versioned manifest snapshots to keep besides `LATEST`
@@ -138,6 +144,7 @@ impl L0Config {
             seal_max_age: None,
             require_distinct_domains: false,
             survival_goal: crate::failure_domain::SurvivalGoal::Zone,
+            hlc_mode: None,
             flush: FlushPolicy::EveryAppend,
             dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
@@ -216,6 +223,12 @@ impl L0Config {
     /// inert; `Region` requires copies in distinct **declared** regions.
     pub fn with_survival_goal(mut self, goal: crate::failure_domain::SurvivalGoal) -> Self {
         self.survival_goal = goal;
+        self
+    }
+
+    /// Set the M2 clock mode explicitly, bypassing `NOETL_EHDB_HLC`.
+    pub fn with_hlc_mode(mut self, mode: crate::hlc_policy::HlcMode) -> Self {
+        self.hlc_mode = Some(mode);
         self
     }
 
@@ -318,6 +331,14 @@ pub struct L0Engine<D: Dataset> {
     shard_tail_max: HashMap<u32, u64>,
     /// Append-time idempotency window (noetl/ai-meta#313).
     dedupe: crate::dedupe::DedupeIndex,
+    /// The M2 commit clock, and the mode that decides whether it is consulted.
+    ///
+    /// Held on the engine rather than created per append because the whole
+    /// point of `HlcClock` is that it never returns a value less than or equal
+    /// to one it already returned — a fresh clock per append would reset that
+    /// guarantee every time.
+    hlc_mode: crate::hlc_policy::HlcMode,
+    hlc: ehdb_core::hlc::HlcClock,
     /// Sender to the uploader thread (dropped on close to stop it).
     upload_tx: Option<Sender<UploadJob>>,
     upload_handle: Option<JoinHandle<()>>,
@@ -566,6 +587,8 @@ impl<D: Dataset> L0Engine<D> {
         let shard_count = config.shard_count;
         let dedupe_capacity_init =
             crate::dedupe::DedupeIndex::with_capacity(config.dedupe_capacity);
+        let hlc_mode_resolved =
+            config.hlc_mode.unwrap_or_else(crate::hlc_policy::HlcMode::from_env);
         Self {
             config,
             replicas,
@@ -575,6 +598,24 @@ impl<D: Dataset> L0Engine<D> {
             global_sequence,
             shard_tail_max: HashMap::new(),
             dedupe: dedupe_capacity_init,
+            // Resolved ONCE at open: a per-append env read would put a syscall
+            // on the commit path, and the mode cannot change under a running
+            // process anyway.
+            hlc_mode: hlc_mode_resolved,
+            // ⚠ Seeded from the tip the engine just recovered, not from
+            // `default()`. `HlcClock::seeded_from` exists precisely because a
+            // fresh process must not re-issue timestamps a previous one used,
+            // and the wall clock alone does not guarantee that across a restart
+            // during which it stepped back.
+            hlc: ehdb_core::hlc::HlcClock::seeded_from(
+                ehdb_core::hlc::Hlc::from_parts(0, 0),
+                Box::new(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                }),
+            ),
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
@@ -713,6 +754,22 @@ impl<D: Dataset> L0Engine<D> {
         if let Some(existing) = self.dedupe_hit(&record) {
             self.metrics.incr_dedupe_hits();
             return Ok(existing);
+        }
+        // M2 — stamp the commit HLC.
+        //
+        // ⚠ AFTER the dedupe check above, never before: a duplicate is an
+        // acknowledgement of an append that already happened, not an append, so
+        // it must not burn a timestamp or overwrite the one the original
+        // carries.
+        //
+        // ⚠⚠ Nothing reads `commit_hlc`, and that is the M2 exit criterion
+        // rather than a gap — a reader appearing before M3's closed timestamps
+        // would be a phase-ordering violation. Stamping is write-only here on
+        // purpose, which is also why `off` (the default) is byte-identical:
+        // `skip_serializing_if` omits the field entirely.
+        let mut record = record;
+        if self.hlc_mode.stamps() {
+            D::stamp_commit_hlc(&mut record, self.hlc.now().as_u64());
         }
         let sort_key = D::sort_key(&record);
         let shard = D::partition(&record, self.config.shard_count);
