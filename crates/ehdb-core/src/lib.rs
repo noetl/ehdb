@@ -1,5 +1,10 @@
 use std::{collections::BTreeSet, fmt};
 
+/// The three resolvers (multi-region spec M0). Here rather than in
+/// `ehdb-l0` because `ehdb-reference` -- which serves the production
+/// event-log tier -- does not depend on `ehdb-l0`.
+pub mod plan;
+
 pub use arrow_schema::DataType;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
