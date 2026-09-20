@@ -21,8 +21,6 @@
 //! [`FailureDomain::Undeclared`](crate::failure_domain::FailureDomain::Undeclared),
 //! whose own doc puts it: silence is not independence.
 
-use serde::{Deserialize, Serialize};
-
 /// Env var declaring this node's locality, e.g.
 /// `region=us-central1,zone=us-central1-a`.
 pub const LOCALITY_ENV: &str = "NOETL_EHDB_LOCALITY";
@@ -34,72 +32,26 @@ pub const LOCALITY_ENV: &str = "NOETL_EHDB_LOCALITY";
 /// **byte-identically to today**, so a rollback binary keeps reading every
 /// manifest written while the flag is unset. Same precedent as `event_id` on
 /// `EventRecord`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Locality {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zone: Option<String>,
-}
+/// Where a replica physically lives.
+///
+/// ⭐ Re-exported from [`ehdb_core::plan`], not redefined. M0 and M1 were
+/// written in parallel and each declared this type; two structurally identical
+/// types that must stay identical is a representation that drifts, and the
+/// serde shape here is load-bearing (a replica with no locality must serialise
+/// byte-identically to today so a rollback binary keeps reading every manifest
+/// written while the flag is unset — same precedent as `event_id` on
+/// `EventRecord`). One definition cannot disagree with itself.
+pub use ehdb_core::plan::Locality;
 
-impl Locality {
-    pub fn new(region: impl Into<String>, zone: impl Into<String>) -> Self {
-        Self {
-            region: Some(region.into()),
-            zone: Some(zone.into()),
-        }
-    }
-
-    /// Nothing declared.
-    pub fn undeclared() -> Self {
-        Self::default()
-    }
-
-    pub fn is_undeclared(&self) -> bool {
-        self.region.is_none() && self.zone.is_none()
-    }
-
-    /// Parse `region=<r>,zone=<z>`. Unknown keys are **refused**, not ignored
-    /// — a dropped key is a setting the operator believes is applied.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        let mut out = Self::default();
-        for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (k, v) = pair
-                .split_once('=')
-                .ok_or_else(|| format!("locality fragment '{pair}' is not key=value"))?;
-            let v = v.trim();
-            match k.trim().to_ascii_lowercase().as_str() {
-                "region" => out.region = (!v.is_empty()).then(|| v.to_string()),
-                "zone" => out.zone = (!v.is_empty()).then(|| v.to_string()),
-                other => {
-                    return Err(format!(
-                        "unknown locality key '{other}': refused rather than ignored, \
-                         because a silently-dropped key is a setting the operator \
-                         believes is applied"
-                    ))
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn from_env() -> Result<Self, String> {
-        match std::env::var(LOCALITY_ENV) {
-            Ok(raw) => Self::parse(&raw),
-            Err(_) => Ok(Self::undeclared()),
-        }
-    }
-
-    /// Whether these two are provably in **different** regions.
-    ///
-    /// ⚠ Returns `false` when either side is undeclared. "Cannot be shown
-    /// different" is not "is the same", but for a placement decision the two
-    /// must be treated alike: acting on an unproven difference is how an RF
-    /// of N over one domain gets called an RF of N.
-    pub fn provably_different_region(&self, other: &Self) -> bool {
-        match (&self.region, &other.region) {
-            (Some(a), Some(b)) => a != b,
-            _ => false,
-        }
+/// Read [`Locality`] from [`LOCALITY_ENV`], defaulting to undeclared.
+///
+/// ⚠ A free function rather than `Locality::from_env`, because the type now
+/// lives in `ehdb-core::plan`, whose module note states that M0 deliberately
+/// introduces no flags. The parsing is a property of the type and moved with
+/// it; reading the environment is a property of a deployment and stays here.
+pub fn locality_from_env() -> Result<Locality, String> {
+    match std::env::var(LOCALITY_ENV) {
+        Ok(raw) => Locality::parse(&raw),
+        Err(_) => Ok(Locality::undeclared()),
     }
 }

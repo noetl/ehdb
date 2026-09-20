@@ -25,35 +25,18 @@ use crate::closed_timestamp::ClosedTimestamp;
 pub const READ_LOCALITY_ENV: &str = "NOETL_EHDB_READ_LOCALITY";
 
 /// Where a read may be served from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReadLocality {
-    /// **Default, and today.** Always the shard owner.
-    #[default]
-    Owner,
-    /// The nearest replica whose closed timestamp satisfies the request.
-    /// ⛔ Not implemented — gated behind M5.
-    Nearest,
-}
+/// Which replica a read may be served from.
+///
+/// ⭐ Re-exported from [`ehdb_core::plan`], not redefined — see the note on
+/// [`crate::placement::Locality`]. `Owner` is today's behaviour and the
+/// default; `Nearest` is ⛔ not implemented.
+pub use ehdb_core::plan::ReadLocality;
 
-impl ReadLocality {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::Nearest => "nearest",
-        }
-    }
-
-    /// ⚠ Unrecognised ⇒ `Owner`. A typo must not move the read path.
-    pub fn parse(raw: Option<&str>) -> Self {
-        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            Some("nearest") => Self::Nearest,
-            _ => Self::Owner,
-        }
-    }
-
-    pub fn from_env() -> Self {
-        Self::parse(std::env::var(READ_LOCALITY_ENV).ok().as_deref())
-    }
+/// Read [`ReadLocality`] from [`READ_LOCALITY_ENV`].
+///
+/// ⚠ A free function for the same reason as [`crate::placement::locality_from_env`].
+pub fn read_locality_from_env() -> ReadLocality {
+    ReadLocality::parse(std::env::var(READ_LOCALITY_ENV).ok().as_deref())
 }
 
 /// A replica a read could be served from (spec M6 shape).
@@ -75,11 +58,10 @@ impl ReplicaCandidate {
 }
 
 /// Where a read was routed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteTarget {
-    Owner,
-    Replica(String),
-}
+/// Where a read is routed.
+///
+/// ⭐ Re-exported from [`ehdb_core::plan`], not redefined.
+pub use ehdb_core::plan::RouteTarget;
 
 /// Why routing did not produce a non-owner target.
 #[derive(Debug, Clone, PartialEq, Eq)]

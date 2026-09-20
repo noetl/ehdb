@@ -242,37 +242,13 @@ pub fn survives_node_loss(replicas: &[ReplicaDomain]) -> bool {
 ///
 /// ⚠ `Zone` is today's behaviour exactly — [`check_replica_domains`] unchanged.
 /// It is the default so that adding this type changes nothing by itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SurvivalGoal {
-    /// Survive losing one zone / disk / node. Distinct failure domains, which
-    /// is what [`check_replica_domains`] already enforces.
-    #[default]
-    Zone,
-    /// Survive losing a whole region. Requires copies in **different declared
-    /// regions** — a property no device-id comparison can establish, because
-    /// two disks in one region are two domains and one region.
-    Region,
-}
-
-impl SurvivalGoal {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Zone => "zone",
-            Self::Region => "region",
-        }
-    }
-
-    /// Parse from configuration. An unrecognised value is **`Zone`**, matching
-    /// the fail-safe precedent in `EventLogMode::from_env` ("an unknown driver
-    /// never mirrors"): a typo must not silently widen what we claim to
-    /// survive.
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "region" => Self::Region,
-            _ => Self::Zone,
-        }
-    }
-}
+/// How much a replica set is required to survive.
+///
+/// ⭐ Re-exported from [`ehdb_core::plan`], not redefined — see the note on
+/// [`crate::placement::Locality`]. `Zone` is today's behaviour exactly
+/// ([`check_replica_domains`] unchanged) and is the default, so the type
+/// changes nothing by itself.
+pub use ehdb_core::plan::SurvivalGoal;
 
 /// A replica's declared region, for the [`SurvivalGoal::Region`] check.
 ///

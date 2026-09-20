@@ -87,6 +87,47 @@ impl Locality {
     pub fn is_undeclared(&self) -> bool {
         self.region.is_none() && self.zone.is_none()
     }
+
+    /// Parse `region=<r>,zone=<z>`. Unknown keys are **refused**, not ignored
+    /// — a dropped key is a setting the operator believes is applied.
+    ///
+    /// Takes the string rather than reading the environment, so it stays a
+    /// property of the type. The env read lives in `ehdb-l0` (see the module
+    /// note: M0 introduces no flags).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut out = Self::default();
+        for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (k, v) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("locality fragment '{pair}' is not key=value"))?;
+            let v = v.trim();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "region" => out.region = (!v.is_empty()).then(|| v.to_string()),
+                "zone" => out.zone = (!v.is_empty()).then(|| v.to_string()),
+                other => {
+                    return Err(format!(
+                        "unknown locality key '{other}': refused rather than ignored, \
+                         because a silently-dropped key is a setting the operator \
+                         believes is applied"
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether these two are provably in **different** regions.
+    ///
+    /// ⚠ Returns `false` when either side is undeclared. "Cannot be shown
+    /// different" is not "is the same", but for a placement decision the two
+    /// must be treated alike: acting on an unproven difference is how an RF
+    /// of N over one domain gets called an RF of N.
+    pub fn provably_different_region(&self, other: &Self) -> bool {
+        match (&self.region, &other.region) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
 }
 
 /// How much loss a replica set must survive.
@@ -97,6 +138,26 @@ pub enum SurvivalGoal {
     Zone,
     /// Spread across regions.
     Region,
+}
+
+impl SurvivalGoal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Zone => "zone",
+            Self::Region => "region",
+        }
+    }
+
+    /// Parse from configuration. An unrecognised value is **`Zone`**, matching
+    /// the fail-safe precedent in `EventLogMode::from_env` ("an unknown driver
+    /// never mirrors"): a typo must not silently widen what we claim to
+    /// survive.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "region" => Self::Region,
+            _ => Self::Zone,
+        }
+    }
 }
 
 /// Whether a placement violation **refuses** or is merely counted.
@@ -144,6 +205,23 @@ pub enum ReadLocality {
     #[default]
     Owner,
     Nearest,
+}
+
+impl ReadLocality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Nearest => "nearest",
+        }
+    }
+
+    /// ⚠ Unrecognised ⇒ `Owner`. A typo must not move the read path.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("nearest") => Self::Nearest,
+            _ => Self::Owner,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

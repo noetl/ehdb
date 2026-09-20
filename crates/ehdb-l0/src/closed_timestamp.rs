@@ -41,28 +41,12 @@
 use crate::unreplicated::ShardUnreplicated;
 
 /// How fresh a read requires its data to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReadConsistency {
-    /// Today: serve from the owner, no freshness predicate. **Default**, so
-    /// adding this type changes nothing by itself.
-    #[default]
-    Strong,
-    /// Serve from any replica whose closed timestamp is no older than
-    /// `max_staleness_millis`.
-    Bounded { max_staleness_millis: u64 },
-    /// Serve a snapshot at exactly `at_millis`. Requires `closed >= at_millis`.
-    Exact { at_millis: u64 },
-}
-
-impl ReadConsistency {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Strong => "strong",
-            Self::Bounded { .. } => "bounded",
-            Self::Exact { .. } => "exact",
-        }
-    }
-}
+/// How fresh a read requires its data to be.
+///
+/// ⭐ Re-exported from [`ehdb_core::plan`], not redefined — see the note on
+/// [`crate::placement::Locality`]. `Strong` is today's behaviour and the
+/// default.
+pub use ehdb_core::plan::ReadConsistency;
 
 /// One shard's closed timestamp, with the instant it was computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
