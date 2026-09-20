@@ -116,6 +116,9 @@ fn absent_optional_fields_do_not_appear_on_the_wire() {
     })
     .expect("serialize");
     let text = String::from_utf8(bytes).expect("utf8");
-    assert!(!text.contains("prompt_digest"), "absent field leaked: {text}");
+    assert!(
+        !text.contains("prompt_digest"),
+        "absent field leaked: {text}"
+    );
     assert!(!text.contains("model_ref"), "absent field leaked: {text}");
 }
