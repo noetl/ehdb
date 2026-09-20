@@ -222,3 +222,166 @@ pub fn validate_replica_domains(replicas: &[ReplicaDomain]) -> Result<()> {
 pub fn survives_node_loss(replicas: &[ReplicaDomain]) -> bool {
     replicas.iter().any(|r| r.domain.is_independent_of_node())
 }
+
+// ---------------------------------------------------------------------------
+// Survival goals (multi-region spec M4) — region-aware placement.
+//
+// READ-SIDE / VALIDATION ONLY. Nothing here is called from the engine yet and
+// nothing here touches the write path. The wiring — mapping the engine's
+// replica set into `RegionPlacement`s at the existing `check_replica_domains`
+// call site — is deliberately NOT done here: that call site lives in
+// `engine.rs`, which this change does not own.
+//
+// ⚠ Why a parallel input type rather than a `region` field on `ReplicaDomain`:
+// `ReplicaDomain` is built with a struct literal in `engine.rs`, so adding a
+// field there would stop the crate compiling until that file changed. A
+// separate type keeps this shippable on its own.
+// ---------------------------------------------------------------------------
+
+/// How much a replica set is required to survive.
+///
+/// ⚠ `Zone` is today's behaviour exactly — [`check_replica_domains`] unchanged.
+/// It is the default so that adding this type changes nothing by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurvivalGoal {
+    /// Survive losing one zone / disk / node. Distinct failure domains, which
+    /// is what [`check_replica_domains`] already enforces.
+    #[default]
+    Zone,
+    /// Survive losing a whole region. Requires copies in **different declared
+    /// regions** — a property no device-id comparison can establish, because
+    /// two disks in one region are two domains and one region.
+    Region,
+}
+
+impl SurvivalGoal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Zone => "zone",
+            Self::Region => "region",
+        }
+    }
+
+    /// Parse from configuration. An unrecognised value is **`Zone`**, matching
+    /// the fail-safe precedent in `EventLogMode::from_env` ("an unknown driver
+    /// never mirrors"): a typo must not silently widen what we claim to
+    /// survive.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "region" => Self::Region,
+            _ => Self::Zone,
+        }
+    }
+}
+
+/// A replica's declared region, for the [`SurvivalGoal::Region`] check.
+///
+/// Separate from [`ReplicaDomain`] on purpose (see the module note above). The
+/// two are combined by the caller, not by this module.
+#[derive(Debug, Clone)]
+pub struct RegionPlacement {
+    pub replica: String,
+    /// The declared region. `None` means **undeclared**, which is refused under
+    /// [`SurvivalGoal::Region`] — never assumed distinct. Same posture as
+    /// [`FailureDomain::Undeclared`]: silence is not independence.
+    pub region: Option<String>,
+}
+
+/// Why a replica set cannot meet a [`SurvivalGoal::Region`] goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionViolation {
+    /// Two replicas sit in the same declared region.
+    SharedRegion {
+        replica_a: String,
+        replica_b: String,
+        region: String,
+    },
+    /// A replica declares no region, so cross-region spread cannot be shown.
+    UndeclaredRegion { replica: String },
+    /// Fewer than two replicas: a region goal is unmeetable by construction.
+    NotEnoughReplicas { have: usize },
+}
+
+impl RegionViolation {
+    pub fn message(&self) -> String {
+        match self {
+            Self::SharedRegion {
+                replica_a,
+                replica_b,
+                region,
+            } => format!(
+                "replicas '{replica_a}' and '{replica_b}' are both in region '{region}': \
+                 a region goal over one region is a zone goal wearing a larger name"
+            ),
+            Self::UndeclaredRegion { replica } => format!(
+                "replica '{replica}' declares no region, so cross-region spread \
+                 cannot be demonstrated"
+            ),
+            Self::NotEnoughReplicas { have } => {
+                format!("a region survival goal needs at least 2 replicas, found {have}")
+            }
+        }
+    }
+}
+
+/// Check a replica set against a survival goal.
+///
+/// Under [`SurvivalGoal::Zone`] this returns **empty, always** — the zone
+/// property is [`check_replica_domains`]'s job and is not duplicated here. A
+/// caller runs both.
+///
+/// ⚠ Returns **every** violation, not the first, for the same reason
+/// [`check_replica_domains`] does: fixing a misconfiguration one round-trip at
+/// a time is how the rest of it survives review.
+pub fn check_region_survival(
+    replicas: &[RegionPlacement],
+    goal: SurvivalGoal,
+) -> Vec<RegionViolation> {
+    if goal == SurvivalGoal::Zone {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if replicas.len() < 2 {
+        out.push(RegionViolation::NotEnoughReplicas {
+            have: replicas.len(),
+        });
+        return out;
+    }
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for r in replicas {
+        let Some(region) = r.region.as_deref() else {
+            out.push(RegionViolation::UndeclaredRegion {
+                replica: r.replica.clone(),
+            });
+            continue;
+        };
+        if let Some(prev) = seen.get(region) {
+            out.push(RegionViolation::SharedRegion {
+                replica_a: (*prev).to_string(),
+                replica_b: r.replica.clone(),
+                region: region.to_string(),
+            });
+        } else {
+            seen.insert(region.to_string(), &r.replica);
+        }
+    }
+    out
+}
+
+/// [`check_region_survival`], as a hard error. The **enforce** half; callers
+/// wanting shadow behaviour use `check_region_survival` and only count.
+pub fn validate_region_survival(replicas: &[RegionPlacement], goal: SurvivalGoal) -> Result<()> {
+    let violations = check_region_survival(replicas, goal);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    let joined = violations
+        .iter()
+        .map(|v| v.message())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(EhdbError::InvalidState(format!(
+        "replica set cannot meet survival goal '{}': {joined}",
+        goal.as_str()
+    )))
+}

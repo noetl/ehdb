@@ -133,9 +133,11 @@
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
 
+pub mod hlc_policy;
 pub mod blob;
 pub mod bloom;
 pub mod catalog;
+pub mod closed_timestamp;
 pub mod columnar;
 pub mod command_queue;
 pub mod cursor;
@@ -148,18 +150,23 @@ pub mod feed;
 pub mod format_version;
 pub mod frame;
 pub mod kv;
+pub mod membership;
 pub mod merge;
 pub mod metrics;
 pub mod part;
+pub mod placement;
 pub mod projection;
 pub mod provider;
+pub mod region_routing;
 pub mod registry;
+pub mod replica_targets;
 pub mod retention;
 pub mod runtime;
 pub mod substrate;
 pub mod unreplicated;
 pub mod vector;
 pub mod wasm;
+pub mod write_failover;
 
 pub use blob::{content_digest, BlobOp, BlobRegistry, BlobStore, DATASET_D5_BLOB};
 pub use bloom::Bloom;
