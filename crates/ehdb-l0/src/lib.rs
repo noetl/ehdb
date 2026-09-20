@@ -133,7 +133,6 @@
 //! L1/L2/L3. This crate touches no NATS, cuts nothing over, and is kind/local
 //! shadow only.
 
-pub mod hlc_policy;
 pub mod blob;
 pub mod bloom;
 pub mod catalog;
@@ -149,6 +148,7 @@ pub mod fault;
 pub mod feed;
 pub mod format_version;
 pub mod frame;
+pub mod hlc_policy;
 pub mod kv;
 pub mod membership;
 pub mod merge;

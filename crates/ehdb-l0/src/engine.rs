@@ -449,17 +449,13 @@ impl<D: Dataset> L0Engine<D> {
                     region: r.locality.region.clone(),
                 })
                 .collect();
-            if let Err(e) =
-                crate::failure_domain::validate_region_survival(&placements, config.survival_goal)
-            {
-                // Enforced, not shadowed, and that asymmetry with the domain
-                // check below is intentional: the domain check defaults to ON
-                // for everyone and so needs a shadow rung, whereas `Region` is
-                // never reached unless an operator explicitly asked for it.
-                // Asking for a survival goal and silently not getting it is the
-                // failure this phase exists to prevent.
-                return Err(e);
-            }
+            // Enforced, not shadowed, and that asymmetry with the domain check
+            // below is intentional: the domain check defaults to ON for everyone
+            // and so needs a shadow rung, whereas `Region` is never reached
+            // unless an operator explicitly asked for it. Asking for a survival
+            // goal and silently not getting it is the failure this phase exists
+            // to prevent.
+            crate::failure_domain::validate_region_survival(&placements, config.survival_goal)?;
 
             let violations = crate::failure_domain::check_replica_domains(&domains);
             if !violations.is_empty() {
@@ -587,8 +583,9 @@ impl<D: Dataset> L0Engine<D> {
         let shard_count = config.shard_count;
         let dedupe_capacity_init =
             crate::dedupe::DedupeIndex::with_capacity(config.dedupe_capacity);
-        let hlc_mode_resolved =
-            config.hlc_mode.unwrap_or_else(crate::hlc_policy::HlcMode::from_env);
+        let hlc_mode_resolved = config
+            .hlc_mode
+            .unwrap_or_else(crate::hlc_policy::HlcMode::from_env);
         Self {
             config,
             replicas,

@@ -29,7 +29,7 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 fn engine(tag: &str, mode: HlcMode) -> L0EventLogEngine {
     let s: Arc<dyn DurableSubstrate> = Arc::new(InMemorySubstrate::new(format!("hlc-{tag}")));
     L0EventLogEngine::open_replicated(
-        L0Config::d1(&unique_dir(tag))
+        L0Config::d1(unique_dir(tag))
             .with_shard_count(1)
             .with_granule_size(64)
             .with_hlc_mode(mode),
@@ -45,14 +45,26 @@ fn every_append_is_stamped_under_shadow() {
     const N: usize = 50;
     let mut e = engine("shadow", HlcMode::Shadow);
     for i in 0..N {
-        e.append_record(EventRecord::new(i as u64 + 1, format!("exec-{i}"), "t", "p"))
-            .expect("append");
+        e.append_record(EventRecord::new(
+            i as u64 + 1,
+            format!("exec-{i}"),
+            "t",
+            "p",
+        ))
+        .expect("append");
     }
     let recs = e.read_partition_after(0, 0).expect("scan");
     let stamped = recs.iter().filter(|r| r.commit_hlc.is_some()).count();
     println!("appends observed={} stamped={}", recs.len(), stamped);
-    assert_eq!(recs.len(), N, "the drive must actually have appended N records");
-    assert_eq!(stamped, N, "100% of appends must carry commit_hlc under shadow");
+    assert_eq!(
+        recs.len(),
+        N,
+        "the drive must actually have appended N records"
+    );
+    assert_eq!(
+        stamped, N,
+        "100% of appends must carry commit_hlc under shadow"
+    );
 
     // Strictly increasing, which is the property the clock exists for.
     let hlcs: Vec<u64> = recs.iter().filter_map(|r| r.commit_hlc).collect();
@@ -120,7 +132,10 @@ fn the_clock_survives_a_backwards_wall_clock_step() {
     t.store(999_000, std::sync::atomic::Ordering::Relaxed);
     let b = clock.now();
     let c = clock.now();
-    assert!(b > a, "a backwards wall-clock step must not produce a smaller HLC: {a:?} -> {b:?}");
+    assert!(
+        b > a,
+        "a backwards wall-clock step must not produce a smaller HLC: {a:?} -> {b:?}"
+    );
     assert!(c > b, "and it must keep increasing: {b:?} -> {c:?}");
 }
 
@@ -167,7 +182,10 @@ fn a_restarted_clock_seeded_from_the_tip_does_not_reissue() {
 fn nothing_reads_the_commit_hlc_yet() {
     fn code_only(src: &str) -> String {
         src.lines()
-            .map(|l| match l.find("//") { Some(i) => &l[..i], None => l })
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }

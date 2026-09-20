@@ -74,10 +74,8 @@ fn a_replica_target_is_undeclared_unless_told_otherwise() {
 fn the_default_goal_leaves_the_region_check_inert() {
     // ⚠ The load-bearing default. Every deployment today declares no locality;
     // if `Zone` consulted the region check they would all fail to open.
-    let engine = L0EventLogEngine::open_replicated(
-        cfg(&unique_dir("zone-default")),
-        targets(&[None, None]),
-    );
+    let engine =
+        L0EventLogEngine::open_replicated(cfg(&unique_dir("zone-default")), targets(&[None, None]));
     assert!(
         engine.is_ok(),
         "an undeclared replica set must open unchanged under the default goal"
@@ -110,10 +108,7 @@ fn region_goal_refuses_an_undeclared_replica() {
         Ok(_) => panic!("an undeclared replica must be refused under the Region goal"),
         Err(e) => format!("{e}"),
     };
-    assert!(
-        msg.contains("survival goal 'region'"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("survival goal 'region'"), "got: {msg}");
 }
 
 #[test]
