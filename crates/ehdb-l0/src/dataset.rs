@@ -94,6 +94,19 @@ pub trait Dataset: 'static {
     fn assign_sort_key(record: Self::Record, _writer_seq: u64) -> Self::Record {
         record
     }
+
+    /// Stamp the commit HLC on a record at append time (M2).
+    ///
+    /// Default is a **no-op**, so a dataset with no HLC column is unaffected —
+    /// the same shape as [`assign_sort_key`](Self::assign_sort_key), which is
+    /// the established way this trait lets one dataset opt into engine
+    /// behaviour without changing the others.
+    ///
+    /// Placed on the DATASET rather than in the engine because the engine is
+    /// generic over `D` and cannot name a `D::Record` field. Stamping in the
+    /// engine would mean either a trait bound no other dataset can satisfy, or
+    /// a downcast.
+    fn stamp_commit_hlc(_record: &mut Self::Record, _hlc: u64) {}
 }
 
 /// **D1 — the event log** (`noetl.event`). Sort key = `global_sequence`;
@@ -123,6 +136,11 @@ impl Dataset for D1EventLog {
     /// (noetl-server) assigned snowflake ids that raced out of order under
     /// concurrent publish (noetl/ai-meta#203). The command's identity is carried
     /// in `execution_id` / the payload, not in this key.
+    /// D1 carries the HLC column, so it opts in.
+    fn stamp_commit_hlc(record: &mut EventRecord, hlc: u64) {
+        record.commit_hlc = Some(hlc);
+    }
+
     fn dedupe_key(record: &EventRecord) -> Option<&str> {
         record.event_id.as_deref()
     }
@@ -195,6 +213,24 @@ pub struct EventRecord {
     /// records that actually carry a key differ on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// **The commit HLC** (M2) — a hybrid logical timestamp stamped by the
+    /// writer at append.
+    ///
+    /// `None` for every record written before this field existed and for every
+    /// append under `NOETL_EHDB_HLC=off`, which is the default.
+    ///
+    /// ⚠⚠ **Nothing reads this, and that is the phase's exit criterion, not a
+    /// gap.** M2 ships the clock and the stamp; a reader appearing here before
+    /// M3's closed timestamps would be a phase-ordering violation. The value is
+    /// write-only on purpose.
+    ///
+    /// ⚠ `Option` + `skip_serializing_if` is load-bearing for the same reason
+    /// it is on [`EventRecord::event_id`]: a record without an HLC serialises
+    /// **byte-identically to today**, so a rollback binary keeps reading
+    /// everything written while the flag is off. Serialising `0` instead of
+    /// skipping would break that — it is planted defect #5 in the M2 spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_hlc: Option<u64>,
 }
 
 impl EventRecord {
@@ -211,6 +247,7 @@ impl EventRecord {
             transaction_id: transaction_id.into(),
             payload: payload.into(),
             event_id: None,
+            commit_hlc: None,
         }
     }
 

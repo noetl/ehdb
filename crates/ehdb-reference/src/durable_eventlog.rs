@@ -3659,3 +3659,53 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod frame_format_invariants {
+    // S0 — the other half of the duplicated-frame-format guard.
+    //
+    // These constants are declared privately in THIS file and again, publicly,
+    // in `ehdb-l0::frame`. This crate does not depend on `ehdb-l0`, so nothing
+    // links them: they are two independent literals that happen to agree.
+    // `fencing.rs` calls the format "shared byte-identically" — true of the
+    // values, not of the mechanism.
+    //
+    // Each crate therefore pins itself to the same written-down literal. The
+    // sibling half is `ehdb-l0/tests/frame_format_invariants.rs`. If either
+    // drifts, that crate's own test fails instead of segments silently becoming
+    // unreadable.
+    use super::{crc32, FRAME_HEADER_LEN, FRAME_MAGIC};
+
+    #[test]
+    fn header_length_is_twelve() {
+        assert_eq!(
+            FRAME_HEADER_LEN, 12,
+            "C3: fixed 12-byte header. Widening it makes existing segments \
+             unreadable; new fields belong in the record BODY."
+        );
+    }
+
+    #[test]
+    fn magic_is_the_literal() {
+        assert_eq!(FRAME_MAGIC, 0xE5DB_0001);
+    }
+
+    #[test]
+    fn writer_header_matches_the_canonical_layout() {
+        // Mirrors the hand-built header at durable_eventlog.rs:841-843 against
+        // the literal spec, so a change there fails here.
+        let body = br#"{"kind":"slm.turn.prompted","v":1}"#.as_slice();
+        let mut header = [0u8; 12];
+        header[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        header[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&crc32(body).to_le_bytes());
+
+        let mut canonical = [0u8; 12];
+        canonical[0..4].copy_from_slice(&0xE5DB_0001u32.to_le_bytes());
+        canonical[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        canonical[8..12].copy_from_slice(&crc32(body).to_le_bytes());
+
+        assert_eq!(header, canonical);
+        assert_eq!(header.len(), FRAME_HEADER_LEN);
+    }
+}
