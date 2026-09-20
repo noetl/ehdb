@@ -262,8 +262,7 @@ impl Policy {
                         .collect()
                 })
                 .unwrap_or(d.allowed_keychain_aliases),
-            catalog_prefix: std::env::var("NOETL_SLM_CATALOG_PREFIX")
-                .unwrap_or(d.catalog_prefix),
+            catalog_prefix: std::env::var("NOETL_SLM_CATALOG_PREFIX").unwrap_or(d.catalog_prefix),
         }
     }
 }
@@ -294,9 +293,15 @@ pub struct Admission {
 pub enum Decision {
     /// Mode is `off` — the proposal was not considered at all.
     NotConsidered,
-    Rejected { rule: RejectionRule, detail: String },
+    Rejected {
+        rule: RejectionRule,
+        detail: String,
+    },
     /// Passed every automatic gate but needs a human. **Not** admitted.
-    AwaitingApproval { carrier: CatalogCarrier, tool_kind: String },
+    AwaitingApproval {
+        carrier: CatalogCarrier,
+        tool_kind: String,
+    },
     Admitted(Admission),
 }
 
@@ -338,11 +343,7 @@ fn carrier(spec: &serde_json::Value, policy: &Policy) -> CatalogCarrier {
 
 /// Walk the spec for anything that reaches for a credential.
 fn credential_reach(spec: &serde_json::Value, policy: &Policy) -> Option<(RejectionRule, String)> {
-    fn walk(
-        v: &serde_json::Value,
-        policy: &Policy,
-        found: &mut Option<(RejectionRule, String)>,
-    ) {
+    fn walk(v: &serde_json::Value, policy: &Policy, found: &mut Option<(RejectionRule, String)>) {
         if found.is_some() {
             return;
         }
@@ -436,7 +437,9 @@ fn http_not_read_shaped(spec: &serde_json::Value, policy: &Policy) -> Option<Str
         .unwrap_or("")
         .to_ascii_lowercase();
     if !policy.http_allowed_hosts.iter().any(|h| h == &host) {
-        return Some(format!("host {host:?} is not on NOETL_SLM_HTTP_ALLOWED_HOSTS"));
+        return Some(format!(
+            "host {host:?} is not on NOETL_SLM_HTTP_ALLOWED_HOSTS"
+        ));
     }
     None
 }
@@ -465,7 +468,10 @@ pub fn admit(
 
     // 1 — shape
     if !spec.is_object() {
-        return reject(RejectionRule::Malformed, "proposal is not a JSON object".into());
+        return reject(
+            RejectionRule::Malformed,
+            "proposal is not a JSON object".into(),
+        );
     }
 
     // 2 — budget, before anything expensive
@@ -491,7 +497,10 @@ pub fn admit(
 
     // 5 — tool kind, then the human gate
     let Some(kind) = tool_kind_of(spec) else {
-        return reject(RejectionRule::MissingToolKind, "no tool.kind on the proposal".into());
+        return reject(
+            RejectionRule::MissingToolKind,
+            "no tool.kind on the proposal".into(),
+        );
     };
     // 5 — deny list. Terminal: NOT routed to the human gate, because a denied
     // kind must not be approvable into existence.
@@ -514,7 +523,10 @@ pub fn admit(
 
     if !allowed {
         return match policy.human_gate {
-            HumanGate::Required => Decision::AwaitingApproval { carrier, tool_kind: kind },
+            HumanGate::Required => Decision::AwaitingApproval {
+                carrier,
+                tool_kind: kind,
+            },
             HumanGate::Off => reject(
                 RejectionRule::ToolKindNotAllowed,
                 format!("tool kind {kind:?} is not allowed and the human gate is off"),

@@ -33,7 +33,12 @@ fn a_known_kind_round_trips() {
         model: model(),
         prompt: Body::Inline("hello".into()),
         prompt_digest: "sha256:aa".into(),
-        sampling: Some(Sampling { temperature: Some(0.0), top_p: None, seed: Some(7), max_tokens: None }),
+        sampling: Some(Sampling {
+            temperature: Some(0.0),
+            top_p: None,
+            seed: Some(7),
+            max_tokens: None,
+        }),
         source_event_ids: vec![1, 2, 3],
     });
     let bytes = serde_json::to_vec(&ev).expect("serialize");
@@ -65,7 +70,12 @@ fn unknown_optional_fields_on_a_known_kind_are_tolerated() {
     }"#;
     let parsed = SlmContextEvent::from_payload(newer).expect("added field must be tolerated");
     match parsed {
-        SlmContextEvent::TurnDegraded(TurnDegraded { reason, fallback, turn, .. }) => {
+        SlmContextEvent::TurnDegraded(TurnDegraded {
+            reason,
+            fallback,
+            turn,
+            ..
+        }) => {
             assert_eq!(reason, DegradeReason::ParseFailure);
             assert_eq!(fallback, Fallback::Escalate);
             assert_eq!(turn, 2);
@@ -97,11 +107,21 @@ fn absent_optionals_do_not_reach_the_wire() {
 
     // Scoped to the `model` object: a bare substring check is a false positive
     // here, because "prompt_digest" contains "digest".
-    let model_obj = value.get("model").and_then(|m| m.as_object()).expect("model object");
+    let model_obj = value
+        .get("model")
+        .and_then(|m| m.as_object())
+        .expect("model object");
     for absent in ["digest", "server", "api"] {
-        assert!(!model_obj.contains_key(absent), "model.{absent} leaked: {text}");
+        assert!(
+            !model_obj.contains_key(absent),
+            "model.{absent} leaked: {text}"
+        );
     }
-    assert_eq!(model_obj.len(), 2, "only family + variant should survive: {text}");
+    assert_eq!(
+        model_obj.len(),
+        2,
+        "only family + variant should survive: {text}"
+    );
 
     // Top-level optionals must vanish entirely, not serialise as null.
     for absent in ["sampling", "source_event_ids"] {

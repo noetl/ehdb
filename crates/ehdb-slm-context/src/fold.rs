@@ -32,7 +32,11 @@ pub enum FoldError {
     /// caller bug and make the fold's output depend on the caller's ordering.
     UnsortedInput { at: usize, prev: u64, got: u64 },
     /// An event belonging to a different execution. See C5.
-    ForeignExecution { at: usize, expected: String, got: String },
+    ForeignExecution {
+        at: usize,
+        expected: String,
+        got: String,
+    },
     /// A recognised payload that would not parse.
     Malformed { at: usize, detail: String },
 }
@@ -44,7 +48,10 @@ impl std::fmt::Display for FoldError {
                 write!(f, "events not ascending at index {at}: {prev} then {got}")
             }
             FoldError::ForeignExecution { at, expected, got } => {
-                write!(f, "event {at} belongs to execution {got}, folding {expected}")
+                write!(
+                    f,
+                    "event {at} belongs to execution {got}, folding {expected}"
+                )
             }
             FoldError::Malformed { at, detail } => write!(f, "event {at} malformed: {detail}"),
         }
@@ -184,7 +191,11 @@ pub fn fold(
     for (idx, (seq, payload)) in events.iter().enumerate() {
         if let Some(p) = prev_seq {
             if *seq <= p {
-                return Err(FoldError::UnsortedInput { at: idx, prev: p, got: *seq });
+                return Err(FoldError::UnsortedInput {
+                    at: idx,
+                    prev: p,
+                    got: *seq,
+                });
             }
         }
         prev_seq = Some(*seq);
@@ -196,7 +207,10 @@ pub fn fold(
         let parsed = match SlmContextEvent::from_payload(payload) {
             Ok(e) => e,
             Err(err) => {
-                return Err(FoldError::Malformed { at: idx, detail: err.to_string() });
+                return Err(FoldError::Malformed {
+                    at: idx,
+                    detail: err.to_string(),
+                });
             }
         };
 
@@ -248,7 +262,10 @@ pub fn fold(
                 ctx.budget.max_depth_seen = ctx.budget.max_depth_seen.max(e.depth);
             }
             SlmContextEvent::StepRejected(e) => {
-                ctx.rejected.push(Rejection { content_digest: e.content_digest, rule: e.rule });
+                ctx.rejected.push(Rejection {
+                    content_digest: e.content_digest,
+                    rule: e.rule,
+                });
             }
             SlmContextEvent::ContextSummarised(e) => {
                 ctx.summaries.push(Summary {
@@ -278,7 +295,12 @@ fn turn_slot(turns: &mut Vec<Turn>, turn: u32) -> &mut Turn {
     if let Some(pos) = turns.iter().position(|t| t.turn == turn) {
         return &mut turns[pos];
     }
-    turns.push(Turn { turn, prompted: None, completed: None, degraded: None });
+    turns.push(Turn {
+        turn,
+        prompted: None,
+        completed: None,
+        degraded: None,
+    });
     let last = turns.len() - 1;
     &mut turns[last]
 }

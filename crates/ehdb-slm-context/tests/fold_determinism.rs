@@ -4,7 +4,9 @@
 //! intermittently and is asserted once is a decorative check: it agrees with a
 //! `HashMap` about half the time.
 
-use ehdb_slm_context::event::{AdmitGate, Body, ModelRef, SlmContextEvent, TurnCompleted, TurnPrompted};
+use ehdb_slm_context::event::{
+    AdmitGate, Body, ModelRef, SlmContextEvent, TurnCompleted, TurnPrompted,
+};
 use ehdb_slm_context::fold::{fold, Budget, BudgetLimit, FoldError, CURRENT_FOLD_VERSION};
 
 const ITERS: usize = 64;
@@ -72,20 +74,35 @@ fn sample_log() -> Vec<(u64, Vec<u8>)> {
         (13, prompted(EXEC, 1)),
         (14, completed(EXEC, 1)),
         (15, admitted(EXEC, "sha256:s2", 0)),
-        (16, payload(serde_json::json!({"kind":"slm.turn.reflected","v":1}))), // unknown
+        (
+            16,
+            payload(serde_json::json!({"kind":"slm.turn.reflected","v":1})),
+        ), // unknown
     ]
 }
 
 #[test]
 fn same_prefix_same_context_across_many_runs() {
     let events = sample_log();
-    let first = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
+    let first = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold")
+    .canonical_bytes();
+    for i in 0..ITERS {
+        let again = fold(
+            EXEC,
+            &events,
+            u64::MAX,
+            CURRENT_FOLD_VERSION,
+            Budget::default(),
+        )
         .expect("fold")
         .canonical_bytes();
-    for i in 0..ITERS {
-        let again = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
-            .expect("fold")
-            .canonical_bytes();
         assert_eq!(first, again, "fold differed on iteration {i}");
     }
 }
@@ -105,26 +122,51 @@ fn up_to_seq_makes_it_a_prefix_fold() {
     let events = sample_log();
     let early = fold(EXEC, &events, 11, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
     assert_eq!(early.turns.len(), 1, "only turn 0 is within seq<=11");
-    assert!(early.rejected.is_empty(), "the rejection at seq 12 is beyond the prefix");
+    assert!(
+        early.rejected.is_empty(),
+        "the rejection at seq 12 is beyond the prefix"
+    );
 
-    let all = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let all = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(all.turns.len(), 2);
     assert_eq!(all.rejected.len(), 1);
 }
 
 #[test]
 fn rejections_are_retained_for_feedback() {
-    let ctx = fold(EXEC, &sample_log(), u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
-        .expect("fold");
+    let ctx = fold(
+        EXEC,
+        &sample_log(),
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(ctx.rejected.len(), 1);
     assert_eq!(ctx.rejected[0].rule, "tool_kind_not_allowed");
 }
 
 #[test]
 fn unknown_kinds_are_counted_not_dropped_silently() {
-    let ctx = fold(EXEC, &sample_log(), u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
-        .expect("fold");
-    assert_eq!(ctx.skipped_unknown, 1, "the future event kind must be visible as skipped");
+    let ctx = fold(
+        EXEC,
+        &sample_log(),
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
+    assert_eq!(
+        ctx.skipped_unknown, 1,
+        "the future event kind must be visible as skipped"
+    );
 }
 
 #[test]
@@ -135,7 +177,14 @@ fn turns_are_ordered_by_turn_number_not_arrival() {
         (2, prompted(EXEC, 0)),
         (3, prompted(EXEC, 1)),
     ];
-    let ctx = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let ctx = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     let order: Vec<u32> = ctx.turns.iter().map(|t| t.turn).collect();
     assert_eq!(order, vec![0, 1, 2]);
 }
@@ -143,7 +192,13 @@ fn turns_are_ordered_by_turn_number_not_arrival() {
 #[test]
 fn unsorted_input_is_refused_not_silently_sorted() {
     let events = vec![(5, prompted(EXEC, 0)), (4, prompted(EXEC, 1))];
-    match fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()) {
+    match fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    ) {
         Err(FoldError::UnsortedInput { at, prev, got }) => {
             assert_eq!((at, prev, got), (1, 5, 4));
         }
@@ -156,7 +211,13 @@ fn a_foreign_execution_is_refused() {
     // C5: global_sequence is per-engine. Folding a neighbour's context silently
     // would be worse than refusing.
     let events = vec![(1, prompted(EXEC, 0)), (2, prompted("exec-2", 0))];
-    match fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()) {
+    match fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    ) {
         Err(FoldError::ForeignExecution { at, expected, got }) => {
             assert_eq!(at, 1);
             assert_eq!(expected, EXEC);
@@ -172,7 +233,14 @@ fn budget_exhausts_on_generated_steps() {
     for i in 0..8u32 {
         events.push((i as u64 + 1, admitted(EXEC, &format!("sha256:{i}"), 0)));
     }
-    let ctx = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let ctx = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(ctx.budget.steps_admitted, 8);
     assert_eq!(ctx.budget.exhausted, Some(BudgetLimit::GeneratedSteps));
 }
@@ -180,7 +248,14 @@ fn budget_exhausts_on_generated_steps() {
 #[test]
 fn budget_exhausts_on_depth() {
     let events = vec![(1, admitted(EXEC, "sha256:a", 2))];
-    let ctx = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let ctx = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(ctx.budget.max_depth_seen, 2);
     assert_eq!(ctx.budget.exhausted, Some(BudgetLimit::Depth));
 }
@@ -191,7 +266,14 @@ fn budget_exhausts_on_turns() {
     for t in 0..16u32 {
         events.push((t as u64 + 1, prompted(EXEC, t)));
     }
-    let ctx = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let ctx = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(ctx.budget.turns_used, 16);
     assert_eq!(ctx.budget.exhausted, Some(BudgetLimit::Turns));
 }
@@ -199,7 +281,14 @@ fn budget_exhausts_on_turns() {
 #[test]
 fn admitted_gate_and_depth_survive_the_fold() {
     let events = vec![(1, admitted(EXEC, "sha256:a", 1))];
-    let ctx = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default()).expect("fold");
+    let ctx = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .expect("fold");
     assert_eq!(ctx.admitted.len(), 1);
     assert_eq!(ctx.admitted[0].gate, AdmitGate::Auto);
     assert_eq!(ctx.admitted[0].depth, 1);
@@ -210,12 +299,24 @@ fn the_fold_reads_no_clock() {
     // A time-dependent fold would differ across a slow run. Folding the same
     // input with a delay between must still match byte-for-byte.
     let events = sample_log();
-    let a = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
-        .unwrap()
-        .canonical_bytes();
+    let a = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .unwrap()
+    .canonical_bytes();
     std::thread::sleep(std::time::Duration::from_millis(25));
-    let b = fold(EXEC, &events, u64::MAX, CURRENT_FOLD_VERSION, Budget::default())
-        .unwrap()
-        .canonical_bytes();
+    let b = fold(
+        EXEC,
+        &events,
+        u64::MAX,
+        CURRENT_FOLD_VERSION,
+        Budget::default(),
+    )
+    .unwrap()
+    .canonical_bytes();
     assert_eq!(a, b);
 }
