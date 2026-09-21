@@ -8,7 +8,6 @@ members = [
     "crates/ehdb-reference",
     "crates/ehdb-retrieval",
     "crates/ehdb-service",
-    "crates/ehdb-signal-mesh",
     "crates/ehdb-slm-context",
     "crates/ehdb-storage",
     "crates/ehdb-stream",
