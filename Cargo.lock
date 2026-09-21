@@ -722,15 +722,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ehdb-signal-mesh"
-version = "0.1.0"
-dependencies = [
- "ehdb-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "ehdb-slm-context"
 version = "0.1.0"
 dependencies = [

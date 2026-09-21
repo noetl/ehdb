@@ -60,6 +60,13 @@ Future workspace areas include network services and NoETL integration
 surfaces. ⚠ **Analytical execution is not among them** — a new analytical view
 is a new projection, not a query engine (`docs/SCOPE.md`).
 
+### Moved out
+
+The A2A / ReAct **signal mesh** POC and its two design documents now live at
+<https://github.com/noetl/signal-mesh>, where they depend on `ehdb-core` as a
+library pinned at tag `v0.3.0`. They were a consumer of EHDB, never a part of
+it. See [`docs/moved/signal-mesh.md`](docs/moved/signal-mesh.md).
+
 ## Local Durability
 
 `ehdb-transaction` includes `LocalJsonlTransactionLog`, a reference

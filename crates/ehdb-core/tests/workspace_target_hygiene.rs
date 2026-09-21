@@ -8,7 +8,10 @@
 //!
 //! It happened here. `.gitignore` carries `**/[Bb]in/*` from the Visual Studio
 //! template, which matches Cargo's `src/bin/` convention, so
-//! `crates/ehdb-signal-mesh/src/bin/demo.rs` was silently excluded:
+//! `crates/ehdb-signal-mesh/src/bin/demo.rs` was silently excluded (that
+//! crate has since moved to `noetl/signal-mesh` — see
+//! `docs/moved/signal-mesh.md` — but the rule it tripped over lived in
+//! this repository's `.gitignore`, so the guard stays here):
 //!
 //! * the crate built locally, because the file was on disk;
 //! * `git add <dir>` skipped it **without a word**;
