@@ -52,6 +52,12 @@ bld/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*
+# ...but NOT Cargo's `src/bin/` convention. This rule comes from the Visual
+# Studio template and silently swallowed `crates/*/src/bin/*.rs`: the crate
+# built locally (the file was on disk), `git add` skipped it without a word,
+# and `git status` never showed it because ignored files are not listed. CI
+# caught it as "file does not exist" on the runner.
+!**/src/[Bb]in/*
 # Uncomment if you have tasks that rely on *.refresh files to move binaries
 # (https://github.com/github/gitignore/pull/3736)
 #!**/[Bb]in/*.refresh
