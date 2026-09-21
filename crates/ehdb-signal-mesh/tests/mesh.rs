@@ -270,3 +270,57 @@ fn the_mesh_is_off_unless_explicitly_armed() {
         assert!(!mesh_armed(Some(v)), "{v:?} must not arm");
     }
 }
+
+/// The mesh speaks the platform's read-consistency vocabulary, and refuses
+/// rather than approximating what it cannot evaluate.
+///
+/// ⚠ `ReadConsistency::Bounded` is in **milliseconds** and this POC's staleness
+/// is a **sequence gap**. The conversion is an explicit argument precisely
+/// because the units are not the same; a test that assumed they were would be
+/// asserting a type error into correctness.
+#[test]
+fn freshness_uses_the_platforms_read_consistency() {
+    use ehdb_core::plan::ReadConsistency;
+
+    let recs = vec![rec(1, "s", agg("a", 1.0, 1))];
+    // Requested watermark 5, log only reaches 1 => staleness 4.
+    let stale = fold(&recs, "s", 5).expect("folds");
+    assert_eq!(stale.staleness(), 4);
+
+    // Strong admits only a complete read.
+    assert!(matches!(
+        admits(&stale, ReadConsistency::Strong, 1),
+        Err(FreshnessRefusal::TooStale {
+            staleness: 4,
+            allowed: 0
+        })
+    ));
+    let fresh = fold(&recs, "s", 1).expect("folds");
+    assert!(
+        admits(&fresh, ReadConsistency::Strong, 1).is_ok(),
+        "complete read must pass"
+    );
+
+    // Bounded admits within budget and refuses beyond it — both sides, or a
+    // policy that always refused would satisfy the negative case alone.
+    let within = ReadConsistency::Bounded {
+        max_staleness_millis: 4,
+    };
+    assert!(admits(&stale, within, 1).is_ok());
+    let beyond = ReadConsistency::Bounded {
+        max_staleness_millis: 3,
+    };
+    assert!(matches!(
+        admits(&stale, beyond, 1),
+        Err(FreshnessRefusal::TooStale { allowed: 3, .. })
+    ));
+    // The exchange rate is load-bearing: the same budget at a different rate
+    // changes the verdict, which is why it is an argument and not a constant.
+    assert!(admits(&stale, beyond, 2).is_ok(), "3ms x 2 seq/ms = 6 >= 4");
+
+    // Exact needs a clock this POC does not have. Refused, not approximated.
+    assert_eq!(
+        admits(&stale, ReadConsistency::Exact { at_millis: 1 }, 1),
+        Err(FreshnessRefusal::ExactUnsupported)
+    );
+}

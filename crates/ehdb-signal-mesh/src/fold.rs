@@ -15,6 +15,8 @@
 //! bounded-staleness read in the multi-region work (`feat/mr-cluster-a`:
 //! `crates/ehdb-core/src/hlc.rs`), reduced to a single-engine sequence.
 
+use ehdb_core::plan::ReadConsistency;
+
 use crate::event::{MeshEvent, Record};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +145,89 @@ pub fn fold(records: &[Record], stream: &str, up_to_seq: u64) -> Result<TierCont
         }
     }
     Ok(ctx)
+}
+
+/// Whether a context is fresh enough to act on, under the platform's real
+/// read-consistency policy.
+///
+/// ⚠⚠ **The units differ, and that is stated rather than papered over.**
+/// [`ReadConsistency::Bounded`] carries `max_staleness_millis` — a wall-clock
+/// budget, because M3's closed timestamp is a time. This POC has **no clock**;
+/// its bound is a *sequence gap*. Reusing the millisecond field as if it were a
+/// sequence count would typecheck and be wrong.
+///
+/// So the conversion is explicit and one-way: the caller states how many
+/// sequence units it is willing to treat as one millisecond of budget. A real
+/// implementation would carry an HLC and call
+/// [`ehdb_l0::closed_timestamp::admits`] directly instead.
+///
+/// The enum itself is reused rather than re-declared, so the mesh speaks the
+/// platform's vocabulary — `strong` / `bounded` / `exact` — and a reader does
+/// not have to learn a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshnessRefusal {
+    /// The fold is further behind its watermark than the policy allows.
+    TooStale { staleness: u64, allowed: u64 },
+    /// `Exact` asks for a specific point in time, which a clockless POC cannot
+    /// evaluate. Refused rather than approximated.
+    ExactUnsupported,
+}
+
+impl std::fmt::Display for FreshnessRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FreshnessRefusal::TooStale { staleness, allowed } => {
+                write!(f, "staleness {staleness} exceeds the allowed {allowed}")
+            }
+            FreshnessRefusal::ExactUnsupported => {
+                write!(
+                    f,
+                    "ReadConsistency::Exact needs a clock this POC does not have"
+                )
+            }
+        }
+    }
+}
+
+/// Apply the platform's read-consistency policy to a folded context.
+///
+/// `seq_per_milli` is the caller's declared exchange rate between the POC's
+/// sequence gap and M3's millisecond budget. There is no correct universal
+/// value — which is the point of making it an argument rather than a constant.
+pub fn admits(
+    ctx: &TierContext,
+    consistency: ReadConsistency,
+    seq_per_milli: u64,
+) -> Result<(), FreshnessRefusal> {
+    match consistency {
+        // Strong does not consult a freshness budget at all — it is served by
+        // the owner and complete by construction. Same reasoning as
+        // `ehdb_l0::closed_timestamp::admits`.
+        ReadConsistency::Strong => {
+            if ctx.staleness() == 0 {
+                Ok(())
+            } else {
+                Err(FreshnessRefusal::TooStale {
+                    staleness: ctx.staleness(),
+                    allowed: 0,
+                })
+            }
+        }
+        ReadConsistency::Bounded {
+            max_staleness_millis,
+        } => {
+            let allowed = max_staleness_millis.saturating_mul(seq_per_milli);
+            if ctx.staleness() <= allowed {
+                Ok(())
+            } else {
+                Err(FreshnessRefusal::TooStale {
+                    staleness: ctx.staleness(),
+                    allowed,
+                })
+            }
+        }
+        ReadConsistency::Exact { .. } => Err(FreshnessRefusal::ExactUnsupported),
+    }
 }
 
 /// How a tier reduces what it sees to one number.

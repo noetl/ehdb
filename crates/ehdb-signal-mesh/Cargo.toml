@@ -6,6 +6,7 @@ publish = false
 description = "POC: tiered A2A/ReAct agent mesh over the EHDB event log (design/a2a-react-signal-mesh)"
 
 [dependencies]
+ehdb-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

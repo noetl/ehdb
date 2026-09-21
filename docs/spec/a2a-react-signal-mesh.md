@@ -1,6 +1,6 @@
 # A tiered A2A/ReAct agent mesh over the EHDB event log
 
-**Status:** design + POC · branch `design/a2a-react-signal-mesh` · not merged, not deployed
+**Status:** design + POC · **merged to `main`** · nothing enabled, nothing deployed
 **POC:** `crates/ehdb-signal-mesh/` (`cargo run -p ehdb-signal-mesh --bin signal-mesh-demo`)
 
 ## 1. The problem
@@ -31,9 +31,9 @@ exist cannot be checked by its reader.
 | `loop.spec.mode` + `iterator` | `test_simple_loop.yaml:33-37` |
 | Child-playbook invocation | `noetl/ops` `automation/boot.yaml:15-16` (`kind: playbook`, `path: setup/bootstrap.yaml`) |
 | `playbook` is a registered tool kind | `noetl/tools` `src/registry.rs:406` |
-| SLM context event model — 7 payload kinds, `Unknown` fallback | `noetl/ehdb@feat/slm-context-s1-s2-events-fold` `crates/ehdb-slm-context/src/event.rs:193-211` |
-| Pure fold `fold(events, up_to_seq, version)`, `canonical_bytes()`, `FoldError{UnsortedInput,ForeignExecution,Malformed}` | same branch `src/fold.rs:1-13,30-38,164,174` |
-| Multi-region primitives | `noetl/ehdb@feat/mr-cluster-a` — `crates/ehdb-core/src/hlc.rs` (188 L), `crates/ehdb-l0/src/membership.rs` (270 L), `placement.rs` (105 L) |
+| SLM context event model — 7 payload kinds, `Unknown` fallback | **now on `main`**: `crates/ehdb-slm-context/src/event.rs:193-211` |
+| Pure fold `fold(events, up_to_seq, version)`, `canonical_bytes()`, `FoldError{UnsortedInput,ForeignExecution,Malformed}` | **now on `main`**: `crates/ehdb-slm-context/src/fold.rs` |
+| Multi-region primitives | **now on `main`** (v0.3.0): `crates/ehdb-core/src/plan.rs`, `crates/ehdb-l0/src/closed_timestamp.rs`, `membership.rs`, `placement.rs` |
 | D1 event log / D6 vector datasets | `crates/ehdb-l0/src/dataset.rs` (`DATASET_D1_EVENT_LOG`), `src/vector.rs` (`DATASET_D6_VECTOR`) |
 
 ### ⚠ Corrections — including three of my own
@@ -67,6 +67,20 @@ adopt its vocabulary rather than invent a parallel one:
 
 The mesh's `up_to_seq` is the single-engine, sequence-valued form of the same
 idea: a read that names its bound instead of asking for "latest".
+
+**As merged, the POC wires to the real type** — `fold::admits` takes
+`ehdb_core::plan::ReadConsistency` (`Strong` / `Bounded` / `Exact`) rather than
+declaring a parallel vocabulary, so the mesh says `bounded` the way the rest of
+the platform does.
+
+⚠⚠ **The units are NOT the same, and the code says so rather than typechecking
+its way past it.** `ReadConsistency::Bounded` carries `max_staleness_millis` —
+wall-clock, because M3's closed timestamp is a time. The POC has **no clock**;
+its staleness is a *sequence gap*. So `admits` takes an explicit
+`seq_per_milli` exchange rate as an argument, and `Exact { at_millis }` is
+**refused** (`FreshnessRefusal::ExactUnsupported`) rather than approximated. A
+real implementation carries an HLC and calls
+`ehdb_l0::closed_timestamp::admits` directly.
 
 ### Framework citations
 
@@ -198,7 +212,7 @@ confident aggregate over a partial prefix.
 | `NOETL_SIGNAL_MESH` | *(unset)* = off | Master arm | unset |
 | `NOETL_SIGNAL_MESH_REASONER` | *(unset)* = deterministic | `ollama` selects a model-backed reasoner | unset |
 | `NOETL_SIGNAL_MESH_MAX_TIER` | `3` | Caps cascade depth | lower it |
-| `NOETL_EHDB_MAX_STALENESS_MS` | `0` | **M3's flag, reused** — refuse to emit above this staleness. ⚠ Do not invent a mesh-private staleness knob; a second name for one concept is a second thing to keep true. | raise it |
+| `NOETL_EHDB_READ_CONSISTENCY` / `NOETL_EHDB_MAX_STALENESS_MS` | `strong` / `0` | **M3's flags, reused.** The POC consumes the `ReadConsistency` *type*; it does not read these env vars itself. ⚠ No mesh-private staleness knob — a second name for one concept is a second thing to keep true. | n/a (POC reads neither) |
 
 Only the exact string `"true"` arms — the house convention (`seal_max_age`,
 fencing, the repair sweep).
@@ -241,6 +255,12 @@ Stated plainly, because a demo that runs is easy to over-read.
 7. **No playbook execution.** The noetl DSL mapping in §3 and §7 is a design
    claim grounded in cited fixtures, not something the POC runs.
 8. **No back-pressure or failure injection.** Every append succeeds.
+9. **The freshness wiring is a type reuse, not a time model.** `admits` speaks
+   `ReadConsistency`, but converts a millisecond budget to a sequence gap via a
+   caller-supplied rate. Nothing here validates that rate, and `Exact` is
+   refused outright. Do not read this as "the mesh implements M3".
+10. **Merging changed nothing at runtime.** The crate is additive and off by
+    default; no existing crate imports it, and no binary constructs a `Mesh`.
 
 ## 12. Staged plan
 
