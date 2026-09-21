@@ -3,6 +3,12 @@
 **Status:** design + POC · **merged to `main`** · nothing enabled, nothing deployed
 **POC:** `crates/ehdb-signal-mesh/` (`cargo run -p ehdb-signal-mesh --bin signal-mesh-demo`)
 
+📐 **Looking for the architecture overview?** This document is the
+implementation/proof spec — grounding, file:line evidence, and the POC. The
+team-facing blueprint is
+[`docs/architecture/a2a-signal-mesh-blueprint.md`](../architecture/a2a-signal-mesh-blueprint.md):
+diagram-forward, readable without opening any code.
+
 ## 1. The problem
 
 Thousands of devices emit thousands of signals. A hierarchy of agents reduces
