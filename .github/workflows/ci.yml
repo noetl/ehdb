@@ -13,6 +13,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --all --check
+      # Every declared build target must resolve to a git-TRACKED file.
+      #
+      # This runs BEFORE the full suite because it is the check that a
+      # developer's machine structurally cannot make: an ignored source is on
+      # disk locally, `git add` skips it silently, and `git status` never lists
+      # it. A clean checkout is the first place it can be seen -- which is here.
+      #
+      # `cargo test --workspace` below runs it too; this step exists so the
+      # failure is named and fast rather than buried in a full test run.
+      - name: Workspace target hygiene (declared targets are git-tracked)
+        run: cargo test -p ehdb-core --test workspace_target_hygiene -- --nocapture
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo bench --workspace --no-run
