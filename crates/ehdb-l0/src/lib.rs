@@ -135,7 +135,11 @@
 
 pub mod blob;
 pub mod bloom;
+pub mod cache_role;
 pub mod catalog;
+pub mod chain;
+pub mod chain_alt;
+pub mod chain_store_durable;
 pub mod closed_timestamp;
 pub mod columnar;
 pub mod command_queue;
@@ -162,6 +166,7 @@ pub mod registry;
 pub mod replica_targets;
 pub mod retention;
 pub mod runtime;
+pub mod store_role;
 pub mod substrate;
 pub mod unreplicated;
 pub mod vector;
