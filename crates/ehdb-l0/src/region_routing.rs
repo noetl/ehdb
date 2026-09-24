@@ -24,6 +24,13 @@ use crate::closed_timestamp::ClosedTimestamp;
 /// Env var selecting read routing.
 pub const READ_LOCALITY_ENV: &str = "NOETL_EHDB_READ_LOCALITY";
 
+/// `NOETL_EHDB_READ_CONSISTENCY` — `strong` (default) | `bounded` | `exact`.
+pub const READ_CONSISTENCY_ENV: &str = "NOETL_EHDB_READ_CONSISTENCY";
+
+/// `NOETL_EHDB_MAX_STALENESS_MS` — the millisecond bound for `bounded`, and
+/// the timestamp for `exact`. Required by both; meaningless for `strong`.
+pub const MAX_STALENESS_MS_ENV: &str = "NOETL_EHDB_MAX_STALENESS_MS";
+
 /// Where a read may be served from.
 /// Which replica a read may be served from.
 ///
@@ -37,6 +44,30 @@ pub use ehdb_core::plan::ReadLocality;
 /// ⚠ A free function for the same reason as [`crate::placement::locality_from_env`].
 pub fn read_locality_from_env() -> ReadLocality {
     ReadLocality::parse(std::env::var(READ_LOCALITY_ENV).ok().as_deref())
+}
+
+/// ⭐ Re-exported, not redefined — same reason as [`ReadLocality`].
+pub use ehdb_core::plan::ReadConsistency;
+
+/// Read [`ReadConsistency`] from [`READ_CONSISTENCY_ENV`] +
+/// [`MAX_STALENESS_MS_ENV`].
+///
+/// ⚠ Returns `Result`, unlike [`read_locality_from_env`]. A malformed
+/// *relaxation* must not silently become the strict default — see
+/// [`ReadConsistency::parse`]. Unset stays `Strong`, which is today's
+/// behaviour, so a deployment that sets nothing is unaffected by this existing.
+///
+/// ⚠⚠ **This is the ONLY place the two variables are read.** They were cited
+/// as existing platform knobs in downstream design docs for weeks while
+/// occurring **zero** times in this repo — the type and the resolvers were
+/// real and nothing wired configuration to them. `env_read_sites` in
+/// `tests/read_consistency_env.rs` fails the build if a second reader appears,
+/// because two readers is how one of them drifts.
+pub fn read_consistency_from_env() -> Result<ReadConsistency, String> {
+    ReadConsistency::parse(
+        std::env::var(READ_CONSISTENCY_ENV).ok().as_deref(),
+        std::env::var(MAX_STALENESS_MS_ENV).ok().as_deref(),
+    )
 }
 
 /// A replica a read could be served from (spec M6 shape).
