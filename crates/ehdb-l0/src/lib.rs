@@ -136,6 +136,7 @@
 pub mod blob;
 pub mod bloom;
 pub mod catalog;
+pub mod chain;
 pub mod closed_timestamp;
 pub mod columnar;
 pub mod command_queue;
