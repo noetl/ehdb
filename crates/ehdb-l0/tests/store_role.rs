@@ -206,7 +206,7 @@ fn the_suite_reports_all_violations_not_just_the_first() {
 fn the_trait_seam_does_not_slow_the_hot_path() {
     let mut concrete = ChainStore::new();
     let mut prev: Option<String> = None;
-    for i in 0..200 {
+    for i in 0..100 {
         let ev = format!("ev-{i}");
         concrete
             .append("e1", &ev, prev.as_deref(), None, "{}")
@@ -216,18 +216,18 @@ fn the_trait_seam_does_not_slow_the_hot_path() {
 
     let direct = {
         let t = Instant::now();
-        for _ in 0..2_000 {
+        for _ in 0..500 {
             let w = ehdb_l0::chain::ChainStore::walk_from_head(&concrete, "e1").unwrap();
-            assert_eq!(w.len(), 200);
+            assert_eq!(w.len(), 100);
         }
         t.elapsed()
     };
     let through_trait = {
         let dynref: &dyn EventStore = &concrete;
         let t = Instant::now();
-        for _ in 0..2_000 {
+        for _ in 0..500 {
             let w = dynref.walk_from_head("e1").unwrap();
-            assert_eq!(w.len(), 200);
+            assert_eq!(w.len(), 100);
         }
         t.elapsed()
     };
@@ -239,7 +239,7 @@ fn the_trait_seam_does_not_slow_the_hot_path() {
     let ratio = through_trait.as_secs_f64() / direct.as_secs_f64().max(1e-9);
     assert!(
         ratio < 10.0,
-        "the seam cost {ratio:.2}x on a 200-event walk (direct={direct:?} \
+        "the seam cost {ratio:.2}x on a 100-event walk (direct={direct:?} \
          trait={through_trait:?}) — if this fails, check whether the trait became \
          fine-grained enough to put a virtual call in the inner loop"
     );

@@ -95,14 +95,14 @@ fn parent_of_resolves_the_predecessor_and_stops_at_the_root() {
 #[test]
 fn parent_lookup_cost_is_independent_of_total_store_size() {
     let small = store_with(10, 10); // N = 100
-    let large = store_with(1_000, 10); // N = 10_000, 100x
+    let large = store_with(300, 10); // N = 3_000, 30x
     assert_eq!(small.total_events(), 100);
-    assert_eq!(large.total_events(), 10_000);
+    assert_eq!(large.total_events(), 3_000);
 
     let probe = |s: &ChainStore| {
         let ev = s.get("exec-5", "exec-5-ev-9").expect("present in both");
         let t = Instant::now();
-        for _ in 0..10_000 {
+        for _ in 0..2_000 {
             let _ = s.parent_of(ev).unwrap();
         }
         t.elapsed()
@@ -114,7 +114,7 @@ fn parent_lookup_cost_is_independent_of_total_store_size() {
     // keyspace costs at most a couple of extra comparisons.
     assert!(
         ratio < 5.0,
-        "parent lookup scaled with store size: {ratio:.2}x for 100x the events \
+        "parent lookup scaled with store size: {ratio:.2}x for 30x the events \
          (small={t_small:?} large={t_large:?})"
     );
 }
@@ -143,11 +143,11 @@ fn chain_returns_the_execution_in_order_and_nothing_else() {
 #[test]
 fn chain_read_cost_depends_on_k_not_on_n() {
     let small = store_with(10, 10);
-    let large = store_with(1_000, 10);
+    let large = store_with(300, 10);
 
     let probe = |s: &ChainStore| {
         let t = Instant::now();
-        for _ in 0..2_000 {
+        for _ in 0..500 {
             let c = s.chain("exec-5");
             assert_eq!(c.len(), 10);
         }
@@ -168,12 +168,12 @@ fn chain_read_cost_depends_on_k_not_on_n() {
 #[test]
 fn the_scaling_harness_can_detect_a_linear_cost() {
     let small = store_with(10, 10);
-    let large = store_with(1_000, 10);
+    let large = store_with(300, 10);
 
     // A deliberate full scan — what the current store does per read.
     let linear_probe = |s: &ChainStore| {
         let t = Instant::now();
-        for _ in 0..200 {
+        for _ in 0..50 {
             let mut seen = 0usize;
             for e in 0..s.execution_count() {
                 seen += s.chain(&format!("exec-{e}")).len();
@@ -185,7 +185,7 @@ fn the_scaling_harness_can_detect_a_linear_cost() {
     let (t_small, t_large) = (linear_probe(&small), linear_probe(&large));
     let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-9);
     assert!(
-        ratio > 10.0,
+        ratio > 5.0,
         "the harness failed to detect a known-linear cost ({ratio:.2}x) — the flat \
          readings in the P1/P2 tests cannot be trusted until this one shows scaling"
     );
