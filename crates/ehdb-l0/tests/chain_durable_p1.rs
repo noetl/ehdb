@@ -450,3 +450,93 @@ fn appending_a_duplicate_event_id_is_refused() {
     assert_eq!(store.chain("e1").unwrap().len(), 1);
     assert_eq!(store.head("e1").unwrap().as_deref(), Some("a"));
 }
+
+// ---------------------------------------------------------------------------
+// Increment 5: the durable store behind the EventStore seam.
+// ---------------------------------------------------------------------------
+
+use ehdb_l0::store_role::{conformance, open_event_store, Backend, EventStore, StorageRole};
+
+/// ⭐⭐ **The same conformance suite, against the durable backend.**
+///
+/// This is what makes the contract a specification rather than a description of
+/// one implementation: if the durable store needed a weaker suite, the suite
+/// would be describing an implementation.
+#[test]
+fn the_durable_store_passes_the_same_eventstore_conformance_suite() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = LocalFsSubstrate::new(dir.path()).expect("substrate");
+    let mut store = DurableChainStore::new(Arc::new(fs) as Arc<dyn DurableSubstrate>);
+    let v = conformance::run(&mut store);
+    assert!(
+        v.is_empty(),
+        "the durable store must satisfy the same clauses as the in-memory one: {v:#?}"
+    );
+    assert_eq!(EventStore::backend_name(&store), "ehdb-durable");
+}
+
+/// ⭐ **The seam now resolves to a working store, not to a name.**
+/// `open_event_store` is what increment 3 lacked: the registry had a `Backend`
+/// enum and no way to obtain an instance.
+#[test]
+fn the_default_eventlog_role_resolves_to_the_durable_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open_event_store(StorageRole::EventLog, None, dir.path())
+        .expect("the default must resolve");
+    assert_eq!(
+        store.backend_name(),
+        "ehdb-durable",
+        "the default EventLog backend must be the DURABLE store, not the in-memory one"
+    );
+    // And it is genuinely usable through the trait.
+    store.append("e1", "a", None, None, "{}").expect("append");
+    assert_eq!(store.chain("e1").unwrap().len(), 1);
+}
+
+/// The factory honours the access guard: a remote backend is refused for
+/// EventLog rather than instantiated.
+#[test]
+fn the_factory_refuses_a_remote_backend_for_the_eventlog_role() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        open_event_store(
+            StorageRole::EventLog,
+            Some(Backend::CloudflareKv),
+            dir.path()
+        )
+        .is_err(),
+        "the factory must not hand back a store the access guard forbids"
+    );
+    assert!(open_event_store(
+        StorageRole::EventLog,
+        Some(Backend::CloudflareDurableObject),
+        dir.path()
+    )
+    .is_err());
+}
+
+/// ⚠ Control: the factory's refusals are not blanket. An explicitly requested
+/// in-region alternative still instantiates.
+#[test]
+fn the_factory_still_builds_an_explicitly_requested_in_region_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let js = open_event_store(StorageRole::EventLog, Some(Backend::JetStream), dir.path())
+        .expect("jetstream is in-region and must instantiate");
+    assert_eq!(js.backend_name(), "jetstream-sketch");
+}
+
+/// Data written through the trait is readable on a reopen — the seam did not
+/// quietly hand back something in-memory.
+#[test]
+fn data_written_through_the_seam_is_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut store = open_event_store(StorageRole::EventLog, None, dir.path()).expect("open");
+        store.append("e1", "a", None, None, "{}").unwrap();
+        store.append("e1", "b", Some("a"), None, "{}").unwrap();
+    }
+    let reopened = open_event_store(StorageRole::EventLog, None, dir.path()).expect("reopen");
+    let chain = reopened.chain("e1").expect("chain");
+    assert_eq!(chain.len(), 2, "the seam must resolve to a DURABLE store");
+    assert_eq!(chain[1].event_id, "b");
+}

@@ -293,3 +293,85 @@ impl DurableChainStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// The seam: DurableChainStore behind EventStore.
+// ---------------------------------------------------------------------------
+
+/// **The durable store behind the role interface** (RFC §12).
+///
+/// Increment 3 implemented [`EventStore`](crate::store_role::EventStore) on the
+/// in-memory [`ChainStore`](crate::chain::ChainStore), which made the seam real
+/// but left it resolving to a store with no disk. This is the impl the
+/// EventLog role should actually get: the same contract, on the op-counted
+/// durable layout above.
+///
+/// ⚠ Note what does **not** change: the conformance suite. The same clauses run
+/// against both backends, which is the point of having a contract — if the
+/// durable store needed its own weaker suite, the suite would be describing an
+/// implementation rather than specifying a role.
+impl crate::store_role::EventStore for DurableChainStore {
+    fn backend_name(&self) -> &'static str {
+        "ehdb-durable"
+    }
+
+    fn append(
+        &mut self,
+        execution_id: &str,
+        event_id: &str,
+        prev_event_id: Option<&str>,
+        parent_execution_id: Option<&str>,
+        payload: &str,
+    ) -> std::result::Result<ExecSeq, ChainError> {
+        DurableChainStore::append(
+            self,
+            execution_id,
+            event_id,
+            prev_event_id,
+            parent_execution_id,
+            payload,
+        )
+    }
+
+    fn get(
+        &self,
+        execution_id: &str,
+        event_id: &str,
+    ) -> std::result::Result<Option<ChainEvent>, ChainError> {
+        DurableChainStore::get(self, execution_id, event_id)
+            .map_err(|e| ChainError::Invalid(e.to_string()))
+    }
+
+    fn parent_of(&self, event: &ChainEvent) -> std::result::Result<Option<ChainEvent>, ChainError> {
+        DurableChainStore::parent_of(self, event)
+    }
+
+    fn chain(&self, execution_id: &str) -> std::result::Result<Vec<ChainEvent>, ChainError> {
+        DurableChainStore::chain(self, execution_id).map_err(|e| ChainError::Invalid(e.to_string()))
+    }
+
+    fn walk_from_head(
+        &self,
+        execution_id: &str,
+    ) -> std::result::Result<Vec<ChainEvent>, ChainError> {
+        DurableChainStore::walk_from_head(self, execution_id)
+    }
+
+    fn chain_is_complete(&self, execution_id: &str) -> std::result::Result<bool, ChainError> {
+        DurableChainStore::chain_is_complete(self, execution_id)
+    }
+
+    fn parent_execution_of(
+        &self,
+        execution_id: &str,
+    ) -> std::result::Result<Option<String>, ChainError> {
+        Ok(DurableChainStore::chain(self, execution_id)
+            .map_err(|e| ChainError::Invalid(e.to_string()))?
+            .first()
+            .and_then(|e| e.parent_execution_id.clone()))
+    }
+
+    fn apply_replicated(&mut self, event: ChainEvent) -> std::result::Result<(), ChainError> {
+        DurableChainStore::apply_replicated(self, event)
+    }
+}

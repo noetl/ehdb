@@ -429,6 +429,41 @@ impl EventStore for ChainStore {
     }
 }
 
+/// **Open the EventStore for a role** — what the seam actually resolves to.
+///
+/// ⚠ Increment 3 gave the registry a `Backend` *enum* and no way to get an
+/// instance, which meant "the seam resolves to EHDB" was still a statement
+/// about a name. This is the factory: a caller asks for a role and receives a
+/// working store or a refusal.
+///
+/// `root` is the durable substrate root for the EHDB backend; other backends
+/// ignore it.
+pub fn open_event_store(
+    role: StorageRole,
+    explicit: Option<Backend>,
+    root: &std::path::Path,
+) -> std::result::Result<Box<dyn EventStore>, SelectionError> {
+    let backend = resolve_backend_checked(role, explicit)?;
+    match backend {
+        // ⭐ The default resolves to the DURABLE store, not the in-memory one.
+        Backend::Ehdb => {
+            let fs = crate::substrate::LocalFsSubstrate::new(root)
+                .expect("local substrate root must be creatable");
+            Ok(Box::new(
+                crate::chain_store_durable::DurableChainStore::new(std::sync::Arc::new(fs)),
+            ))
+        }
+        Backend::Stub => Ok(Box::new(crate::chain_alt::StubEventStore)),
+        Backend::JetStream => Ok(Box::new(crate::chain_alt::JetStreamSketchEventStore::new())),
+        // Everything else is either not an EventStore backend or is refused by
+        // `resolve_backend_checked` above before reaching here.
+        other => Err(SelectionError::RemoteNotAllowed {
+            role: role.label(),
+            backend: other.label(),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conformance
 // ---------------------------------------------------------------------------
