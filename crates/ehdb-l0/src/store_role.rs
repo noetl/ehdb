@@ -56,6 +56,9 @@ pub enum StorageRole {
     Projection,
     /// Internal noetl execution-context management.
     Context,
+    /// Ephemeral cache. Eventually consistent by nature; no ordering, no
+    /// read-your-writes, and losing an entry is a miss rather than a fault.
+    Cache,
     Kv,
     Object,
     Vector,
@@ -65,10 +68,11 @@ impl StorageRole {
     /// Every role. Closed array so a new role fails to compile here rather than
     /// silently going unconfigurable — and so the metric that labels by role
     /// can pin every value at 0.
-    pub const ALL: [StorageRole; 6] = [
+    pub const ALL: [StorageRole; 7] = [
         StorageRole::EventLog,
         StorageRole::Projection,
         StorageRole::Context,
+        StorageRole::Cache,
         StorageRole::Kv,
         StorageRole::Object,
         StorageRole::Vector,
@@ -79,6 +83,7 @@ impl StorageRole {
             Self::EventLog => "eventlog",
             Self::Projection => "projection",
             Self::Context => "context",
+            Self::Cache => "cache",
             Self::Kv => "kv",
             Self::Object => "object",
             Self::Vector => "vector",
@@ -91,6 +96,7 @@ impl StorageRole {
             Self::EventLog => "NOETL_STORE_EVENTLOG",
             Self::Projection => "NOETL_STORE_PROJECTION",
             Self::Context => "NOETL_STORE_CONTEXT",
+            Self::Cache => "NOETL_STORE_CACHE",
             Self::Kv => "NOETL_STORE_KV",
             Self::Object => "NOETL_STORE_OBJECT",
             Self::Vector => "NOETL_STORE_VECTOR",
@@ -109,6 +115,21 @@ pub enum Backend {
     CockroachKv,
     Postgres,
     Redis,
+    Gcs,
+    /// **Cloudflare KV.** Reached from GKE over the **REST API** — the same
+    /// path the noetl.ai waitlist already uses. Eventually consistent,
+    /// sub-20ms *cached* reads.
+    CloudflareKv,
+    /// **Cloudflare D1.** SQL, single-region strong, reached over its **HTTP
+    /// query API**.
+    CloudflareD1,
+    /// **Cloudflare R2.** Object storage over the **S3-compatible API**.
+    CloudflareR2,
+    /// **Cloudflare Durable Objects.** One DO per `execution_id` is the
+    /// per-execution single-writer ordered log this whole RFC is shaped around
+    /// — but it is reachable **only via a native binding from a Worker**.
+    /// See [`AccessMode::EdgeNative`].
+    CloudflareDurableObject,
     /// ⚠ A deliberately non-conforming backend, mirroring ops#311's
     /// `vertex-stub`. It exists so the conformance suite can be shown to
     /// **reject** something. A suite that passes everything proves nothing.
@@ -123,6 +144,11 @@ impl Backend {
             Self::CockroachKv => "cockroach-kv",
             Self::Postgres => "postgres",
             Self::Redis => "redis",
+            Self::Gcs => "gcs",
+            Self::CloudflareKv => "cloudflare-kv",
+            Self::CloudflareD1 => "d1",
+            Self::CloudflareR2 => "r2",
+            Self::CloudflareDurableObject => "durable-object",
             Self::Stub => "stub",
         }
     }
@@ -136,10 +162,151 @@ impl Backend {
             Some("cockroach-kv") | Some("cockroach_kv") => Self::CockroachKv,
             Some("postgres") => Self::Postgres,
             Some("redis") => Self::Redis,
+            Some("gcs") => Self::Gcs,
+            Some("cloudflare-kv") | Some("cloudflare_kv") | Some("cfkv") => Self::CloudflareKv,
+            Some("d1") | Some("cloudflare-d1") => Self::CloudflareD1,
+            Some("r2") | Some("cloudflare-r2") => Self::CloudflareR2,
+            Some("durable-object") | Some("do") => Self::CloudflareDurableObject,
             Some("stub") => Self::Stub,
             _ => Self::Ehdb,
         }
     }
+}
+
+/// **How a backend is reached** — and therefore what latency it imposes.
+///
+/// ⚠ This is the load-bearing distinction for the Cloudflare backends, and it
+/// is why they are not interchangeable with EHDB across all roles. From the GKE
+/// backend, Cloudflare KV / D1 / R2 are reached over their **remote APIs** —
+/// the KV REST API (the path the noetl.ai waitlist already uses), D1's HTTP
+/// query API, R2's S3-compatible API — **not** native bindings. Every call is
+/// an internet round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// Same cluster / same region. Sub-millisecond, and the only thing an
+    /// O(1)-per-event hot path can sit on.
+    InRegion,
+    /// Reached over a remote HTTP/S3 API from GKE. Tens of milliseconds at
+    /// best, and subject to internet variance.
+    RemoteApi,
+    /// Reachable **only** via a native binding from inside a Cloudflare Worker.
+    /// Unavailable to any GKE-hosted component, at any latency.
+    EdgeNative,
+}
+
+impl AccessMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InRegion => "in-region",
+            Self::RemoteApi => "remote-api",
+            Self::EdgeNative => "edge-native",
+        }
+    }
+}
+
+impl Backend {
+    /// How this backend is reached **from the GKE backend**.
+    pub fn access_mode(&self) -> AccessMode {
+        match self {
+            Self::Ehdb | Self::JetStream | Self::CockroachKv | Self::Postgres | Self::Redis => {
+                AccessMode::InRegion
+            }
+            Self::Gcs => AccessMode::InRegion,
+            Self::CloudflareKv | Self::CloudflareD1 | Self::CloudflareR2 => AccessMode::RemoteApi,
+            Self::CloudflareDurableObject => AccessMode::EdgeNative,
+            Self::Stub => AccessMode::InRegion,
+        }
+    }
+}
+
+impl StorageRole {
+    /// Whether this role can tolerate a remote round trip per operation.
+    ///
+    /// ⭐ **`EventLog` cannot, and that is a hard property rather than a
+    /// preference.** Its contract is an O(1) predecessor fetch on the execution
+    /// hot path; putting an internet round trip there would reintroduce exactly
+    /// the latency the restructure exists to remove, only sourced from the
+    /// network instead of from a replay. The other roles are latency-tolerant:
+    /// a cache miss, a projection read and a context blob fetch are all already
+    /// off the per-event path.
+    pub fn tolerates_remote(&self) -> bool {
+        !matches!(self, Self::EventLog)
+    }
+}
+
+/// Why a role/backend pairing was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionError {
+    /// The role's hot path cannot absorb a remote round trip.
+    RemoteNotAllowed {
+        role: &'static str,
+        backend: &'static str,
+    },
+    /// The backend needs a native binding this process does not have.
+    EdgeOnly {
+        role: &'static str,
+        backend: &'static str,
+    },
+}
+
+impl SelectionError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::RemoteNotAllowed { role, backend } => format!(
+                "backend '{backend}' is reached over a remote API and cannot serve role \
+                 '{role}': that role's contract includes an O(1) predecessor fetch on the \
+                 execution hot path, and an internet round trip there reintroduces the \
+                 latency the redesign removes. Keep the event chain on an in-region \
+                 backend (ehdb, jetstream); put Cloudflare backends on \
+                 cache/projection/context/object."
+            ),
+            Self::EdgeOnly { role, backend } => format!(
+                "backend '{backend}' is reachable only via a native binding from a \
+                 Cloudflare Worker, so it cannot serve role '{role}' from a GKE-hosted \
+                 component. It is available only to components actually running at the \
+                 edge (the console/edge tier)."
+            ),
+        }
+    }
+}
+
+/// Validate a role/backend pairing for a **GKE-hosted** component.
+///
+/// ⭐ Refuses rather than silently falling back. A silent fallback to `ehdb`
+/// would leave the flag looking taken while changing nothing — and an operator
+/// who set `NOETL_STORE_EVENTLOG=cloudflare-kv` needs to learn that it is
+/// wrong, not have it quietly ignored.
+pub fn validate_selection(
+    role: StorageRole,
+    backend: Backend,
+) -> std::result::Result<(), SelectionError> {
+    match backend.access_mode() {
+        AccessMode::InRegion => Ok(()),
+        AccessMode::EdgeNative => Err(SelectionError::EdgeOnly {
+            role: role.label(),
+            backend: backend.label(),
+        }),
+        AccessMode::RemoteApi => {
+            if role.tolerates_remote() {
+                Ok(())
+            } else {
+                Err(SelectionError::RemoteNotAllowed {
+                    role: role.label(),
+                    backend: backend.label(),
+                })
+            }
+        }
+    }
+}
+
+/// Resolve **and validate**. The form a GKE component should call.
+pub fn resolve_backend_checked(
+    role: StorageRole,
+    explicit: Option<Backend>,
+) -> std::result::Result<Backend, SelectionError> {
+    let b = resolve_backend(role, explicit);
+    validate_selection(role, b)?;
+    Ok(b)
 }
 
 /// Resolve a role's backend. Precedence, exactly ops#311's:

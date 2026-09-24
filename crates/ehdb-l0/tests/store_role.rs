@@ -260,3 +260,206 @@ fn both_backends_are_usable_through_the_same_trait_object() {
     }
     assert_eq!(names, vec!["ehdb", "jetstream-sketch"]);
 }
+
+// ---------------------------------------------------------------------------
+// Cloudflare backends: access mode is ENFORCED, not documented.
+// ---------------------------------------------------------------------------
+
+use ehdb_l0::cache_role::{
+    conformance as cache_conformance, AlwaysMissCache, BrokenCache, CacheStore,
+    CloudflareKvCacheSketch, EhdbCache,
+};
+use ehdb_l0::store_role::{
+    resolve_backend_checked, validate_selection, AccessMode, SelectionError,
+};
+
+#[test]
+fn cloudflare_backends_parse_including_aliases() {
+    assert_eq!(Backend::parse(Some("cloudflare-kv")), Backend::CloudflareKv);
+    assert_eq!(Backend::parse(Some("cfkv")), Backend::CloudflareKv);
+    assert_eq!(Backend::parse(Some("d1")), Backend::CloudflareD1);
+    assert_eq!(Backend::parse(Some("r2")), Backend::CloudflareR2);
+    assert_eq!(Backend::parse(Some("do")), Backend::CloudflareDurableObject);
+    assert_eq!(Backend::parse(Some("gcs")), Backend::Gcs);
+}
+
+/// From GKE, Cloudflare KV/D1/R2 are remote APIs; DO is not reachable at all.
+#[test]
+fn access_modes_reflect_how_a_gke_component_actually_reaches_each_backend() {
+    assert_eq!(Backend::Ehdb.access_mode(), AccessMode::InRegion);
+    assert_eq!(Backend::JetStream.access_mode(), AccessMode::InRegion);
+    for remote in [
+        Backend::CloudflareKv,
+        Backend::CloudflareD1,
+        Backend::CloudflareR2,
+    ] {
+        assert_eq!(
+            remote.access_mode(),
+            AccessMode::RemoteApi,
+            "{} is reached over a remote API from GKE",
+            remote.label()
+        );
+    }
+    assert_eq!(
+        Backend::CloudflareDurableObject.access_mode(),
+        AccessMode::EdgeNative,
+        "a DO needs a native Worker binding"
+    );
+}
+
+/// ⭐⭐ The guard that makes the latency rule real rather than advisory.
+/// `NOETL_STORE_EVENTLOG=cloudflare-kv` must be REFUSED, loudly — not silently
+/// defaulted back to ehdb, which would leave the flag looking taken.
+#[test]
+fn a_remote_backend_is_refused_for_the_eventlog_role() {
+    for remote in [
+        Backend::CloudflareKv,
+        Backend::CloudflareD1,
+        Backend::CloudflareR2,
+    ] {
+        let err = validate_selection(StorageRole::EventLog, remote)
+            .expect_err("the event chain hot path cannot absorb a round trip");
+        assert!(matches!(err, SelectionError::RemoteNotAllowed { .. }));
+        let m = err.message();
+        assert!(m.contains("hot path"), "{m}");
+        assert!(
+            m.contains("in-region"),
+            "must say where the chain belongs: {m}"
+        );
+    }
+}
+
+/// ⚠ Control: the same backends are ACCEPTED on the latency-tolerant roles.
+/// Without this, "refuses remote" could be satisfied by refusing everything.
+#[test]
+fn the_same_remote_backends_are_accepted_on_latency_tolerant_roles() {
+    for role in [
+        StorageRole::Cache,
+        StorageRole::Projection,
+        StorageRole::Context,
+        StorageRole::Object,
+    ] {
+        assert!(
+            validate_selection(role, Backend::CloudflareKv).is_ok(),
+            "{} should accept a remote backend",
+            role.label()
+        );
+    }
+    assert!(validate_selection(StorageRole::Projection, Backend::CloudflareD1).is_ok());
+    assert!(validate_selection(StorageRole::Object, Backend::CloudflareR2).is_ok());
+    assert!(validate_selection(StorageRole::Context, Backend::CloudflareR2).is_ok());
+}
+
+/// A Durable Object is refused for EVERY role from GKE — including the one
+/// whose shape it matches best. That is the point: right model, wrong host.
+#[test]
+fn a_durable_object_is_refused_for_every_role_from_gke() {
+    for role in StorageRole::ALL {
+        let err = validate_selection(role, Backend::CloudflareDurableObject)
+            .expect_err("no native binding outside a Worker");
+        assert!(matches!(err, SelectionError::EdgeOnly { .. }));
+        assert!(err.message().contains("edge"), "{}", err.message());
+    }
+}
+
+#[test]
+fn resolve_backend_checked_refuses_an_incompatible_flag() {
+    let role = StorageRole::EventLog;
+    let prev = std::env::var(role.env_var()).ok();
+    unsafe { std::env::set_var(role.env_var(), "cloudflare-kv") };
+    assert!(
+        resolve_backend_checked(role, None).is_err(),
+        "an incompatible flag must ERROR, not silently fall back to ehdb"
+    );
+    // The default remains fine.
+    unsafe { std::env::remove_var(role.env_var()) };
+    assert_eq!(resolve_backend_checked(role, None), Ok(Backend::Ehdb));
+    if let Some(v) = prev {
+        unsafe { std::env::set_var(role.env_var(), v) }
+    }
+}
+
+#[test]
+fn the_cache_role_exists_and_defaults_to_ehdb() {
+    assert_eq!(StorageRole::Cache.env_var(), "NOETL_STORE_CACHE");
+    assert_eq!(StorageRole::Cache.label(), "cache");
+    assert!(StorageRole::ALL.contains(&StorageRole::Cache));
+    assert!(StorageRole::Cache.tolerates_remote());
+    assert!(!StorageRole::EventLog.tolerates_remote());
+}
+
+// ---------------------------------------------------------------------------
+// Cache conformance — and ⭐ the seam ACCEPTING a non-EHDB backend.
+// ---------------------------------------------------------------------------
+
+/// ⭐⭐ The proof the seam is usable, not merely restrictive. Increments so far
+/// showed conformance *rejecting* non-EHDB backends; this shows a genuinely
+/// different, eventually-consistent, remote-API backend **passing** a role's
+/// contract — which is what "pluggable" has to mean.
+#[test]
+fn the_cloudflare_kv_sketch_passes_cache_conformance() {
+    // propagation_reads = 1: the first read after a write misses, as KV can.
+    let mut kv = CloudflareKvCacheSketch::new(1);
+    let v = cache_conformance::run(&mut kv);
+    assert!(
+        v.is_empty(),
+        "an eventually-consistent cache must CONFORM, not be excluded: {v:#?}"
+    );
+    assert!(!kv.read_your_writes(), "and it honestly reports no RYW");
+    assert_eq!(kv.backend_name(), "cloudflare-kv-sketch");
+}
+
+#[test]
+fn the_ehdb_cache_also_passes_and_reports_read_your_writes() {
+    let mut e = EhdbCache::default();
+    assert!(cache_conformance::passes(&mut e));
+    assert!(e.read_your_writes(), "in-region is stronger than required");
+}
+
+/// ⚠ The contract's honest boundary: a cache that always misses is **useless
+/// but correct**, because a miss is never a fault. Stating this is better than
+/// pretending the suite covers usefulness — hit rate is an operational metric,
+/// not a contract clause.
+#[test]
+fn an_always_miss_cache_conforms_because_a_miss_is_never_a_fault() {
+    let mut m = AlwaysMissCache;
+    assert!(
+        cache_conformance::passes(&mut m),
+        "correctness and usefulness are different properties for a cache"
+    );
+}
+
+/// ⭐ And the suite is not vacuous: a backend that FABRICATES a hit is
+/// rejected. A miss is legal; a wrong hit silently poisons every caller.
+#[test]
+fn the_cache_suite_rejects_a_backend_that_fabricates_a_hit() {
+    let mut b = BrokenCache;
+    let v = cache_conformance::run(&mut b);
+    assert!(!v.is_empty(), "fabrication must be REJECTED");
+    let clauses: Vec<&str> = v.iter().map(|x| x.clause).collect();
+    assert!(clauses.contains(&"get/never-fabricates"), "{clauses:?}");
+}
+
+#[test]
+fn two_cache_backends_work_through_one_trait_object() {
+    let mut a = EhdbCache::default();
+    let mut b = CloudflareKvCacheSketch::new(0);
+    let stores: Vec<&mut dyn CacheStore> = vec![&mut a, &mut b];
+    let mut names = Vec::new();
+    for s in stores {
+        s.put("k", "v");
+        assert_eq!(s.get("k").as_deref(), Some("v"));
+        names.push(s.backend_name());
+    }
+    assert_eq!(names, vec!["ehdb", "cloudflare-kv-sketch"]);
+}
+
+/// The KV sketch converges — eventual, not never.
+#[test]
+fn the_kv_sketch_converges_after_propagation() {
+    let mut kv = CloudflareKvCacheSketch::new(1);
+    kv.put("k", "v");
+    assert_eq!(kv.get("k"), None, "first read may miss");
+    kv.converge();
+    assert_eq!(kv.get("k").as_deref(), Some("v"), "then it is visible");
+}

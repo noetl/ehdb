@@ -135,6 +135,7 @@
 
 pub mod blob;
 pub mod bloom;
+pub mod cache_role;
 pub mod catalog;
 pub mod chain;
 pub mod chain_alt;
