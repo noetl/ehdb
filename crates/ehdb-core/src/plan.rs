@@ -196,6 +196,51 @@ impl ReadConsistency {
             Self::Exact { .. } => "exact",
         }
     }
+
+    /// Parse a configured consistency level and its companion bound.
+    ///
+    /// `level` is `strong` (default) | `bounded` | `exact`; `bound_millis` is
+    /// the staleness budget for `bounded` and the timestamp for `exact`.
+    ///
+    /// # Why this REFUSES rather than defaulting
+    ///
+    /// ⚠⚠ `ReadLocality::parse` maps an unrecognised value to `Owner`, and that
+    /// is right there: a typo must not move the read path, and `Owner` is
+    /// strictly the *safer* answer. The same rule inverted here would be a
+    /// defect. `bounded` with a missing or unparseable bound cannot fall back
+    /// to `Strong` — the operator asked to *relax* freshness and a silent
+    /// upgrade to the strict setting would be a confusing performance cliff —
+    /// and it certainly cannot fall back to some invented budget, which would
+    /// be the system choosing its own correctness bound. So a malformed
+    /// relaxation is an error the caller must handle.
+    ///
+    /// An **absent** level is different from a malformed one and stays
+    /// `Strong`: that is today's behaviour, and a deployment that sets nothing
+    /// must keep getting exactly what it got before this existed.
+    pub fn parse(level: Option<&str>, bound_millis: Option<&str>) -> Result<Self, String> {
+        let bound = |what: &str| -> Result<u64, String> {
+            match bound_millis.map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) => v.parse::<u64>().map_err(|e| {
+                    format!(
+                        "{what} requires a non-negative integer in milliseconds, got {v:?}: {e}"
+                    )
+                }),
+                None => Err(format!("{what} requires a millisecond bound; none was set")),
+            }
+        };
+        match level.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("strong") => Ok(Self::Strong),
+            Some("bounded") => Ok(Self::Bounded {
+                max_staleness_millis: bound("bounded")?,
+            }),
+            Some("exact") => Ok(Self::Exact {
+                at_millis: bound("exact")?,
+            }),
+            Some(other) => Err(format!(
+                "unknown read consistency {other:?}; expected strong | bounded | exact"
+            )),
+        }
+    }
 }
 
 /// Where a read may be served from.
