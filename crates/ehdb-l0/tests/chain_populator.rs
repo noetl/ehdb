@@ -177,19 +177,32 @@ fn the_watermark_is_claimed_before_the_append_once_authoritative() {
         .put_overwrite("chain/e1/wm", b"1:2")
         .expect("advance marker");
 
-    // The store still answers — and the answer is honest about what it holds.
-    let chain = p
-        .chain_if_authoritative("e1")
-        .unwrap()
-        .expect("authoritative");
-    assert_eq!(chain.len(), 1, "the chain is short, and says so");
+    // The MARKER survives — that is what the pre-append ordering buys, and the
+    // reverse ordering would have left no marker at all here.
     match p.authority("e1").unwrap() {
         Authority::Authoritative { through_seq, .. } => assert_eq!(through_seq, 2),
         other => panic!("expected Authoritative, got {other:?}"),
     }
-    // ⚠ The reverse ordering would have produced NO marker here, and
-    // chain_if_authoritative would have returned None — the population
-    // invisible.
+
+    // ⚠⚠ But the GUARDED READ refuses while the marker is ahead of the content.
+    //
+    // This assertion was the other way round until 2026-09-28: it expected
+    // `Some(1)` and called that "honest about what it holds". The kind proof
+    // showed it is not honest in the way that matters — `chain_if_authoritative`
+    // returns a bare `Vec`, so a caller has nowhere to see the shortfall, and a
+    // short chain is indistinguishable from a complete one (contiguous seqs, and
+    // complete by the chain's own gap check). Measured: Postgres 7 events, store
+    // 6, watermark `1:7`, guarded read `Some(6)`.
+    //
+    // The gap is the only evidence the store has that the log moved on without
+    // it, so it is read rather than ignored, and the caller is sent to the
+    // authoritative log.
+    assert_eq!(
+        p.chain_if_authoritative("e1").unwrap().map(|c| c.len()),
+        None,
+        "a watermark ahead of the stored content must read as CANNOT ANSWER, not \
+         as a short chain a caller cannot tell is short"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -407,10 +420,24 @@ fn a_failure_on_an_authoritative_execution_does_not_revoke_it() {
         p.authority("e1").unwrap().is_trustworthy(),
         "existing authority survives a failed append"
     );
+
+    // ⚠ The failed append widened the marker to 2 before it failed, so the
+    // marker and the content now disagree and the guarded read refuses. Authority
+    // is NOT revoked — the distinction matters: the marker records that this
+    // execution was being populated, which is what a later repair pass needs,
+    // while the read refuses because the prefix it holds may be stale.
     assert_eq!(
         p.chain_if_authoritative("e1").unwrap().map(|c| c.len()),
-        Some(1),
-        "and the real content is still readable"
+        None,
+        "a failed append leaves marker and content disagreeing, so the guarded \
+         read must refuse rather than serve a possibly-stale prefix"
+    );
+
+    // ⭐ And the content is still THERE — refusing to serve it is not losing it.
+    assert_eq!(
+        p.authority("e1").unwrap().label(),
+        "authoritative",
+        "the marker is intact"
     );
 }
 
@@ -481,5 +508,61 @@ fn the_populate_doc_does_not_claim_uniform_watermark_first_ordering() {
          authoritative; doing it on a never-seen execution leaves \
          `Authoritative {{1,1}}` over zero events when the append fails, which \
          is the authoritative-and-empty cliff.\n{doc}"
+    );
+}
+
+/// ⚠⚠ **The restart scenario, as measured in kind on 2026-09-28.**
+///
+/// The server stamps the chain edge from an in-memory head map that does not
+/// survive a restart, so the next event for a still-running execution arrives
+/// with `prev = None`. The store rejects it (it is not the head), and the
+/// partition then stops growing while the execution keeps emitting.
+///
+/// Without the watermark tripwire the store serves the pre-restart prefix and
+/// looks entirely healthy doing it: the sequences are contiguous, the chain's own
+/// gap check passes, and nothing in the returned value says "there is more".
+/// That is a reader concluding a running execution's history ends where the
+/// server happened to restart.
+#[test]
+fn a_post_restart_pseudo_root_freezes_the_chain_and_the_read_refuses() {
+    let r = rig();
+    let p = r.pop();
+    p.populate("e-restart", "e1", None, None, "{}").unwrap();
+    p.populate("e-restart", "e2", Some("e1"), None, "{}")
+        .unwrap();
+    p.populate("e-restart", "e3", Some("e2"), None, "{}")
+        .unwrap();
+
+    // Healthy: marker and content agree, so the read answers.
+    assert_eq!(
+        p.chain_if_authoritative("e-restart")
+            .unwrap()
+            .map(|c| c.len()),
+        Some(3),
+        "a chain populated from its root and up to date must be readable"
+    );
+
+    // The restart: the next event carries no chain edge, because the map that
+    // held the head is gone.
+    let rejected = p.populate("e-restart", "e4", None, None, "{}");
+    assert!(
+        rejected.is_err(),
+        "an event claiming to be a second root must be rejected, not appended"
+    );
+
+    // The chain is now permanently behind the log — every later event is
+    // rejected for the same reason — and the read must say so.
+    assert_eq!(
+        p.chain_if_authoritative("e-restart").unwrap(),
+        None,
+        "the chain stopped tracking the execution, so the guarded read must \
+         refuse instead of serving the frozen prefix"
+    );
+
+    // ⭐ The events are still stored. Refusing to serve is not deleting.
+    assert_eq!(
+        p.authority("e-restart").unwrap().label(),
+        "authoritative",
+        "the marker survives, which is what a repair pass needs to find this"
     );
 }
