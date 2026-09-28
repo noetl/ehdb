@@ -43,7 +43,12 @@ fn cmd(id: u64) -> EventRecord {
     EventRecord::new(id, format!("exec-{id}"), "t", payload)
 }
 
-async fn coord_with(ack_wait: Duration) -> (Arc<FeedWriter<D1EventLog>>, Arc<ClaimCoordinator<D1EventLog>>) {
+async fn coord_with(
+    ack_wait: Duration,
+) -> (
+    Arc<FeedWriter<D1EventLog>>,
+    Arc<ClaimCoordinator<D1EventLog>>,
+) {
     let (obj, local) = (unique_dir("obj"), unique_dir("local"));
     let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&obj).unwrap());
     let engine = L0Engine::<D1EventLog>::open(
@@ -91,13 +96,19 @@ async fn a_departed_connections_record_is_reclaimable_at_once() {
 
     // Connection 7 is gone.
     let released = coord.release_conn(7).await;
-    assert_eq!(released, 1, "the departed connection's one record is released");
+    assert_eq!(
+        released, 1,
+        "the departed connection's one record is released"
+    );
 
     // THE POINT: immediately reclaimable, not after 30s.
     let second = tokio::time::timeout(Duration::from_secs(3), coord.claim_next(FILTER, 2))
         .await
         .expect("a released record must be reclaimable AT ONCE, not after ack_wait");
-    assert_eq!(second.sort_key, first.sort_key, "the same record comes back");
+    assert_eq!(
+        second.sort_key, first.sort_key,
+        "the same record comes back"
+    );
     assert!(
         second.redelivered,
         "it must be marked redelivered — a consumer has to be able to tell a \
@@ -122,7 +133,11 @@ async fn releasing_one_connection_leaves_the_others_alone() {
     assert_ne!(a.sort_key, b.sort_key, "two records, two connections");
 
     // Connection 11 departs. Connection 12 is still working.
-    assert_eq!(coord.release_conn(11).await, 1, "only 11's record is released");
+    assert_eq!(
+        coord.release_conn(11).await,
+        1,
+        "only 11's record is released"
+    );
 
     let back = tokio::time::timeout(Duration::from_secs(3), coord.claim_next(FILTER, 2))
         .await
@@ -166,7 +181,11 @@ async fn release_is_safe_for_unknown_and_untracked_connections() {
     let (writer, coord) = coord_with(Duration::from_secs(30)).await;
     writer.append(cmd(100)).unwrap();
 
-    assert_eq!(coord.release_conn(999).await, 0, "unknown connection: no-op");
+    assert_eq!(
+        coord.release_conn(999).await,
+        0,
+        "unknown connection: no-op"
+    );
 
     // conn 0 = untracked (the plain `claim_next` path).
     let _d = coord.claim_next_on(FILTER, 1, 0).await;

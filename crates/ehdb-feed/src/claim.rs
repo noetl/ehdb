@@ -579,85 +579,85 @@ where
             // of them would leave exactly the stall this fixes on the paths it
             // missed.
             let serve = async {
-            // One heartbeat is sent up front on the first heartbeat-requesting
-            // claim of a connection, so the client learns *immediately* that this
-            // coordinator heartbeats and can arm its read deadline for the whole
-            // connection — rather than only after its first claim happens to park
-            // long enough. Once per connection, so the per-claim hot path
-            // (noetl/ai-meta#205) pays nothing.
-            let mut liveness_announced = false;
-            loop {
-                let body = match read_frame(&mut sock).await {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
-                let req: ClaimReq = match serde_json::from_slice(&body) {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                match req {
-                    ClaimReq::Next {
-                        member,
-                        filter,
-                        heartbeat_ms,
-                    } => {
-                        let claim = coordinator.claim_next_on(&filter, member, conn);
-                        let delivery = match heartbeat_ms.filter(|ms| *ms > 0) {
-                            None => claim.await,
-                            Some(ms) => {
-                                if !liveness_announced {
-                                    if write_frame(&mut sock, HEARTBEAT_FRAME).await.is_err() {
-                                        return;
+                // One heartbeat is sent up front on the first heartbeat-requesting
+                // claim of a connection, so the client learns *immediately* that this
+                // coordinator heartbeats and can arm its read deadline for the whole
+                // connection — rather than only after its first claim happens to park
+                // long enough. Once per connection, so the per-claim hot path
+                // (noetl/ai-meta#205) pays nothing.
+                let mut liveness_announced = false;
+                loop {
+                    let body = match read_frame(&mut sock).await {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let req: ClaimReq = match serde_json::from_slice(&body) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    match req {
+                        ClaimReq::Next {
+                            member,
+                            filter,
+                            heartbeat_ms,
+                        } => {
+                            let claim = coordinator.claim_next_on(&filter, member, conn);
+                            let delivery = match heartbeat_ms.filter(|ms| *ms > 0) {
+                                None => claim.await,
+                                Some(ms) => {
+                                    if !liveness_announced {
+                                        if write_frame(&mut sock, HEARTBEAT_FRAME).await.is_err() {
+                                            return;
+                                        }
+                                        liveness_announced = true;
                                     }
-                                    liveness_announced = true;
-                                }
-                                let beat = Duration::from_millis(ms);
-                                // `&mut claim` inside the timeout: a heartbeat only
-                                // *pauses* polling the claim, it never drops it, so
-                                // no assignment can be lost to a heartbeat tick.
-                                tokio::pin!(claim);
-                                loop {
-                                    match tokio::time::timeout(beat, &mut claim).await {
-                                        Ok(delivery) => break delivery,
-                                        Err(_) => {
-                                            if write_frame(&mut sock, HEARTBEAT_FRAME)
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
+                                    let beat = Duration::from_millis(ms);
+                                    // `&mut claim` inside the timeout: a heartbeat only
+                                    // *pauses* polling the claim, it never drops it, so
+                                    // no assignment can be lost to a heartbeat tick.
+                                    tokio::pin!(claim);
+                                    loop {
+                                        match tokio::time::timeout(beat, &mut claim).await {
+                                            Ok(delivery) => break delivery,
+                                            Err(_) => {
+                                                if write_frame(&mut sock, HEARTBEAT_FRAME)
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
                                 }
+                            };
+                            let resp = ClaimResp {
+                                sort_key: delivery.sort_key,
+                                redelivered: delivery.redelivered,
+                                record: delivery.record,
+                            };
+                            let bytes = match serde_json::to_vec(&resp) {
+                                Ok(b) => b,
+                                Err(_) => return,
+                            };
+                            if write_frame(&mut sock, &bytes).await.is_err() {
+                                return;
                             }
-                        };
-                        let resp = ClaimResp {
-                            sort_key: delivery.sort_key,
-                            redelivered: delivery.redelivered,
-                            record: delivery.record,
-                        };
-                        let bytes = match serde_json::to_vec(&resp) {
-                            Ok(b) => b,
-                            Err(_) => return,
-                        };
-                        if write_frame(&mut sock, &bytes).await.is_err() {
-                            return;
                         }
-                    }
-                    ClaimReq::Ack { sort_key } => {
-                        coordinator.ack(sort_key).await;
-                        if write_frame(&mut sock, b"1").await.is_err() {
-                            return;
+                        ClaimReq::Ack { sort_key } => {
+                            coordinator.ack(sort_key).await;
+                            if write_frame(&mut sock, b"1").await.is_err() {
+                                return;
+                            }
                         }
-                    }
-                    ClaimReq::Nack { sort_key } => {
-                        coordinator.nack(sort_key).await;
-                        if write_frame(&mut sock, b"1").await.is_err() {
-                            return;
+                        ClaimReq::Nack { sort_key } => {
+                            coordinator.nack(sort_key).await;
+                            if write_frame(&mut sock, b"1").await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
-            }
             };
             serve.await;
             // Always: the connection is finished, so whatever it still owes an
