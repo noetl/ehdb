@@ -144,10 +144,13 @@ impl<'a> ChainPopulator<'a> {
 
     /// **Populate one event.**
     ///
-    /// ⭐ The watermark is claimed **before** the append, so a crash between the
-    /// two leaves a marker over a short chain (honestly reported by the chain's
-    /// own gap detection) rather than events with no marker (silently invisible
-    /// to every reader).
+    /// ⭐ The watermark ordering is **asymmetric**, and deliberately so: an
+    /// execution the store has never seen is appended FIRST and marked after,
+    /// while one that is already authoritative is marked FIRST and appended
+    /// after. The rule in one line: **never create authority out of a failure.**
+    /// The long-form argument — and the defect that produced it — is in the
+    /// comment on the ordering inside the body; read that before changing either
+    /// branch.
     pub fn populate(
         &self,
         execution_id: &str,

@@ -438,3 +438,48 @@ fn a_failed_first_replicated_apply_creates_no_authority() {
         "a failed first replicated apply must create no authority either"
     );
 }
+
+/// ⚠ **The doc comment must not describe the pre-fix ordering.**
+///
+/// Found while wiring the call site: after the asymmetry landed, `populate`'s
+/// own doc still read *"the watermark is claimed before the append"* — the
+/// claim whose unconditional form is the defect. A reader trusting it would
+/// "restore" uniform ordering and reintroduce authoritative-and-empty.
+///
+/// A comment is not a guard (noetl/ai-meta#332) — but a comment that
+/// contradicts its code is worse than none, so this pins the one sentence that
+/// matters.
+#[test]
+fn the_populate_doc_does_not_claim_uniform_watermark_first_ordering() {
+    let src = include_str!("../src/chain_populator.rs");
+    let at = src
+        .find("pub fn populate(")
+        .expect("populate not found — the extraction broke, not the property");
+    // The doc block immediately above the signature.
+    let head = &src[..at];
+    let doc_start = head
+        .rfind("/// **Populate one event.**")
+        .expect("populate's doc header not found — re-anchor this guard");
+    let doc = &head[doc_start..];
+    assert!(
+        doc.len() > 200,
+        "extracted {} bytes of doc — implausibly small; a guard measuring \
+         nothing passes",
+        doc.len()
+    );
+    assert!(
+        doc.contains("asymmetric"),
+        "populate's doc no longer calls the ordering asymmetric. If the \
+         asymmetry was genuinely removed, `a_failed_first_populate_leaves_the_\
+         store_not_populated` is the test that should be failing — check that \
+         first.\n{doc}"
+    );
+    assert!(
+        !doc.contains("claimed **before** the append"),
+        "populate's doc claims the watermark is claimed before the append \
+         unconditionally. That is true only when the execution is ALREADY \
+         authoritative; doing it on a never-seen execution leaves \
+         `Authoritative {{1,1}}` over zero events when the append fails, which \
+         is the authoritative-and-empty cliff.\n{doc}"
+    );
+}
