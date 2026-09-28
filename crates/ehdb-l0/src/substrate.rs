@@ -263,6 +263,16 @@ pub struct SubstrateCounters {
     pub get_all_bytes: AtomicU64,
     /// Number of `delete` calls (L0.5 GC reclaims).
     pub delete_calls: AtomicU64,
+    /// Number of `list_prefix` calls (directory/prefix enumerations).
+    ///
+    /// ⚠ Added because its absence made a whole class of storage operation
+    /// **invisible** to this instrument. A proof that an operation "issues
+    /// exactly one storage read" was counting `get_all` + `get_range` only, so
+    /// an implementation could enumerate a prefix on every call — an O(k) cost —
+    /// and still read as exactly one. Two mutation-battery mutants survived on
+    /// precisely that blind spot. A counter that cannot see an operation makes
+    /// every claim about that operation vacuous.
+    pub list_prefix_calls: AtomicU64,
 }
 
 /// A transparent [`DurableSubstrate`] wrapper that records per-key I/O and can
@@ -371,6 +381,9 @@ impl<S: DurableSubstrate> DurableSubstrate for CountingSubstrate<S> {
     }
 
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.counters
+            .list_prefix_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.list_prefix(prefix)
     }
 

@@ -1,5 +1,15 @@
 use std::{collections::BTreeSet, fmt};
 
+/// Hybrid logical clock (multi-region spec M2). Lives here rather than in
+/// `ehdb-l0` because `ehdb-reference` -- which is what actually serves the
+/// production event-log tier -- does not depend on `ehdb-l0`.
+pub mod hlc;
+
+/// The three resolvers (multi-region spec M0). Here for the same reason as
+/// `hlc`: `ehdb-reference` serves the production event-log tier and does not
+/// depend on `ehdb-l0`.
+pub mod plan;
+
 pub use arrow_schema::DataType;
 use serde::{de, Deserialize, Deserializer, Serialize};
 

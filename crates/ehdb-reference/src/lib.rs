@@ -237,6 +237,41 @@ pub fn runtime_cache_enabled() -> bool {
 type RuntimeCache =
     std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<LocalReferenceRuntime>>>>;
 
+/// Drop the cached runtime for `path`, releasing its replayed state.
+///
+/// ⚠⚠ Without this the reference-runtime cache is **unbounded and permanent**:
+/// `with_runtime` inserts a `LocalReferenceRuntime` per log path and never
+/// removes it, and that runtime holds the whole log replayed into a
+/// `ReferenceDatabase`. A caller that rotates or retires a log therefore bounds
+/// the FILE while the process keeps the old state resident forever — the file
+/// shrinks and the RSS does not.
+///
+/// That is not hypothetical. On 2026-09-20 the EHDB tier's log reached 4.0 GB
+/// against a writer whose baseline was ~3 GiB, and the writer was OOM-killed at
+/// a 4 GiB limit and again at 8 GiB.
+///
+/// Returns whether an entry was actually removed, so a caller can tell "evicted"
+/// from "there was nothing cached" rather than assuming.
+///
+/// Safe to call when the cache is disabled (there is nothing to remove) and
+/// safe to call for a path that was never opened.
+pub fn forget_runtime(path: &Path) -> bool {
+    match runtime_cache().lock() {
+        Ok(mut map) => map.remove(path).is_some(),
+        // A poisoned cache means some other thread panicked holding it. Report
+        // "nothing evicted" rather than panicking in a cleanup path.
+        Err(_) => false,
+    }
+}
+
+/// How many runtimes the cache currently holds.
+///
+/// Exposed so a test can assert eviction actually happened instead of trusting
+/// that it did.
+pub fn cached_runtime_count() -> usize {
+    runtime_cache().lock().map(|m| m.len()).unwrap_or(0)
+}
+
 fn runtime_cache() -> &'static RuntimeCache {
     static C: OnceLock<RuntimeCache> = OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))

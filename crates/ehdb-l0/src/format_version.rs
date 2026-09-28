@@ -234,13 +234,24 @@ mod tests {
         let at = src
             .find("pub fn open_replicated_with_metrics")
             .expect("chokepoint not found — the extraction broke");
-        // ⚠ Window widened 2000 → 5000 (resilient-core Phase 3). The
-        // chokepoint grew: the failure-domain check now sits between the format
-        // gate and the manifest load, which pushed `load_durable_manifest` out
-        // of the old window and tripped this guard's own "widen it" branch.
-        // Widening the window preserves the property (gate present, and BEFORE
-        // the manifest read); it does not relax it.
-        let body: String = src[at..].chars().take(5000).collect();
+        // ⚠ Window widened 2000 → 5000 (resilient-core Phase 3), then
+        // 5000 → 9000 (M4 wiring, 2026-09-19). The chokepoint keeps growing:
+        // the failure-domain check, and now the M4 region-survival check, sit
+        // between the format gate and the manifest load, which pushed
+        // `load_durable_manifest` out of the old windows and tripped this
+        // guard's own "widen it" branch each time.
+        //
+        // Widening preserves the property — gate present, and BEFORE the
+        // manifest read — and does not relax it: the ORDER assertion below is
+        // what carries the meaning, and a window that merely contains both
+        // still fails if the gate moved after the load. Measured at the time of
+        // widening: gate at +849, manifest load at +5787.
+        //
+        // ⚠ A character window over source is a proximity proxy, not the
+        // property. It survives because the order check is the real assertion;
+        // if this needs widening a fourth time, replace it with a parse rather
+        // than a larger number.
+        let body: String = src[at..].chars().take(9000).collect();
         assert!(
             body.contains("verify_or_initialise"),
             "the format gate is not called from the open chokepoint; an engine \

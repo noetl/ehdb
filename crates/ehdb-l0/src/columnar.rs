@@ -319,6 +319,10 @@ pub fn decode_columnar(bytes: &[u8]) -> Result<Vec<EventRecord>> {
             // pins that limitation so it is a known gap rather than a surprise
             // the first time D1 parts move to this layout.
             event_id: None,
+            // Same fixed-four-column limitation, now for the M2 commit HLC.
+            // Not on the write path (the part writer uses the serde_json frame
+            // codec), and pinned by the test below so it stays a known gap.
+            commit_hlc: None,
         });
     }
     Ok(out)
