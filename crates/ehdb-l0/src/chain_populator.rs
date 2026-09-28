@@ -144,10 +144,13 @@ impl<'a> ChainPopulator<'a> {
 
     /// **Populate one event.**
     ///
-    /// ⭐ The watermark is claimed **before** the append, so a crash between the
-    /// two leaves a marker over a short chain (honestly reported by the chain's
-    /// own gap detection) rather than events with no marker (silently invisible
-    /// to every reader).
+    /// ⭐ The watermark ordering is **asymmetric**, and deliberately so: an
+    /// execution the store has never seen is appended FIRST and marked after,
+    /// while one that is already authoritative is marked FIRST and appended
+    /// after. The rule in one line: **never create authority out of a failure.**
+    /// The long-form argument — and the defect that produced it — is in the
+    /// comment on the ordering inside the body; read that before changing either
+    /// branch.
     pub fn populate(
         &self,
         execution_id: &str,
@@ -160,7 +163,6 @@ impl<'a> ChainPopulator<'a> {
             .authority(execution_id)
             .map_err(|e| ChainError::Invalid(e.to_string()))?;
 
-        // Claim the marker first, at the sequence this append will take.
         let next = self
             .store
             .head_entry(execution_id)
@@ -168,12 +170,45 @@ impl<'a> ChainPopulator<'a> {
             .map(|(s, _)| s)
             .unwrap_or(0)
             + 1;
+
+        // ⚠⚠ THE ORDERING IS NOT UNIFORM, and the asymmetry is the fix for a
+        // real defect found while wiring this to the emit chokepoint.
+        //
+        // The first draft claimed the marker before EVERY append. On an
+        // execution the store has never seen, an append that then FAILS leaves a
+        // marker over zero events — `Authoritative { 1, 1 }` with an empty
+        // partition — so `chain_if_authoritative` returns `Some(vec![])` and a
+        // reader concludes a RUNNING execution has no events. That is exactly
+        // the cliff the watermark exists to prevent, reintroduced through the
+        // failure path.
+        //
+        // And it is the COMMON case, not an edge one: arming the populator
+        // mid-flight means the first row seen for an already-running execution
+        // carries a `prev` the empty store does not have, so `append` fails with
+        // `NotHead` on essentially every in-flight execution.
+        //
+        // So:
+        //   NotPopulated  -> append FIRST, then mark. A crash between them
+        //                    leaves events with no marker, which reads as
+        //                    NotPopulated — invisible, but SAFE (falls through).
+        //                    Nothing is lost, because Postgres is still
+        //                    authoritative.
+        //   Authoritative -> mark FIRST, then append. There is already content,
+        //                    so a crash must not make the store under-report it;
+        //                    a marker over a short chain is reported honestly by
+        //                    the chain's own gap detection.
+        //
+        // The rule in one line: **never create authority out of a failure.**
+        let already_authoritative = matches!(before, Authority::Authoritative { .. });
         let first = match before {
             Authority::Authoritative { first_seq, .. } => first_seq,
             Authority::NotPopulated => next,
         };
-        self.write_watermark(execution_id, first, next)
-            .map_err(|e| ChainError::Invalid(e.to_string()))?;
+
+        if already_authoritative {
+            self.write_watermark(execution_id, first, next)
+                .map_err(|e| ChainError::Invalid(e.to_string()))?;
+        }
 
         let seq = self.store.append(
             execution_id,
@@ -182,6 +217,12 @@ impl<'a> ChainPopulator<'a> {
             parent_execution_id,
             payload,
         )?;
+
+        if !already_authoritative {
+            // The append succeeded, so authority is now justified by content.
+            self.write_watermark(execution_id, first, seq)
+                .map_err(|e| ChainError::Invalid(e.to_string()))?;
+        }
 
         // The append assigns its own sequence; reconcile if they disagree
         // (a concurrent writer, which single-writer ownership forbids — so this
@@ -207,9 +248,19 @@ impl<'a> ChainPopulator<'a> {
             } => (first_seq.min(seq), through_seq.max(seq)),
             Authority::NotPopulated => (seq, seq),
         };
-        self.write_watermark(&exec, first, through)
-            .map_err(|e| ChainError::Invalid(e.to_string()))?;
-        self.store.apply_replicated(event)
+        let already_authoritative = matches!(before, Authority::Authoritative { .. });
+
+        // Same asymmetry, same reason — see `populate`.
+        if already_authoritative {
+            self.write_watermark(&exec, first, through)
+                .map_err(|e| ChainError::Invalid(e.to_string()))?;
+        }
+        self.store.apply_replicated(event)?;
+        if !already_authoritative {
+            self.write_watermark(&exec, first, through)
+                .map_err(|e| ChainError::Invalid(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// ⭐ **The guarded read.** `None` means *the store cannot answer*, which a

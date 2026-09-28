@@ -153,15 +153,20 @@ fn the_three_states_are_distinguishable() {
 // Crash-ordering: the marker is claimed BEFORE the append.
 // ---------------------------------------------------------------------------
 
-/// ⭐ A crash between marker and append must leave a marker over a SHORT chain,
-/// not events with no marker.
+/// ⭐ On an ALREADY-AUTHORITATIVE execution, a crash between marker and append
+/// must leave a marker over a SHORT chain, not events with no marker.
+///
+/// ⚠ The ordering is asymmetric and this test covers only half of it. On a
+/// NOT-yet-populated execution the append comes FIRST — see
+/// `a_failed_first_populate_leaves_the_store_not_populated` for why marking
+/// first there would create authority out of a failure.
 ///
 /// Events-without-marker is silently invisible: every reader falls through and
 /// the population appears never to have happened. Marker-over-short-chain is
 /// reported honestly by the chain's own gap detection. The failure mode is
 /// chosen rather than inherited, and this test pins the choice.
 #[test]
-fn the_watermark_is_claimed_before_the_append() {
+fn the_watermark_is_claimed_before_the_append_once_authoritative() {
     let r = rig();
     let p = r.pop();
     p.populate("e1", "a", None, None, "{}").unwrap();
@@ -325,4 +330,156 @@ fn the_watermark_widens_up_when_a_later_sequence_arrives_second() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// ⚠⚠ Never create authority out of a failure.
+// ---------------------------------------------------------------------------
+
+/// **The defect this fixes, in its realistic form.**
+///
+/// Arming the populator MID-FLIGHT is the normal way it gets switched on: the
+/// first row seen for an already-running execution carries a `prev` the empty
+/// store does not have, so `append` fails with `NotHead`. The first draft had
+/// already claimed the watermark by then, leaving `Authoritative` over ZERO
+/// events — so `chain_if_authoritative` returned `Some(vec![])` and a reader
+/// concluded a running execution had no events.
+///
+/// That is the exact cliff the watermark exists to prevent, arriving through
+/// the failure path instead of the empty-store path.
+#[test]
+fn a_failed_first_populate_leaves_the_store_not_populated() {
+    let r = rig();
+    let p = r.pop();
+
+    let res = p.populate("e-inflight", "ev-500", Some("ev-499"), None, "{}");
+    assert!(
+        res.is_err(),
+        "precondition: appending with a prev the empty store lacks must fail"
+    );
+
+    assert_eq!(
+        p.authority("e-inflight").expect("authority"),
+        Authority::NotPopulated,
+        "a FAILED first populate must leave the store NOT populated — authority \
+         must never be created out of a failure"
+    );
+    assert_eq!(
+        p.chain_if_authoritative("e-inflight").expect("guarded"),
+        None,
+        "and the guarded read must still fall through, not answer Some(empty)"
+    );
+}
+
+/// ⚠ Control: a SUCCEEDING first populate does create authority. Without this,
+/// "a failure creates no authority" is satisfied by a populator that never
+/// creates any.
+#[test]
+fn a_succeeding_first_populate_does_create_authority() {
+    let r = rig();
+    let p = r.pop();
+    p.populate("e-fresh", "a", None, None, "{}")
+        .expect("must succeed");
+    assert!(
+        p.authority("e-fresh").unwrap().is_trustworthy(),
+        "a successful first populate MUST create authority"
+    );
+    assert_eq!(
+        p.chain_if_authoritative("e-fresh")
+            .unwrap()
+            .map(|c| c.len()),
+        Some(1)
+    );
+}
+
+/// A failure on an ALREADY-authoritative execution must not revoke authority —
+/// there is real content behind it.
+#[test]
+fn a_failure_on_an_authoritative_execution_does_not_revoke_it() {
+    let r = rig();
+    let p = r.pop();
+    p.populate("e1", "a", None, None, "{}").unwrap();
+    assert!(p
+        .populate("e1", "bad", Some("not-the-head"), None, "{}")
+        .is_err());
+
+    assert!(
+        p.authority("e1").unwrap().is_trustworthy(),
+        "existing authority survives a failed append"
+    );
+    assert_eq!(
+        p.chain_if_authoritative("e1").unwrap().map(|c| c.len()),
+        Some(1),
+        "and the real content is still readable"
+    );
+}
+
+/// The same rule on the replicated path.
+#[test]
+fn a_failed_first_replicated_apply_creates_no_authority() {
+    let r = rig();
+    let p = r.pop();
+    // An event whose id is empty is refused by the store.
+    let bad = ChainEvent {
+        exec_seq: 1,
+        event_id: String::new(),
+        prev_event_id: None,
+        execution_id: "e-repl".to_string(),
+        parent_execution_id: None,
+        payload: "{}".to_string(),
+    };
+    assert!(
+        p.populate_replicated(bad).is_err(),
+        "precondition: apply fails"
+    );
+    assert_eq!(
+        p.authority("e-repl").unwrap(),
+        Authority::NotPopulated,
+        "a failed first replicated apply must create no authority either"
+    );
+}
+
+/// ⚠ **The doc comment must not describe the pre-fix ordering.**
+///
+/// Found while wiring the call site: after the asymmetry landed, `populate`'s
+/// own doc still read *"the watermark is claimed before the append"* — the
+/// claim whose unconditional form is the defect. A reader trusting it would
+/// "restore" uniform ordering and reintroduce authoritative-and-empty.
+///
+/// A comment is not a guard (noetl/ai-meta#332) — but a comment that
+/// contradicts its code is worse than none, so this pins the one sentence that
+/// matters.
+#[test]
+fn the_populate_doc_does_not_claim_uniform_watermark_first_ordering() {
+    let src = include_str!("../src/chain_populator.rs");
+    let at = src
+        .find("pub fn populate(")
+        .expect("populate not found — the extraction broke, not the property");
+    // The doc block immediately above the signature.
+    let head = &src[..at];
+    let doc_start = head
+        .rfind("/// **Populate one event.**")
+        .expect("populate's doc header not found — re-anchor this guard");
+    let doc = &head[doc_start..];
+    assert!(
+        doc.len() > 200,
+        "extracted {} bytes of doc — implausibly small; a guard measuring \
+         nothing passes",
+        doc.len()
+    );
+    assert!(
+        doc.contains("asymmetric"),
+        "populate's doc no longer calls the ordering asymmetric. If the \
+         asymmetry was genuinely removed, `a_failed_first_populate_leaves_the_\
+         store_not_populated` is the test that should be failing — check that \
+         first.\n{doc}"
+    );
+    assert!(
+        !doc.contains("claimed **before** the append"),
+        "populate's doc claims the watermark is claimed before the append \
+         unconditionally. That is true only when the execution is ALREADY \
+         authoritative; doing it on a never-seen execution leaves \
+         `Authoritative {{1,1}}` over zero events when the append fails, which \
+         is the authoritative-and-empty cliff.\n{doc}"
+    );
 }
