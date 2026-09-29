@@ -270,9 +270,40 @@ impl<'a> ChainPopulator<'a> {
     /// `DurableChainStore::chain` directly — it is where the watermark does its
     /// job.
     pub fn chain_if_authoritative(&self, execution_id: &str) -> Result<Option<Vec<ChainEvent>>> {
-        match self.authority(execution_id)? {
-            Authority::NotPopulated => Ok(None),
-            Authority::Authoritative { .. } => Ok(Some(self.store.chain(execution_id)?)),
+        let Authority::Authoritative { through_seq, .. } = self.authority(execution_id)? else {
+            return Ok(None);
+        };
+
+        // ⚠⚠ THE WATERMARK IS ALSO A TRIPWIRE, not only a "populated" flag.
+        //
+        // On the already-authoritative path `populate` widens the watermark
+        // BEFORE the append. That is deliberate (a crash between the two must
+        // not under-report existing content), and it means a *failed* append
+        // leaves `through_seq` one ahead of what is stored. Measured in kind
+        // 2026-09-28: Postgres 7 events, store 6, watermark `1:7`.
+        //
+        // That gap is the only evidence the store has that the log moved on
+        // without it, so it must be read rather than ignored. It happens for a
+        // mundane and recurring reason: the chain edge is stamped from the
+        // server's IN-MEMORY head map, which does not survive a restart, so the
+        // next event for a still-running execution carries `prev = NULL`, the
+        // store rejects it as not-the-head, and the partition then stops growing
+        // while the execution continues.
+        //
+        // Returning the stored prefix there would hand a caller a chain that is
+        // silently stale — authoritative-looking, contiguous, complete by its own
+        // gap check, and missing every event after the restart. `None` sends the
+        // caller to the authoritative log instead, which is the safe direction
+        // and the whole reason this function exists.
+        let stored_head = self
+            .store
+            .head_entry(execution_id)?
+            .map(|(s, _)| s)
+            .unwrap_or(0);
+        if stored_head != through_seq {
+            return Ok(None);
         }
+
+        Ok(Some(self.store.chain(execution_id)?))
     }
 }
