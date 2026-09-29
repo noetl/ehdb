@@ -777,9 +777,24 @@ fn a_log_disagreeing_with_the_stored_prefix_is_reported_not_repaired() {
         other => panic!("expected Diverged, got {other:?}"),
     }
 
-    // ⭐ And nothing was rewritten.
-    let chain = p.chain_if_authoritative("e-div").unwrap().expect("served");
-    assert_eq!(chain[1].event_id, "b", "the stored chain is untouched");
+    // ⭐ And nothing was REWRITTEN — the events are exactly as they were.
+    //
+    // ⚠ Read through the store, not through `chain_if_authoritative`: as of
+    // noetl/ai-meta#360 a detected content conflict REVOKES serve-trust by
+    // dropping the coverage record, so the guarded read now refuses. This test's
+    // subject is "reported, not repaired", and that is still true — the chain is
+    // intact, only the permission to serve it is withdrawn.
+    let raw = r.store.chain("e-div").expect("raw chain");
+    assert_eq!(raw[1].event_id, "b", "the stored chain is untouched");
+    assert_eq!(raw.len(), 2, "and nothing was appended or removed");
+
+    assert_eq!(
+        p.chain_if_authoritative("e-div").unwrap(),
+        None,
+        "but a partition proven to disagree with the authoritative log must no \
+         longer be served — Postgres is authoritative, so the STORE is the wrong \
+         one here"
+    );
 }
 
 /// Every `FromLog` label is enumerated, so none is an absent series.
@@ -799,6 +814,10 @@ fn from_log_labels_are_enumerated_for_pinning() {
             stored: String::new(),
             log: String::new(),
         },
+        FromLog::StaleLog {
+            stored_len: 2,
+            log_len: 1,
+        },
     ] {
         assert!(
             FromLog::ALL_LABELS.contains(&v.label()),
@@ -806,7 +825,26 @@ fn from_log_labels_are_enumerated_for_pinning() {
             v.label()
         );
     }
-    assert_eq!(FromLog::ALL_LABELS.len(), 3);
+    assert_eq!(FromLog::ALL_LABELS.len(), 4);
+
+    // ⚠ Only Diverged is unhealthy. StaleLog reading as healthy IS the fix for
+    // noetl/ai-meta#360 — if this flips, 6.3% false divergence returns.
+    assert!(FromLog::StaleLog {
+        stored_len: 2,
+        log_len: 1
+    }
+    .is_healthy());
+    assert!(FromLog::InSync {
+        total: 1,
+        appended: 0
+    }
+    .is_healthy());
+    assert!(!FromLog::Diverged {
+        at_position: 0,
+        stored: String::new(),
+        log: String::new()
+    }
+    .is_healthy());
 }
 
 /// ⚠⚠ A failed append part-way through `populate_from_log`.
@@ -856,4 +894,198 @@ fn a_failed_append_mid_extend_leaves_nothing_servable() {
              mid-extend; it must not be written until the content is there"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#360 — a stale snapshot is not a divergence.
+// ---------------------------------------------------------------------------
+
+/// ⭐⭐ **The prod failure, reproduced exactly.**
+///
+/// `LogSourcedChainSource::chain_for` reads the event log and THEN takes the
+/// store lock — it cannot hold a `std::sync::Mutex` across the database `await`.
+/// So under concurrent reads of one execution, the task that read the log FIRST
+/// can reach the lock SECOND and find the store already ahead of its snapshot.
+///
+/// Classing that as `Diverged` produced **5 false divergences in 79 comparisons
+/// (6.3%)** on the prod ramp of 2026-09-29, failing the comparator gate and
+/// forcing a rollback — while nothing was wrong: 60 partitions with 0 persistent
+/// mismatches and 24/24 executions completed.
+///
+/// The interleaving below is that race, made deterministic:
+///   task B reads [a,b,c,d] and applies it;
+///   task A, holding the older snapshot [a,b,c], reaches the store second.
+#[test]
+fn a360_a_snapshot_behind_the_store_is_stale_not_diverged() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "race";
+
+    // Task B: the newer snapshot lands first.
+    p.populate_from_log(exec, &log(&["a", "b", "c", "d"]))
+        .expect("newer snapshot applies");
+
+    // Task A: the OLDER snapshot arrives second. Every event it holds matches;
+    // the store simply holds one more.
+    let out = p
+        .populate_from_log(exec, &log(&["a", "b", "c"]))
+        .expect("a stale snapshot must not error");
+
+    match out {
+        FromLog::StaleLog {
+            stored_len,
+            log_len,
+        } => {
+            assert_eq!(stored_len, 4);
+            assert_eq!(log_len, 3);
+        }
+        FromLog::Diverged { .. } => panic!(
+            "a snapshot that is BEHIND the store was classed as Diverged. That is \
+             the noetl/ai-meta#360 false alarm — 6.3% of prod comparisons — and it \
+             fails the comparator gate while nothing is actually wrong."
+        ),
+        other => panic!("expected StaleLog, got {other:?}"),
+    }
+    assert!(out.is_healthy(), "StaleLog must count as healthy");
+
+    // ⭐ And the partition stays SERVABLE with the FULL chain. The stale read
+    // must not shrink it — the extra event is real and committed.
+    let chain = p
+        .chain_if_authoritative(exec)
+        .expect("guarded read")
+        .expect("a stale read must leave the partition servable");
+    assert_eq!(
+        chain.len(),
+        4,
+        "the stale snapshot must not truncate the partition; coverage is monotonic"
+    );
+}
+
+/// ⚠⚠ **THE ALARM MUST STILL WORK.** A genuine content conflict — a position
+/// both sides hold, filled with different events — is still `Diverged`.
+///
+/// Without this, the #360 fix could have been "stop reporting divergence", which
+/// would pass the comparator gate by switching the detector off.
+#[test]
+fn a360_a_real_content_conflict_is_still_diverged() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "conflict";
+    p.populate_from_log(exec, &log(&["a", "b", "c"]))
+        .expect("initial");
+
+    // Same length, DIFFERENT event at position 1. Not staleness — disagreement.
+    let out = p
+        .populate_from_log(exec, &log(&["a", "ZZZ", "c"]))
+        .expect("no error");
+    match out {
+        FromLog::Diverged {
+            at_position,
+            ref stored,
+            ref log,
+        } => {
+            assert_eq!(at_position, 1);
+            assert_eq!(stored, "b");
+            assert_eq!(log, "ZZZ");
+        }
+        other => panic!(
+            "a CONTENT conflict must still be Diverged, got {other:?}. If this \
+             reports StaleLog the #360 fix has disabled the detector instead of \
+             classifying it."
+        ),
+    }
+    assert!(!out.is_healthy());
+    assert_eq!(
+        p.chain_if_authoritative(exec).unwrap(),
+        None,
+        "and a genuinely diverged partition must still refuse to serve"
+    );
+}
+
+/// ⚠ A conflict where the log is SHORTER but the shared prefix disagrees is a
+/// conflict, not staleness. The length must not be what decides it.
+#[test]
+fn a360_shorter_log_with_a_conflicting_prefix_is_diverged_not_stale() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "short-conflict";
+    p.populate_from_log(exec, &log(&["a", "b", "c", "d"]))
+        .expect("initial");
+    let out = p
+        .populate_from_log(exec, &log(&["a", "XX"]))
+        .expect("no error");
+    assert!(
+        matches!(out, FromLog::Diverged { at_position: 1, .. }),
+        "a shorter log whose shared prefix CONFLICTS is divergence, got {out:?} — \
+         classifying on length alone would mask a real conflict behind staleness"
+    );
+}
+
+/// ⚠ A stale snapshot leaves coverage alone because it returns EARLY.
+///
+/// ⚠⚠ This test does NOT exercise the monotonic guard in `write_coverage` — I
+/// first wrote it believing it did, and a mutant that deleted that guard passed.
+/// The early `StaleLog` return happens before `write_coverage` is reached, so
+/// coverage is untouched for a different reason than the guard. Saying so,
+/// because a test whose name promises one property and checks another is worse
+/// than no test. The guard's own coverage is
+/// `a360_coverage_guard_rejects_a_shrinking_total` below.
+#[test]
+fn a360_a_stale_read_leaves_coverage_and_the_partition_alone() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "mono";
+    p.populate_from_log(exec, &log(&["a", "b", "c", "d", "e"]))
+        .expect("full");
+    let (_, before) = p.coverage(exec).unwrap().expect("coverage");
+    assert_eq!(before, 5);
+
+    p.populate_from_log(exec, &log(&["a", "b"]))
+        .expect("stale read");
+    let (_, after) = p.coverage(exec).unwrap().expect("coverage");
+    assert_eq!(after, 5, "coverage went {before} -> {after}");
+    assert_eq!(
+        p.chain_if_authoritative(exec).unwrap().map(|c| c.len()),
+        Some(5),
+        "and the partition is still fully servable"
+    );
+}
+
+/// ⚠⚠ **The monotonic-coverage guard, actually exercised.**
+///
+/// Reaching it needs coverage to be AHEAD of the stored chain, which is the
+/// crash-mid-extend shape: `populate_from_log` claims coverage before appending,
+/// so a crash between the two leaves `cov_total` larger than the partition. A
+/// later read with a log SHORTER than that recorded total then calls
+/// `write_coverage` with a smaller value — the only path that reaches the guard.
+///
+/// Coverage records how much of the execution the store has SEEN. For an
+/// append-only log that only grows, so a smaller value is always the older
+/// observation and is dropped.
+#[test]
+fn a360_coverage_guard_rejects_a_shrinking_total() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "shrink";
+    p.populate_from_log(exec, &log(&["a", "b", "c"]))
+        .expect("initial");
+
+    // Simulate the crash: coverage claims 9 over a 3-event partition.
+    r.substrate
+        .put_overwrite("chain/shrink/cov", b"a:9")
+        .expect("advance coverage past the content");
+    assert_eq!(p.coverage(exec).unwrap().unwrap().1, 9);
+
+    // A later read whose log is longer than the store (so no StaleLog) but
+    // SHORTER than the recorded coverage. This is the only path to the guard.
+    p.populate_from_log(exec, &log(&["a", "b", "c", "d"]))
+        .expect("extend");
+
+    let (_, total) = p.coverage(exec).unwrap().expect("coverage");
+    assert_eq!(
+        total, 9,
+        "coverage shrank to {total}. It must never move backwards: a smaller \
+         total is always the older observation, and accepting it would let a \
+         partition look complete when the log once held more."
+    );
 }

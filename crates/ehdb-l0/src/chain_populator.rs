@@ -136,11 +136,40 @@ pub enum FromLog {
     /// Reported rather than repaired: silently rewriting an immutable chain to
     /// match a new reading is how a store stops being evidence. `at_position` is
     /// 0-based in log order.
+    ///
+    /// ⚠⚠ This means a **content conflict** — a position both sides hold, filled
+    /// with different events. It does NOT mean "the caller's log snapshot was
+    /// older than the store", which is [`FromLog::StaleLog`] and is benign.
+    /// Conflating the two cost a prod ramp: see that variant.
     Diverged {
         at_position: usize,
         stored: String,
         log: String,
     },
+    /// ⭐ The caller's log snapshot is **behind** the store: every event the
+    /// snapshot holds matches, and the store simply holds more.
+    ///
+    /// # Why this is benign, and why it is not `Diverged`
+    ///
+    /// `populate_from_log` is the sole writer, so every stored event arrived from
+    /// *some* read of this same log. A store that is longer than the caller's
+    /// snapshot therefore means only that **a newer snapshot was already
+    /// applied** — the extra events are real and committed. Nothing disagrees.
+    ///
+    /// It happens because the caller reads the log and *then* takes the store
+    /// lock (the lock is a `std::sync::Mutex`, so it cannot be held across the
+    /// database `await`). Under concurrent reads of one execution, the task that
+    /// read first can reach the lock second and find the store already ahead.
+    ///
+    /// ⚠ Classing that as `Diverged` produced **5 false divergences in 79
+    /// comparisons (6.3%)** on the prod ramp of 2026-09-29, which failed the
+    /// comparator gate and forced a rollback — while nothing was actually wrong
+    /// (60 partitions, 0 persistent mismatches; 24/24 executions completed).
+    /// noetl/ai-meta#360.
+    ///
+    /// The partition stays **servable**: the stored chain is a superset of the
+    /// caller's snapshot and is the fresher answer.
+    StaleLog { stored_len: usize, log_len: usize },
 }
 
 impl FromLog {
@@ -149,13 +178,20 @@ impl FromLog {
             Self::InSync { appended: 0, .. } => "in_sync",
             Self::InSync { .. } => "extended",
             Self::Diverged { .. } => "diverged",
+            Self::StaleLog { .. } => "stale_log",
         }
+    }
+
+    /// Is this a healthy outcome? ⚠ `StaleLog` IS healthy — it is the caller
+    /// being behind, not the store being wrong.
+    pub fn is_healthy(&self) -> bool {
+        !matches!(self, Self::Diverged { .. })
     }
 
     /// Every label, for pinning at 0 — absence is the default for a labelled
     /// series, so an unpinned family is indistinguishable from a build that
     /// predates it.
-    pub const ALL_LABELS: [&'static str; 3] = ["in_sync", "extended", "diverged"];
+    pub const ALL_LABELS: [&'static str; 4] = ["in_sync", "extended", "diverged", "stale_log"];
 }
 
 /// What the store knows about an execution.
@@ -370,7 +406,24 @@ impl<'a> ChainPopulator<'a> {
         }
     }
 
+    /// Write the coverage record. ⚠⚠ **MONOTONIC — coverage never shrinks.**
+    ///
+    /// A caller whose log snapshot is behind would otherwise record a SMALLER
+    /// total than the partition holds, and `chain_if_authoritative` would then
+    /// refuse on `chain.len() != cov_total`. That turns a benign stale read into
+    /// an unservable partition — the same false alarm as
+    /// [`FromLog::StaleLog`], one layer down.
+    ///
+    /// Coverage describes how much of the execution the store has seen. That
+    /// quantity only grows, so a smaller value is always the older observation
+    /// and is dropped.
     fn write_coverage(&self, execution_id: &str, root: &str, total: usize) -> Result<()> {
+        if let Some((existing_root, existing_total)) = self.coverage(execution_id)? {
+            if existing_total > total && existing_root == root {
+                // An older observation. Keep what we have.
+                return Ok(());
+            }
+        }
         self.substrate
             .put_overwrite(&cov_key(execution_id), format!("{root}:{total}").as_bytes())
     }
@@ -420,19 +473,46 @@ impl<'a> ChainPopulator<'a> {
             match events.get(i) {
                 Some(want) if want.event_id == have.event_id => {}
                 Some(want) => {
+                    // ⚠⚠ REVOKE SERVE-TRUST. A content conflict means the stored
+                    // chain disagrees with the authoritative log at a position
+                    // both hold — and Postgres is authoritative, so the STORE is
+                    // the wrong one. Dropping the coverage record makes
+                    // `chain_if_authoritative` refuse until a clean repopulate.
+                    //
+                    // Without this the partition stayed servable after a detected
+                    // conflict: this function reports rather than repairs, so it
+                    // wrote nothing, and the previously-healthy coverage still
+                    // matched. The CALLING source refuses on `Diverged`, but any
+                    // other reader calling `chain_if_authoritative` alone would be
+                    // handed the chain we just proved wrong. Found by the test
+                    // `a360_a_real_content_conflict_is_still_diverged`.
+                    //
+                    // ⚠ The EVENTS and the watermark are left intact — this
+                    // revokes trust, it does not destroy evidence. A conflict is
+                    // something to investigate, and deleting the diverging chain
+                    // would remove the only copy of what disagreed.
+                    self.substrate.delete(&cov_key(execution_id)).ok();
                     return Ok(FromLog::Diverged {
                         at_position: i,
                         stored: have.event_id.clone(),
                         log: want.event_id.clone(),
-                    })
+                    });
                 }
-                // The store holds MORE than the log. Not a prefix mismatch but the
-                // same verdict: the two disagree about history.
+                // ⭐ The store holds MORE than the caller's snapshot, and
+                // everything the snapshot holds matched. That is the CALLER being
+                // behind, not a disagreement — see `FromLog::StaleLog`. Returning
+                // `Diverged` here is what produced 6.3% false divergence on the
+                // prod ramp (noetl/ai-meta#360).
+                //
+                // ⚠ Return WITHOUT writing coverage: a stale snapshot would record
+                // a SMALLER total than the partition holds, and the guarded read
+                // would then refuse on `chain.len() != cov_total`. Fixing the
+                // classification without this would only convert a false
+                // divergence into a false refusal.
                 None => {
-                    return Ok(FromLog::Diverged {
-                        at_position: i,
-                        stored: have.event_id.clone(),
-                        log: String::new(),
+                    return Ok(FromLog::StaleLog {
+                        stored_len: stored.len(),
+                        log_len: events.len(),
                     })
                 }
             }
