@@ -35,11 +35,32 @@
 //! not. The partition is already the unit of ownership; the watermark belongs on
 //! it.
 //!
-//! ⚠ **The marker is written BEFORE the first event, not after.** Written after,
-//! a crash mid-populate leaves events present with no marker — a reader falls
-//! through and the population is invisible. Written before, a crash leaves a
-//! marker with a short chain, which the chain's own gap detection already
-//! reports honestly. The failure mode is chosen, not inherited.
+//! ⚠⚠ **The marker ordering is ASYMMETRIC.** A never-seen execution is appended
+//! FIRST and marked after; an already-authoritative one is marked FIRST and
+//! appended after. The rule in one line: **never create authority out of a
+//! failure.** The argument, and the defect that produced it, are in the comment
+//! inside [`ChainPopulator::populate`]. (This paragraph asserted the uniform
+//! "marker before the append" ordering until 2026-09-29, after the asymmetry had
+//! already landed — the same doc drift the function-level guard now pins, one
+//! level up.)
+//!
+//! ## ⭐⭐ The source of truth is the LOG, not the emit path
+//!
+//! [`ChainPopulator::populate_from_log`] is the entry point a reader should be
+//! built on. It takes an execution's events **as the authoritative log ordered
+//! them** and **recomputes the chain edges from that order**, rather than
+//! trusting whatever `prev_event_id` the rows carry.
+//!
+//! That is not defensiveness, it is the measured reality: in the kind database
+//! **643,420 of 645,677 rows carry `prev_event_id IS NULL`**, and **534 of 595
+//! executions carry more than one null-prev root**, because the emit path stamps
+//! the edge from an in-memory head map that does not survive a restart. A
+//! populator that trusted the column would build a partition rooted wherever the
+//! server last restarted.
+//!
+//! Recomputing from order also makes population **idempotent and restart-proof by
+//! construction**: the stored chain must be a prefix of the log, and anything
+//! beyond that prefix is appended. There is no in-memory state to lose.
 
 use ehdb_core::{EhdbError, Result};
 
@@ -66,6 +87,75 @@ pub fn populator_enabled() -> bool {
 
 fn wm_key(execution_id: &str) -> String {
     format!("chain/{execution_id}/wm")
+}
+
+/// The **coverage** record: proof that this partition was built from the
+/// authoritative log, and from that log's first event.
+///
+/// ```text
+/// chain/<execution_id>/cov  ->  "<root_event_id>:<total_in_log>"
+/// ```
+///
+/// The watermark answers *"was this populated?"*. It cannot answer *"was it
+/// populated from the BEGINNING?"* — its `first_seq` is the **store's** sequence,
+/// which is `1` for any fresh partition regardless of where the execution
+/// actually started. Measured 2026-09-28: an execution with 3 events in the log
+/// and 1 in the store reported `authoritative first=1 through=1`, and the guarded
+/// read returned a confident, contiguous, gap-check-passing chain that began at
+/// the execution's third event.
+///
+/// So coverage is recorded separately, and [`ChainPopulator::chain_if_authoritative`]
+/// refuses any partition that lacks it. A partition written by the per-event
+/// [`ChainPopulator::populate`] path has no coverage record and is therefore never
+/// served — which is deliberate: that path cannot know whether it saw the
+/// execution's first event.
+fn cov_key(execution_id: &str) -> String {
+    format!("chain/{execution_id}/cov")
+}
+
+/// One event as the authoritative log gives it, in log order.
+///
+/// ⚠ There is no `prev_event_id` field, and its absence is the point. The edge is
+/// recomputed from the position in this slice; a column that is NULL on 99.65% of
+/// prod-shaped rows is not an input worth having.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEvent {
+    pub event_id: String,
+    pub parent_execution_id: Option<String>,
+    pub payload: String,
+}
+
+/// What [`ChainPopulator::populate_from_log`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromLog {
+    /// The partition now matches the log exactly.
+    InSync { total: usize, appended: usize },
+    /// ⚠ The stored chain is **not a prefix** of the log, so the two disagree
+    /// about history and the partition must not be served.
+    ///
+    /// Reported rather than repaired: silently rewriting an immutable chain to
+    /// match a new reading is how a store stops being evidence. `at_position` is
+    /// 0-based in log order.
+    Diverged {
+        at_position: usize,
+        stored: String,
+        log: String,
+    },
+}
+
+impl FromLog {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InSync { appended: 0, .. } => "in_sync",
+            Self::InSync { .. } => "extended",
+            Self::Diverged { .. } => "diverged",
+        }
+    }
+
+    /// Every label, for pinning at 0 — absence is the default for a labelled
+    /// series, so an unpinned family is indistinguishable from a build that
+    /// predates it.
+    pub const ALL_LABELS: [&'static str; 3] = ["in_sync", "extended", "diverged"];
 }
 
 /// What the store knows about an execution.
@@ -263,6 +353,128 @@ impl<'a> ChainPopulator<'a> {
         Ok(())
     }
 
+    /// Read the coverage record: `(root_event_id, total_in_log)`.
+    pub fn coverage(&self, execution_id: &str) -> Result<Option<(String, usize)>> {
+        match self.substrate.get_all(&cov_key(execution_id)) {
+            Ok(bytes) => {
+                let raw = String::from_utf8_lossy(&bytes).to_string();
+                let (root, total) = raw
+                    .rsplit_once(':')
+                    .ok_or_else(|| EhdbError::Storage(format!("malformed coverage: {raw:?}")))?;
+                let total = total
+                    .parse()
+                    .map_err(|e| EhdbError::Storage(format!("coverage total: {e}")))?;
+                Ok(Some((root.to_string(), total)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn write_coverage(&self, execution_id: &str, root: &str, total: usize) -> Result<()> {
+        self.substrate
+            .put_overwrite(&cov_key(execution_id), format!("{root}:{total}").as_bytes())
+    }
+
+    /// ⭐⭐ **Populate from the authoritative log.** This is the entry point a
+    /// reader should be built on.
+    ///
+    /// `events` is the execution's events **in the order the authoritative log
+    /// gives them** (for `noetl.event`, ascending `event_id` — a per-execution
+    /// monotonic snowflake). The chain edge is **recomputed from that order**: the
+    /// first event is the root and each subsequent event links to its predecessor.
+    ///
+    /// ⚠⚠ The log's own `prev_event_id` column is deliberately not an input. It is
+    /// NULL on 643,420 of 645,677 kind rows, and 534 of 595 executions carry more
+    /// than one null-prev root, because the emit path stamps the edge from an
+    /// in-memory head map that does not survive a restart. Trusting the column
+    /// would root the partition wherever the server last happened to restart.
+    ///
+    /// Idempotent and incremental: the stored chain must be a **prefix** of
+    /// `events`, and only the remainder is appended. Re-running with a longer log
+    /// extends the partition; re-running with the same log appends nothing.
+    ///
+    /// A disagreement with the stored prefix returns [`FromLog::Diverged`] and
+    /// writes nothing — an immutable chain is not silently rewritten to match a
+    /// new reading.
+    pub fn populate_from_log(&self, execution_id: &str, events: &[LogEvent]) -> Result<FromLog> {
+        // An execution the log genuinely has nothing for: mark it covered so the
+        // empty answer is trusted rather than mistaken for "never populated".
+        //
+        // ⚠ The CALLER must not pass an empty slice for a failed read. A read
+        // failure is "cannot answer" and has to stay distinguishable from "the log
+        // has no events"; collapsing the two here is the exact bug this module
+        // exists to prevent, moved up one level.
+        if events.is_empty() {
+            self.write_watermark(execution_id, 0, 0)?;
+            self.write_coverage(execution_id, "", 0)?;
+            return Ok(FromLog::InSync {
+                total: 0,
+                appended: 0,
+            });
+        }
+
+        let stored = self.store.chain(execution_id)?;
+
+        // The stored chain must be a prefix of the log, position for position.
+        for (i, have) in stored.iter().enumerate() {
+            match events.get(i) {
+                Some(want) if want.event_id == have.event_id => {}
+                Some(want) => {
+                    return Ok(FromLog::Diverged {
+                        at_position: i,
+                        stored: have.event_id.clone(),
+                        log: want.event_id.clone(),
+                    })
+                }
+                // The store holds MORE than the log. Not a prefix mismatch but the
+                // same verdict: the two disagree about history.
+                None => {
+                    return Ok(FromLog::Diverged {
+                        at_position: i,
+                        stored: have.event_id.clone(),
+                        log: String::new(),
+                    })
+                }
+            }
+        }
+
+        // Coverage is claimed BEFORE extending, for the same reason the watermark
+        // is on the already-authoritative path: the root is already decided by the
+        // log's first event, and a crash mid-extend must not leave a partition that
+        // under-reports what it holds. It is not creating authority out of a
+        // failure — the root it records is read from the log, not from a write that
+        // might not have happened.
+        self.write_coverage(execution_id, &events[0].event_id, events.len())?;
+
+        let mut appended = 0usize;
+        for (i, ev) in events.iter().enumerate().skip(stored.len()) {
+            let prev = if i == 0 {
+                None
+            } else {
+                Some(events[i - 1].event_id.as_str())
+            };
+            self.store
+                .append(
+                    execution_id,
+                    &ev.event_id,
+                    prev,
+                    ev.parent_execution_id.as_deref(),
+                    &ev.payload,
+                )
+                .map_err(|e| EhdbError::Storage(e.to_string()))?;
+            appended += 1;
+        }
+
+        // The watermark last, and only once the content is actually there, so it
+        // never claims more than the partition holds.
+        self.write_watermark(execution_id, 1, events.len() as ExecSeq)?;
+
+        Ok(FromLog::InSync {
+            total: events.len(),
+            appended,
+        })
+    }
+
     /// ⭐ **The guarded read.** `None` means *the store cannot answer*, which a
     /// caller must treat as "fall through", never as "no events".
     ///
@@ -304,6 +516,42 @@ impl<'a> ChainPopulator<'a> {
             return Ok(None);
         }
 
-        Ok(Some(self.store.chain(execution_id)?))
+        // ⭐⭐ COVERAGE: was this partition built from the log, and from the log's
+        // FIRST event?
+        //
+        // The watermark cannot answer that. Its `first_seq` is the STORE's
+        // sequence, which is 1 for any fresh partition no matter where the
+        // execution actually began. Measured 2026-09-28: an execution with 3 events
+        // in the log and 1 in the store read `authoritative first=1 through=1`, and
+        // this function returned a contiguous, gap-check-passing chain that started
+        // at the execution's third event — a reader seeing a running execution
+        // whose history begins wherever the populator happened to be armed.
+        //
+        // Only `populate_from_log` writes the coverage record, so a partition built
+        // by the per-event path is never served. That is deliberate: the per-event
+        // path cannot know whether it saw the execution's first event.
+        let Some((cov_root, cov_total)) = self.coverage(execution_id)? else {
+            return Ok(None);
+        };
+
+        let chain = self.store.chain(execution_id)?;
+
+        // The recorded root must still be the root the partition holds, and the
+        // recorded total must match what is stored. Either disagreement means the
+        // partition is not the one the coverage describes.
+        if chain.len() != cov_total {
+            return Ok(None);
+        }
+        match chain.first() {
+            None => {
+                if !cov_root.is_empty() {
+                    return Ok(None);
+                }
+            }
+            Some(first) if first.event_id == cov_root => {}
+            Some(_) => return Ok(None),
+        }
+
+        Ok(Some(chain))
     }
 }

@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use ehdb_l0::chain::{ChainError, ChainEvent};
-use ehdb_l0::chain_populator::{populator_enabled, Authority, ChainPopulator, POPULATOR_ENV};
+use ehdb_l0::chain_populator::{
+    populator_enabled, Authority, ChainPopulator, FromLog, LogEvent, POPULATOR_ENV,
+};
 use ehdb_l0::chain_store_durable::DurableChainStore;
 use ehdb_l0::substrate::{DurableSubstrate, LocalFsSubstrate};
 
@@ -33,6 +35,19 @@ impl Rig {
     fn pop(&self) -> ChainPopulator<'_> {
         ChainPopulator::new(&self.store, self.substrate.as_ref())
     }
+}
+
+/// Build a log slice from ids. ⚠ Deliberately carries NO `prev_event_id`: the
+/// edge is recomputed from position, because the column is NULL on 99.65% of
+/// prod-shaped rows.
+fn log(ids: &[&str]) -> Vec<LogEvent> {
+    ids.iter()
+        .map(|id| LogEvent {
+            event_id: (*id).to_string(),
+            parent_execution_id: None,
+            payload: "{}".to_string(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +95,12 @@ fn an_unpopulated_execution_is_not_populated_not_empty() {
 fn a_populated_execution_is_authoritative_and_answers() {
     let r = rig();
     let p = r.pop();
-    p.populate("e1", "a", None, None, "{}").expect("populate");
-    p.populate("e1", "b", Some("a"), None, "{}")
-        .expect("populate");
+    // ⚠ Built through the LOG path, because that is the only source the guarded
+    // read serves. The per-event `populate` path still writes, but it cannot know
+    // whether it saw the execution's first event, so it records no coverage and is
+    // never served — see `a_per_event_populated_partition_is_never_served`.
+    p.populate_from_log("e1", &log(&["a", "b"]))
+        .expect("populate from log");
 
     match p.authority("e1").expect("authority") {
         Authority::Authoritative {
@@ -111,13 +129,10 @@ fn a_populated_execution_is_authoritative_and_answers() {
 fn a_populated_but_eventless_execution_answers_empty_and_is_trusted() {
     let r = rig();
     let p = r.pop();
-    // Populate then remove the event, leaving the marker — the shape a
-    // retention sweep or a cancelled execution produces.
-    p.populate("e1", "a", None, None, "{}").expect("populate");
-    r.substrate.delete("chain/e1/ev/a").expect("delete event");
-    r.substrate
-        .delete("chain/e1/seq/00000000000000000001")
-        .expect("delete pointer");
+    // An execution the authoritative log genuinely has no events for. The caller
+    // read the log successfully and it was empty — which is NOT the same as a read
+    // that failed, and the populator's doc makes that the caller's obligation.
+    p.populate_from_log("e1", &[]).expect("populate empty");
 
     assert!(p.authority("e1").unwrap().is_trustworthy());
     assert_eq!(
@@ -136,7 +151,7 @@ fn a_populated_but_eventless_execution_answers_empty_and_is_trusted() {
 fn the_three_states_are_distinguishable() {
     let r = rig();
     let p = r.pop();
-    p.populate("populated", "a", None, None, "{}").unwrap();
+    p.populate_from_log("populated", &log(&["a"])).unwrap();
 
     let never = p.chain_if_authoritative("never").unwrap();
     let full = p.chain_if_authoritative("populated").unwrap();
@@ -256,7 +271,7 @@ fn population_survives_reopening_the_store() {
         let sub: Arc<dyn DurableSubstrate> = Arc::new(fs);
         let store = DurableChainStore::new(Arc::clone(&sub));
         let p = ChainPopulator::new(&store, sub.as_ref());
-        p.populate("e1", "a", None, None, "{}").unwrap();
+        p.populate_from_log("e1", &log(&["a"])).unwrap();
     }
     let fs = LocalFsSubstrate::new(dir.path()).unwrap();
     let sub: Arc<dyn DurableSubstrate> = Arc::new(fs);
@@ -397,11 +412,13 @@ fn a_succeeding_first_populate_does_create_authority() {
         p.authority("e-fresh").unwrap().is_trustworthy(),
         "a successful first populate MUST create authority"
     );
+    // ⚠ Authority, but NOT served. The per-event path records no coverage, so the
+    // guarded read refuses it — see `a_per_event_populated_partition_is_never_served`
+    // for the argument. This test's own subject is the WATERMARK, which is created.
     assert_eq!(
-        p.chain_if_authoritative("e-fresh")
-            .unwrap()
-            .map(|c| c.len()),
-        Some(1)
+        p.chain_if_authoritative("e-fresh").unwrap(),
+        None,
+        "a per-event-populated partition has no coverage record and is not served"
     );
 }
 
@@ -511,58 +528,332 @@ fn the_populate_doc_does_not_claim_uniform_watermark_first_ordering() {
     );
 }
 
-/// ⚠⚠ **The restart scenario, as measured in kind on 2026-09-28.**
+/// ⭐⭐ **The restart scenario, as measured in kind on 2026-09-28 — now fixed by
+/// construction.**
 ///
-/// The server stamps the chain edge from an in-memory head map that does not
-/// survive a restart, so the next event for a still-running execution arrives
-/// with `prev = None`. The store rejects it (it is not the head), and the
-/// partition then stops growing while the execution keeps emitting.
+/// The emit path stamps the chain edge from an in-memory head map that does not
+/// survive a restart, so the next event for a still-running execution reaches the
+/// log with `prev_event_id = NULL`. Under the per-event populator that row was
+/// rejected as not-the-head and the partition then froze while the execution kept
+/// emitting: Postgres 7 events, store 6, watermark `1:7`.
 ///
-/// Without the watermark tripwire the store serves the pre-restart prefix and
-/// looks entirely healthy doing it: the sequences are contiguous, the chain's own
-/// gap check passes, and nothing in the returned value says "there is more".
-/// That is a reader concluding a running execution's history ends where the
-/// server happened to restart.
+/// `populate_from_log` cannot exhibit that, because it never reads the column. The
+/// log below is exactly the prod shape — a second null-prev "root" in the middle —
+/// and the resulting chain is fully linked with no second root.
 #[test]
-fn a_post_restart_pseudo_root_freezes_the_chain_and_the_read_refuses() {
+fn a_post_restart_null_prev_row_does_not_create_a_pseudo_root() {
     let r = rig();
     let p = r.pop();
-    p.populate("e-restart", "e1", None, None, "{}").unwrap();
-    p.populate("e-restart", "e2", Some("e1"), None, "{}")
-        .unwrap();
-    p.populate("e-restart", "e3", Some("e2"), None, "{}")
-        .unwrap();
 
-    // Healthy: marker and content agree, so the read answers.
+    // The log as Postgres holds it after a mid-flight restart. `log()` carries no
+    // prev column at all, which IS the fix: position is the only input.
+    let out = p
+        .populate_from_log("e-restart", &log(&["e1", "e2", "e3", "e4", "e5"]))
+        .expect("populate from log");
     assert_eq!(
-        p.chain_if_authoritative("e-restart")
-            .unwrap()
-            .map(|c| c.len()),
-        Some(3),
-        "a chain populated from its root and up to date must be readable"
+        out,
+        FromLog::InSync {
+            total: 5,
+            appended: 5
+        }
     );
 
-    // The restart: the next event carries no chain edge, because the map that
-    // held the head is gone.
-    let rejected = p.populate("e-restart", "e4", None, None, "{}");
+    let chain = p
+        .chain_if_authoritative("e-restart")
+        .expect("guarded read")
+        .expect("a log-sourced partition is served");
+    assert_eq!(
+        chain.len(),
+        5,
+        "every event, including the post-restart ones"
+    );
+
+    // ⭐ Exactly ONE root, and every other event links to its predecessor.
+    let roots = chain.iter().filter(|e| e.prev_event_id.is_none()).count();
+    assert_eq!(
+        roots, 1,
+        "a log carrying a second null-prev row must still yield ONE chain root; \
+         found {roots}. This is the 534-of-595 shape from the kind database."
+    );
+    for w in chain.windows(2) {
+        assert_eq!(
+            w[1].prev_event_id.as_deref(),
+            Some(w[0].event_id.as_str()),
+            "each event must link to its predecessor in log order"
+        );
+    }
+}
+
+/// ⭐⭐ **Mid-flight arming no longer truncates.**
+///
+/// Measured before the fix: an execution armed after it started held 1 event
+/// against the log's 3, reported `authoritative first=1 through=1`, and the
+/// guarded read returned a contiguous, gap-check-passing chain beginning at the
+/// execution's THIRD event. `first=1` was true of the store and false of the
+/// execution.
+///
+/// Arming mid-flight now populates from the log's first event, so the partition is
+/// complete the moment it exists.
+#[test]
+fn arming_mid_flight_populates_from_the_logs_first_event() {
+    let r = rig();
+    let p = r.pop();
+
+    // The execution has been running for a while; the populator is armed now.
+    let full = log(&["a", "b", "c"]);
+    p.populate_from_log("e-mid", &full).expect("populate");
+
+    let chain = p.chain_if_authoritative("e-mid").unwrap().expect("served");
+    assert_eq!(
+        chain.len(),
+        3,
+        "the WHOLE log, not the tail from arming time"
+    );
+    assert_eq!(chain[0].event_id, "a", "rooted at the log's first event");
     assert!(
-        rejected.is_err(),
-        "an event claiming to be a second root must be rejected, not appended"
+        chain[0].prev_event_id.is_none(),
+        "and that root is the only event with no predecessor"
     );
+}
 
-    // The chain is now permanently behind the log — every later event is
-    // rejected for the same reason — and the read must say so.
+/// ⚠⚠ A partition built by the **per-event** path is never served.
+///
+/// It cannot know whether it saw the execution's first event, so it records no
+/// coverage. The watermark alone cannot cover for that: its `first_seq` is the
+/// STORE's sequence, `1` for any fresh partition regardless of where the execution
+/// began — which is precisely how the truncated read passed for authoritative.
+#[test]
+fn a_per_event_populated_partition_is_never_served() {
+    let r = rig();
+    let p = r.pop();
+    p.populate("e-emit", "x", None, None, "{}").unwrap();
+    p.populate("e-emit", "y", Some("x"), None, "{}").unwrap();
+
+    assert!(
+        p.authority("e-emit").unwrap().is_trustworthy(),
+        "the watermark exists"
+    );
     assert_eq!(
-        p.chain_if_authoritative("e-restart").unwrap(),
+        p.coverage("e-emit").unwrap(),
         None,
-        "the chain stopped tracking the execution, so the guarded read must \
-         refuse instead of serving the frozen prefix"
+        "but no coverage record — the per-event path cannot claim one"
+    );
+    assert_eq!(
+        p.chain_if_authoritative("e-emit").unwrap(),
+        None,
+        "so the guarded read refuses, however complete the partition happens to be"
+    );
+}
+
+/// ⚠ A crash part-way through extending leaves coverage claiming more than the
+/// partition holds, and the read must refuse.
+///
+/// This is the realistic failure of the log path: coverage is claimed before the
+/// appends (so a crash cannot make the store under-report), which means a crash
+/// mid-extend leaves `cov_total` ahead of the stored length.
+#[test]
+fn coverage_claiming_more_than_is_stored_refuses() {
+    let r = rig();
+    let p = r.pop();
+    p.populate_from_log("e-part", &log(&["a", "b"])).unwrap();
+    assert!(p.chain_if_authoritative("e-part").unwrap().is_some());
+
+    // Simulate the crash: coverage says 4, the partition holds 2.
+    r.substrate
+        .put_overwrite("chain/e-part/cov", b"a:4")
+        .expect("advance coverage");
+
+    assert_eq!(
+        p.chain_if_authoritative("e-part").unwrap(),
+        None,
+        "coverage ahead of content must read as CANNOT ANSWER"
+    );
+}
+
+/// ⚠ Coverage naming a different root than the partition holds must refuse.
+///
+/// Guards the case where a partition was rebuilt from a different starting point —
+/// the truncation defect's signature — even if the counts happen to line up.
+#[test]
+fn coverage_naming_a_different_root_refuses() {
+    let r = rig();
+    let p = r.pop();
+    p.populate_from_log("e-root", &log(&["a", "b"])).unwrap();
+
+    r.substrate
+        .put_overwrite("chain/e-root/cov", b"zzz:2")
+        .expect("rewrite coverage root");
+
+    assert_eq!(
+        p.chain_if_authoritative("e-root").unwrap(),
+        None,
+        "a coverage root that is not the partition's root must read as CANNOT ANSWER"
+    );
+}
+
+/// ⚠ The watermark tripwire must still be reachable on a **covered** partition.
+///
+/// Without this the tripwire would be dead code for every partition that can
+/// actually be served: the coverage gate would refuse first in every realistic
+/// case. Defence in depth is only defence if something exercises it.
+#[test]
+fn the_watermark_tripwire_still_fires_on_a_covered_partition() {
+    let r = rig();
+    let p = r.pop();
+    p.populate_from_log("e-wm", &log(&["a", "b"])).unwrap();
+    assert!(p.chain_if_authoritative("e-wm").unwrap().is_some());
+
+    // Coverage stays correct; only the watermark runs ahead.
+    r.substrate
+        .put_overwrite("chain/e-wm/wm", b"1:9")
+        .expect("advance watermark");
+
+    assert_eq!(
+        p.chain_if_authoritative("e-wm").unwrap(),
+        None,
+        "a watermark ahead of the stored head must refuse even when coverage agrees"
+    );
+}
+
+/// ⚠ Re-running with the same log appends nothing; with a longer log, extends.
+#[test]
+fn population_from_the_log_is_idempotent_and_incremental() {
+    let r = rig();
+    let p = r.pop();
+
+    assert_eq!(
+        p.populate_from_log("e-inc", &log(&["a", "b"])).unwrap(),
+        FromLog::InSync {
+            total: 2,
+            appended: 2
+        }
+    );
+    assert_eq!(
+        p.populate_from_log("e-inc", &log(&["a", "b"])).unwrap(),
+        FromLog::InSync {
+            total: 2,
+            appended: 0
+        },
+        "re-running with the same log must append nothing, not fail"
+    );
+    assert_eq!(
+        p.populate_from_log("e-inc", &log(&["a", "b", "c"]))
+            .unwrap(),
+        FromLog::InSync {
+            total: 3,
+            appended: 1
+        },
+        "a longer log extends the partition by exactly the remainder"
     );
 
-    // ⭐ The events are still stored. Refusing to serve is not deleting.
-    assert_eq!(
-        p.authority("e-restart").unwrap().label(),
-        "authoritative",
-        "the marker survives, which is what a repair pass needs to find this"
+    let chain = p.chain_if_authoritative("e-inc").unwrap().expect("served");
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain[2].prev_event_id.as_deref(), Some("b"));
+}
+
+/// ⚠ A log that disagrees with the stored prefix is REPORTED, not repaired.
+///
+/// Silently rewriting an immutable chain to match a new reading is how a store
+/// stops being evidence.
+#[test]
+fn a_log_disagreeing_with_the_stored_prefix_is_reported_not_repaired() {
+    let r = rig();
+    let p = r.pop();
+    p.populate_from_log("e-div", &log(&["a", "b"])).unwrap();
+
+    let out = p
+        .populate_from_log("e-div", &log(&["a", "DIFFERENT"]))
+        .unwrap();
+    match out {
+        FromLog::Diverged {
+            at_position,
+            stored,
+            log: l,
+        } => {
+            assert_eq!(at_position, 1);
+            assert_eq!(stored, "b");
+            assert_eq!(l, "DIFFERENT");
+        }
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+
+    // ⭐ And nothing was rewritten.
+    let chain = p.chain_if_authoritative("e-div").unwrap().expect("served");
+    assert_eq!(chain[1].event_id, "b", "the stored chain is untouched");
+}
+
+/// Every `FromLog` label is enumerated, so none is an absent series.
+#[test]
+fn from_log_labels_are_enumerated_for_pinning() {
+    for v in [
+        FromLog::InSync {
+            total: 1,
+            appended: 0,
+        },
+        FromLog::InSync {
+            total: 1,
+            appended: 1,
+        },
+        FromLog::Diverged {
+            at_position: 0,
+            stored: String::new(),
+            log: String::new(),
+        },
+    ] {
+        assert!(
+            FromLog::ALL_LABELS.contains(&v.label()),
+            "{} missing from ALL_LABELS",
+            v.label()
+        );
+    }
+    assert_eq!(FromLog::ALL_LABELS.len(), 3);
+}
+
+/// ⚠⚠ A failed append part-way through `populate_from_log`.
+///
+/// Found by a surviving mutant: moving the watermark write to BEFORE the appends
+/// changed no test, which meant nothing exercised the log path's failure case at
+/// all. The population below fails on its second event (the store refuses an empty
+/// id), leaving coverage claiming 2 over a partition holding 1.
+///
+/// The property is that the guarded read refuses afterwards **and** that the
+/// watermark is not left claiming content that was never written.
+#[test]
+fn a_failed_append_mid_extend_leaves_nothing_servable() {
+    let r = rig();
+    let p = r.pop();
+
+    let bad = vec![
+        LogEvent {
+            event_id: "a".to_string(),
+            parent_execution_id: None,
+            payload: "{}".to_string(),
+        },
+        LogEvent {
+            event_id: String::new(), // the store refuses this
+            parent_execution_id: None,
+            payload: "{}".to_string(),
+        },
+    ];
+    assert!(
+        p.populate_from_log("e-fail", &bad).is_err(),
+        "an append the store refuses must surface, not be swallowed"
     );
+
+    assert_eq!(
+        p.chain_if_authoritative("e-fail").unwrap(),
+        None,
+        "a partition whose population failed part-way must not be served"
+    );
+
+    // ⭐ The watermark must not claim events that were never appended. Writing it
+    // before the appends is what the surviving mutant did; this is the assertion
+    // that makes that ordering load-bearing rather than incidental.
+    match p.authority("e-fail").unwrap() {
+        Authority::NotPopulated => {}
+        Authority::Authoritative { through_seq, .. } => panic!(
+            "the watermark claims through_seq={through_seq} after a failed \
+             mid-extend; it must not be written until the content is there"
+        ),
+    }
 }
