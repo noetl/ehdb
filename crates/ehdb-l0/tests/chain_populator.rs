@@ -1111,7 +1111,6 @@ fn a360_coverage_guard_rejects_a_shrinking_total() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // noetl/ai-meta#362 — the chain is defined by LINKS, never by id order.
 // ---------------------------------------------------------------------------
@@ -1193,7 +1192,10 @@ fn a362_input_slice_order_is_irrelevant() {
         ev("d", Some("c")),
         ev("b", Some("a")),
     ];
-    assert_eq!(ids_of(&events, &order_by_links(&events)), vec!["a", "b", "c", "d"]);
+    assert_eq!(
+        ids_of(&events, &order_by_links(&events)),
+        vec!["a", "b", "c", "d"]
+    );
 }
 
 #[test]
@@ -1274,9 +1276,18 @@ fn a362_all_labels_are_enumerated() {
         LinkOrder::Ordered(vec![]),
         LinkOrder::MultipleRoots { roots: vec![] },
         LinkOrder::NoRoot,
-        LinkOrder::Fork { at: String::new(), successors: vec![] },
-        LinkOrder::Dangling { event: String::new(), prev: String::new() },
-        LinkOrder::Unreachable { reached: 0, total: 0 },
+        LinkOrder::Fork {
+            at: String::new(),
+            successors: vec![],
+        },
+        LinkOrder::Dangling {
+            event: String::new(),
+            prev: String::new(),
+        },
+        LinkOrder::Unreachable {
+            reached: 0,
+            total: 0,
+        },
     ] {
         assert!(all.contains(&o.label()), "{} is not pinned", o.label());
     }
