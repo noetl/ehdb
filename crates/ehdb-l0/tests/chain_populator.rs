@@ -40,14 +40,33 @@ impl Rig {
 /// Build a log slice from ids. ⚠ Deliberately carries NO `prev_event_id`: the
 /// edge is recomputed from position, because the column is NULL on 99.65% of
 /// prod-shaped rows.
+/// A LINKED log: each event's `prev_event_id` is its neighbour to the left, and
+/// the first is the root. This is what a healthy execution looks like
+/// (noetl/ai-meta#362) — one root, every other event linked.
 fn log(ids: &[&str]) -> Vec<LogEvent> {
     ids.iter()
-        .map(|id| LogEvent {
+        .enumerate()
+        .map(|(i, id)| LogEvent {
             event_id: (*id).to_string(),
             parent_execution_id: None,
             payload: "{}".to_string(),
+            prev_event_id: if i == 0 {
+                None
+            } else {
+                Some(ids[i - 1].to_string())
+            },
         })
         .collect()
+}
+
+/// An event with an explicit link, for building deliberately malformed sets.
+fn ev(id: &str, prev: Option<&str>) -> LogEvent {
+    LogEvent {
+        event_id: id.to_string(),
+        parent_execution_id: None,
+        payload: "{}".to_string(),
+        prev_event_id: prev.map(|p| p.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -866,11 +885,13 @@ fn a_failed_append_mid_extend_leaves_nothing_servable() {
             event_id: "a".to_string(),
             parent_execution_id: None,
             payload: "{}".to_string(),
+            prev_event_id: None,
         },
         LogEvent {
             event_id: String::new(), // the store refuses this
             parent_execution_id: None,
             payload: "{}".to_string(),
+            prev_event_id: Some("a".to_string()),
         },
     ];
     assert!(
@@ -1088,4 +1109,176 @@ fn a360_coverage_guard_rejects_a_shrinking_total() {
          total is always the older observation, and accepting it would let a \
          partition look complete when the log once held more."
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#362 — the chain is defined by LINKS, never by id order.
+// ---------------------------------------------------------------------------
+
+use ehdb_l0::chain_populator::{order_by_links, LinkOrder};
+
+fn ids_of(events: &[LogEvent], o: &LinkOrder) -> Vec<String> {
+    match o {
+        LinkOrder::Ordered(idx) => idx.iter().map(|&i| events[i].event_id.clone()).collect(),
+        other => panic!("expected Ordered, got {other:?}"),
+    }
+}
+
+/// ⭐⭐ **THE #362 TEST.** An event that commits into the MIDDLE of an id-ordered
+/// read is ordered correctly by links — and this test proves it DISCRIMINATES by
+/// asserting that sorting on `event_id` would give a different answer.
+///
+/// Without that second assertion the test would pass on an id-sorting
+/// implementation too, and would be measuring nothing.
+#[test]
+fn a362_an_interior_insert_is_ordered_by_links_not_by_id() {
+    // Chain order: e10 -> e90 -> e20.  `e20` was minted before `e90` but committed
+    // after it, so its id sorts in the middle while its LINK puts it last.
+    let events = vec![
+        ev("e10", None),
+        ev("e90", Some("e10")),
+        ev("e20", Some("e90")),
+    ];
+
+    let got = order_by_links(&events);
+    assert_eq!(
+        ids_of(&events, &got),
+        vec!["e10", "e90", "e20"],
+        "links must define the order"
+    );
+
+    // ⚠ The discriminating half: id-order disagrees, so a pass here cannot come
+    // from an implementation that sorts.
+    let mut by_id: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
+    by_id.sort();
+    assert_eq!(
+        by_id,
+        vec!["e10", "e20", "e90"],
+        "fixture sanity: id order must DIFFER from link order, or this test is vacuous"
+    );
+    assert_ne!(
+        ids_of(&events, &got),
+        by_id.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "link order and id order must differ here — that difference IS the bug #362 fixes"
+    );
+}
+
+/// ⚠⚠ The re-rooting defect: two events claim genesis. Unbuildable by design —
+/// the links cannot say which root is real.
+#[test]
+fn a362_multiple_roots_is_reported_not_guessed() {
+    let events = vec![
+        ev("e1", None),
+        ev("e2", Some("e1")),
+        ev("e5", None), // the false root a lost head map stamps
+        ev("e6", Some("e5")),
+    ];
+    match order_by_links(&events) {
+        LinkOrder::MultipleRoots { roots } => assert_eq!(roots, vec!["e1", "e5"]),
+        other => panic!(
+            "two roots MUST be reported. Got {other:?}. Walking from an arbitrary \
+             root returns a plausible prefix — a confident wrong answer."
+        ),
+    }
+}
+
+/// A slice in scrambled order is still ordered correctly — position in the input
+/// carries no meaning at all.
+#[test]
+fn a362_input_slice_order_is_irrelevant() {
+    let events = vec![
+        ev("c", Some("b")),
+        ev("a", None),
+        ev("d", Some("c")),
+        ev("b", Some("a")),
+    ];
+    assert_eq!(ids_of(&events, &order_by_links(&events)), vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn a362_no_root_is_reported() {
+    // A cycle: every event points at another, so nothing is genesis.
+    let events = vec![ev("x", Some("y")), ev("y", Some("x"))];
+    assert_eq!(order_by_links(&events), LinkOrder::NoRoot);
+}
+
+#[test]
+fn a362_a_fork_is_reported_not_silently_resolved() {
+    let events = vec![
+        ev("r", None),
+        ev("a", Some("r")),
+        ev("b", Some("r")), // same predecessor
+    ];
+    match order_by_links(&events) {
+        LinkOrder::Fork { at, successors } => {
+            assert_eq!(at, "r");
+            assert_eq!(successors, vec!["a", "b"]);
+        }
+        other => panic!("a fork must be reported, got {other:?}"),
+    }
+}
+
+#[test]
+fn a362_a_dangling_prev_is_reported() {
+    let events = vec![ev("r", None), ev("a", Some("nope"))];
+    match order_by_links(&events) {
+        LinkOrder::Dangling { event, prev } => {
+            assert_eq!(event, "a");
+            assert_eq!(prev, "nope");
+        }
+        other => panic!("a dangling prev must be reported, got {other:?}"),
+    }
+}
+
+/// Root found, walk terminates, but an island is left over — not one chain.
+#[test]
+fn a362_unreachable_events_are_reported() {
+    let events = vec![
+        ev("r", None),
+        ev("a", Some("r")),
+        ev("i2", Some("i1")),
+        ev("i1", Some("i0")),
+        ev("i0", Some("a")),
+    ];
+    // i0 -> i1 -> i2 hangs off `a`, so all five ARE reachable; make it an island
+    // instead by pointing i0 at something outside the chain but inside the set.
+    let events2 = vec![
+        ev("r", None),
+        ev("a", Some("r")),
+        ev("i1", Some("i2")),
+        ev("i2", Some("i1")),
+    ];
+    assert!(matches!(order_by_links(&events), LinkOrder::Ordered(_)));
+    match order_by_links(&events2) {
+        LinkOrder::Unreachable { reached, total } => {
+            assert_eq!((reached, total), (2, 4));
+        }
+        other => panic!("an island must be reported, got {other:?}"),
+    }
+}
+
+#[test]
+fn a362_empty_and_single_are_fine() {
+    assert_eq!(order_by_links(&[]), LinkOrder::Ordered(vec![]));
+    let one = vec![ev("only", None)];
+    assert_eq!(ids_of(&one, &order_by_links(&one)), vec!["only"]);
+}
+
+/// ⚠ Every label pinned, so a metric on this cannot have an absent series that
+/// reads like a build with no such outcome.
+#[test]
+fn a362_all_labels_are_enumerated() {
+    let all = LinkOrder::ALL_LABELS;
+    for o in [
+        LinkOrder::Ordered(vec![]),
+        LinkOrder::MultipleRoots { roots: vec![] },
+        LinkOrder::NoRoot,
+        LinkOrder::Fork { at: String::new(), successors: vec![] },
+        LinkOrder::Dangling { event: String::new(), prev: String::new() },
+        LinkOrder::Unreachable { reached: 0, total: 0 },
+    ] {
+        assert!(all.contains(&o.label()), "{} is not pinned", o.label());
+    }
+    assert_eq!(all.len(), 6, "a new variant needs a new pinned label");
 }

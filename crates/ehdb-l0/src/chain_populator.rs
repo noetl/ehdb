@@ -123,6 +123,174 @@ pub struct LogEvent {
     pub event_id: String,
     pub parent_execution_id: Option<String>,
     pub payload: String,
+    /// The chain link as the LOG records it: this event's predecessor.
+    ///
+    /// ⚠⚠ THIS FIELD WAS DELIBERATELY ABSENT UNTIL noetl/ai-meta#362, and the
+    /// reason it is here now is the whole point of that issue.
+    ///
+    /// noetl/ai-meta#357 left it out on the evidence that it was NULL on 643,420
+    /// of 645,677 rows, and rebuilt the order from the log's `ORDER BY event_id`
+    /// sequence instead. That measurement was real but it was an AGGREGATE, and
+    /// the aggregate hid the shape: a NULL prev is the *genesis* of an execution,
+    /// so one per execution is correct by design. Measured PER EXECUTION, the
+    /// linkage is populated on 61 of 63 recent executions — the 643k NULLs are one
+    /// dead pre-feature era, not a live defect.
+    ///
+    /// And id-order is not a substitute, because `event_id` is a snowflake minted
+    /// BEFORE the insert: commit order is not id order, so an event can commit
+    /// into the MIDDLE of an id-ordered read and shift every position after it.
+    /// That is the #362 divergence, measured on prod.
+    ///
+    /// `None` means "this is the root". Exactly one event per execution may say so.
+    pub prev_event_id: Option<String>,
+}
+
+/// How a set of log events ordered by FOLLOWING ITS LINKS, per noetl/ai-meta#362.
+///
+/// Every non-`Ordered` variant is a condition the caller must REFUSE on, and each
+/// one is distinct because they need different responses and different alarms.
+/// Collapsing them into a bare `None` is how the previous two divergence classes
+/// stayed unexplained for a whole session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOrder {
+    /// Exactly one root, every event reached once, no fork, no cycle.
+    /// Carries indices into the caller's slice, in chain order.
+    Ordered(Vec<usize>),
+    /// ⚠⚠ THE RE-ROOTING DEFECT. More than one event claims to be the genesis.
+    ///
+    /// This is what a lost in-memory head map produces: a mid-flight execution's
+    /// next event is stamped `prev = NULL` and becomes a second false root. It is
+    /// the defect the per-execution invariant measures, and the one thing that
+    /// makes a link-defined chain unbuildable — there is no way to tell which root
+    /// is the real one from the links alone.
+    MultipleRoots { roots: Vec<String> },
+    /// No event has a NULL prev: every event points at something. Either the true
+    /// root is outside this set (a truncated read) or the links form a cycle.
+    NoRoot,
+    /// Two or more events claim the SAME predecessor.
+    ///
+    /// The model permits predecessors plural, and the measured data has fanout
+    /// exactly 1 on all 2,262 edges — so rather than silently pick a branch, this
+    /// reports. A fork that is later found legitimate can be built on from here;
+    /// a fork silently resolved is a chain that quietly disagrees with the log.
+    Fork { at: String, successors: Vec<String> },
+    /// An event's `prev_event_id` names an id that is not in this set.
+    Dangling { event: String, prev: String },
+    /// The root was found and the walk terminated, but not every event was
+    /// reached — so the set is not one chain.
+    Unreachable { reached: usize, total: usize },
+}
+
+impl LinkOrder {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ordered(_) => "ordered",
+            Self::MultipleRoots { .. } => "multiple_roots",
+            Self::NoRoot => "no_root",
+            Self::Fork { .. } => "fork",
+            Self::Dangling { .. } => "dangling_prev",
+            Self::Unreachable { .. } => "unreachable",
+        }
+    }
+    /// Every label, so a metric can pin all values at 0 unconditionally — an
+    /// unpinned label is an absent series and reads like a build without it.
+    pub const ALL_LABELS: [&'static str; 6] = [
+        "ordered",
+        "multiple_roots",
+        "no_root",
+        "fork",
+        "dangling_prev",
+        "unreachable",
+    ];
+}
+
+/// Order events by following `prev_event_id`, NOT by sorting on `event_id`.
+///
+/// ⭐⭐ This is the noetl/ai-meta#362 fix, and the property that matters is what it
+/// does NOT do: it never compares two `event_id`s. A snowflake id is minted before
+/// the insert, so an event with a lower id can commit later and land in the middle
+/// of an id-ordered read — which shifted every subsequent position and read as a
+/// content conflict. Under link traversal that same event is simply a link, and the
+/// interior insert is a non-event.
+///
+/// Pure and allocation-light: one pass to index, one pass to walk.
+pub fn order_by_links(events: &[LogEvent]) -> LinkOrder {
+    use std::collections::HashMap;
+
+    if events.is_empty() {
+        return LinkOrder::Ordered(Vec::new());
+    }
+
+    // id -> index, and prev -> the events claiming it (to detect forks).
+    let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        by_id.insert(e.event_id.as_str(), i);
+    }
+
+    let mut roots: Vec<String> = Vec::new();
+    let mut succ: HashMap<&str, Vec<usize>> = HashMap::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        match e.prev_event_id.as_deref() {
+            None => roots.push(e.event_id.clone()),
+            Some(prev) => {
+                if !by_id.contains_key(prev) {
+                    return LinkOrder::Dangling {
+                        event: e.event_id.clone(),
+                        prev: prev.to_string(),
+                    };
+                }
+                succ.entry(prev).or_default().push(i);
+            }
+        }
+    }
+
+    // ⚠ Check the root count BEFORE walking. A walk from an arbitrary root would
+    // succeed and return a plausible-looking prefix, which is exactly the kind of
+    // confident wrong answer this module exists to avoid.
+    match roots.len() {
+        1 => {}
+        0 => return LinkOrder::NoRoot,
+        _ => {
+            roots.sort();
+            return LinkOrder::MultipleRoots { roots };
+        }
+    }
+
+    for (prev, ss) in succ.iter() {
+        if ss.len() > 1 {
+            let mut names: Vec<String> = ss.iter().map(|&i| events[i].event_id.clone()).collect();
+            names.sort();
+            return LinkOrder::Fork {
+                at: prev.to_string(),
+                successors: names,
+            };
+        }
+    }
+
+    let root_idx = by_id[roots[0].as_str()];
+    let mut order = Vec::with_capacity(events.len());
+    let mut cur = root_idx;
+    // The fork check above means each event has at most one successor, so the walk
+    // is linear and bounded by `events.len()` — a cycle cannot spin forever, it
+    // simply fails the reached-count check below.
+    loop {
+        order.push(cur);
+        match succ.get(events[cur].event_id.as_str()) {
+            Some(next) if order.len() <= events.len() => cur = next[0],
+            _ => break,
+        }
+        if order.len() > events.len() {
+            break;
+        }
+    }
+
+    if order.len() != events.len() {
+        return LinkOrder::Unreachable {
+            reached: order.len(),
+            total: events.len(),
+        };
+    }
+    LinkOrder::Ordered(order)
 }
 
 /// What [`ChainPopulator::populate_from_log`] did.
