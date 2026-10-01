@@ -8,6 +8,10 @@ rust-version.workspace = true
 description = "EHDB L0 — replicated object-store layer: immutable parts + ClickHouse-style meta-catalog + hot-local/durable-async tiering over a pluggable object store. noetl-internal only (fixed datasets)."
 
 [dependencies]
+# Chain-certified projections (noetl/ai-meta#366) — compiled in only under the
+# `chain-cert` feature, which is off by default.
+sha2 = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
 ehdb-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,3 +22,9 @@ twox-hash.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = "3"
+
+[features]
+chain-cert = ["dep:sha2", "dep:hex"]
+# Hardware SHA-256. Carries most of the win on aarch64; pulls `cc` as a build
+# dependency, so it is a separate opt-in from the certificate itself.
+chain-cert-asm = ["chain-cert", "sha2/asm"]
