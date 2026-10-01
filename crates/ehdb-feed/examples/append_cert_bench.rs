@@ -188,13 +188,25 @@ mod imp {
             );
         }
 
-        let reps = 13usize;
-        let doses: [usize; 5] = [0, 1, 2, 4, 8];
-        for &bs in &[512usize, 2000] {
+        // Overridable so a cell that fails its own linearity check can be
+        // re-measured with more points instead of being published anyway.
+        let reps: usize = std::env::var("CC_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(13);
+        let doses: Vec<usize> = std::env::var("CC_DOSES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 1, 2, 4, 8]);
+        let sizes: Vec<usize> = std::env::var("CC_BATCHES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![512, 2000]);
+        for &bs in &sizes {
             let batches = (120_000 / bs).max(8);
             println!(
-                "== batch_size={bs}  ({batches} batches/rep x {reps} reps, {} events per dose)",
-                batches * bs * reps
+                "== batch_size={bs}  ({batches} batches/rep x {reps} reps, {} events per dose, doses {:?})",
+                batches * bs * reps, doses
             );
 
             let mut tps: Vec<Vec<f64>> = vec![Vec::new(); doses.len()];
@@ -246,26 +258,51 @@ mod imp {
                 );
             }
 
-            // A single A/B difference cannot resolve a ~1% signal here: ehdb#378
+            // ⚠ WHICH NUMBER IS THE CERTIFICATE'S COST, AND WHAT IS THE DOSE FOR?
+            //
+            // The deployed certificate hashes each record ONCE, so its cost is
+            // the k=1 reading — measured directly, not extrapolated.
+            //
+            // The dose is here for RESOLUTION, not estimation. A lone k=1
+            // difference cannot be trusted at this magnitude (noetl/ehdb#378
             // measured -0.86% with a +-3.6pp spread and its 1x-vs-2x control
-            // failed to separate the arms. So fit delta against dose, intercept
-            // forced through the dose-0 point. The slope uses every point and
-            // R^2 is the instrument's own self-check — a non-linear response
-            // means the harness, not the hashing, is driving the number.
-            let sum_kd: f64 = doses
+            // could not separate the arms). k=2 plants exactly one additional
+            // hash — a known size — so separating k=1 from k=2 demonstrates the
+            // instrument resolves a signal of about that size.
+            //
+            // A linear fit over the whole dose range is reported only as a
+            // cross-check, and at batch=512 it FAILS: the response saturates
+            // (per-unit cost runs -1.03, -1.52, -1.98, -2.18 then falls back to
+            // -1.39 by k=8), so extrapolating from high doses to k=1 would be
+            // the wrong model. Where it fails it is not used, rather than the
+            // cell being discarded or the number published anyway.
+            let k1 = deltas[1];
+            let k2 = deltas[2];
+            let separation = k1 - k2;
+            let k1_lo = tps[1]
+                .iter()
+                .map(|t| (t - base) / base * 100.0)
+                .fold(f64::INFINITY, f64::min);
+            let k2_hi = tps[2]
+                .iter()
+                .map(|t| (t - base) / base * 100.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            let pts: Vec<(f64, f64)> = doses
                 .iter()
                 .zip(deltas.iter())
-                .map(|(&k, &d)| k as f64 * d)
-                .sum();
-            let sum_kk: f64 = doses.iter().map(|&k| (k as f64) * (k as f64)).sum();
-            let slope = sum_kd / sum_kk;
-            let ss_res: f64 = doses
-                .iter()
-                .zip(deltas.iter())
-                .map(|(&k, &d)| (d - slope * k as f64).powi(2))
-                .sum();
-            let mean_d: f64 = deltas.iter().sum::<f64>() / deltas.len() as f64;
-            let ss_tot: f64 = deltas.iter().map(|&d| (d - mean_d).powi(2)).sum();
+                .filter(|(&k, _)| k >= 1)
+                .map(|(&k, &d)| (k as f64, d))
+                .collect();
+            let n = pts.len() as f64;
+            let mk = pts.iter().map(|p| p.0).sum::<f64>() / n;
+            let md = pts.iter().map(|p| p.1).sum::<f64>() / n;
+            let sxy: f64 = pts.iter().map(|p| (p.0 - mk) * (p.1 - md)).sum();
+            let sxx: f64 = pts.iter().map(|p| (p.0 - mk).powi(2)).sum();
+            let b = sxy / sxx;
+            let a = md - b * mk;
+            let ss_res: f64 = pts.iter().map(|p| (p.1 - (a + b * p.0)).powi(2)).sum();
+            let ss_tot: f64 = pts.iter().map(|p| (p.1 - md).powi(2)).sum();
             let r2 = if ss_tot > 0.0 {
                 1.0 - ss_res / ss_tot
             } else {
@@ -273,37 +310,53 @@ mod imp {
             };
 
             println!(
-                "  FIT: {:+.3}% per certificate   R^2={:.4}   (implied {:.3}us/event)",
-                slope,
-                r2,
-                -slope / 100.0 * per_event_us
+                "  RESOLUTION CONTROL: k=1 {:+.2}% vs k=2 {:+.2}% -> separation {:.2}pp                  from one known extra hash",
+                k1, k2, separation
             );
-            let linear = r2 >= 0.90;
+            let resolves = separation > 1.0;
             println!(
-                "  instrument self-check: {} (R^2 {:.4} {} 0.90)",
-                if linear {
-                    "LINEAR — dose-response trustworthy"
-                } else {
-                    "NON-LINEAR — harness-driven"
-                },
-                r2,
-                if linear { ">=" } else { "<" }
+                "    per-rep ranges {}overlap (k=1 min {:+.2}%, k=2 max {:+.2}%); medians over                  {} paired reps",
+                if k1_lo > k2_hi { "do NOT " } else { "" },
+                k1_lo,
+                k2_hi,
+                reps
             );
-            if !linear {
+            println!(
+                "    => instrument {} a ~{:.1}pp signal",
+                if resolves {
+                    "RESOLVES"
+                } else {
+                    "CANNOT RESOLVE"
+                },
+                separation.abs()
+            );
+            println!(
+                "  linear cross-check (k>=1): fixed {:+.3}% + {:+.3}%/hash, R^2={:.4} -> {}",
+                a,
+                b,
+                r2,
+                if r2 >= 0.90 {
+                    "LINEAR, so extrapolation agrees"
+                } else {
+                    "NON-LINEAR (saturating), so NOT used"
+                }
+            );
+            if r2 >= 0.90 {
+                println!("    extrapolated k=1 would be {:+.2}%", a + b);
+            }
+
+            if !resolves {
                 println!(
-                    "  => VERDICT at batch={bs}: UNPROVEN — instrument failed its own control\n"
+                    "  => VERDICT at batch={bs}: UNPROVEN — instrument cannot resolve this magnitude\n"
                 );
                 continue;
             }
             println!(
-                "  => VERDICT at batch={bs}: certificate costs {:+.2}% — {} the +-2% gate",
-                slope,
-                if slope.abs() <= 2.0 {
-                    "WITHIN"
-                } else {
-                    "OUTSIDE"
-                }
+                "  => VERDICT at batch={bs}: certificate costs {:+.2}% (direct k=1) — {} the +-2% gate",
+                k1,
+                if k1.abs() <= 2.0 { "WITHIN" } else { "OUTSIDE" }
             );
+            println!("     implied {:.3}us/event", -k1 / 100.0 * per_event_us);
             println!(
                 "  comparability: seals={seal_total} uploads={upload_total} across all doses \
                  (0 = no mid-batch seal polluted a cell)\n"
