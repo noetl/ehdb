@@ -96,6 +96,18 @@ pub struct L0Config {
     pub seal_max_age: Option<Duration>,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
+    /// Maintain per-execution chain certificates (noetl/ai-meta#366).
+    ///
+    /// **Off by default**, and additionally gated at compile time by the
+    /// `chain-cert` feature — with the feature off this field is inert. Two
+    /// gates because the compile-time one keeps `sha2` out of a default build
+    /// while the runtime one lets the certificate be turned on in a deployed
+    /// binary without a rebuild (and A/B'd in one process).
+    ///
+    /// ⚠ Turning this on does NOT change the bytes written. The digest covers
+    /// the stored bytes, so if the flag altered them, flipping it would fork
+    /// every chain.
+    pub chain_cert: bool,
     /// Keys remembered per shard for append-time idempotency (noetl/ai-meta#313).
     /// `0` disables dedupe entirely.
     pub dedupe_capacity: usize,
@@ -146,6 +158,7 @@ impl L0Config {
             survival_goal: crate::failure_domain::SurvivalGoal::Zone,
             hlc_mode: None,
             flush: FlushPolicy::EveryAppend,
+            chain_cert: false,
             dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
             manifest_retain: DEFAULT_MANIFEST_RETAIN,
@@ -237,6 +250,12 @@ impl L0Config {
         self
     }
     /// Set the durability-window posture.
+    /// Enable per-execution chain certificates (noetl/ai-meta#366).
+    pub fn with_chain_cert(mut self, on: bool) -> Self {
+        self.chain_cert = on;
+        self
+    }
+
     pub fn with_flush(mut self, flush: FlushPolicy) -> Self {
         self.flush = flush;
         self
@@ -891,6 +910,23 @@ impl<D: Dataset> L0Engine<D> {
         }
     }
 
+    /// This execution's chain certificate from the shard that owns it
+    /// (noetl/ai-meta#366). `None` until a chunk seals.
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_certificate(&self, execution_id: &str) -> Option<crate::chain_cert::ChainCert> {
+        let shard = D::read_partition(execution_id, self.config.shard_count);
+        self.writers
+            .get(&shard)
+            .and_then(|w| w.chain_certificate(execution_id))
+    }
+
+    /// Records absorbed into chain state across every open writer — proves the
+    /// path ran rather than merely existing (A9).
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_absorbed(&self) -> u64 {
+        self.writers.values().map(|w| w.chain_absorbed()).sum()
+    }
+
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {
         if !self.writers.contains_key(&shard) {
             let writer = PartWriter::<D>::open(
@@ -904,6 +940,8 @@ impl<D: Dataset> L0Engine<D> {
             )?;
             let mut writer = writer;
             writer.set_seal_max_age(self.config.seal_max_age);
+            #[cfg(feature = "chain-cert")]
+            writer.set_chain_cert(self.config.chain_cert);
             // noetl/ai-meta#209 defect 2 — a writer that just recovered an
             // active part left by a crash holds records the manifest does not
             // know about, because the manifest lists sealed parts only. The

@@ -22,6 +22,12 @@ serde_json.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { workspace = true, features = ["io-util"] }
 
+[features]
+# Chain-certified projections (noetl/ai-meta#366) — passthrough to ehdb-l0.
+# Off by default; `L0Config::chain_cert` is a second, runtime gate.
+chain-cert = ["ehdb-l0/chain-cert"]
+chain-cert-asm = ["chain-cert", "ehdb-l0/chain-cert-asm"]
+
 [dev-dependencies]
 # For the chain-certificate append A/B example only (noetl/server#482).
 # `asm` = hardware SHA-256; it is the single biggest lever in that measurement.

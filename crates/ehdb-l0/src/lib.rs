@@ -136,6 +136,8 @@
 pub mod blob;
 pub mod bloom;
 pub mod catalog;
+#[cfg(feature = "chain-cert")]
+pub mod chain_cert;
 pub mod closed_timestamp;
 pub mod columnar;
 pub mod command_queue;
