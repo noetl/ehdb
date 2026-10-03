@@ -1,0 +1,21 @@
+# Pinned so clippy's lint set cannot move on its own.
+#
+# This repo's clippy step gates with `-D warnings` and NO allow-list, so any lint a
+# new Rust release adds reddens `main` with no code change. That is not hypothetical
+# here: CI's `@stable` rolled to 1.99.0 on 2026-10-03, which deprecated
+# `Atomic::fetch_update` (renamed to `try_update`) and would have failed the next run
+# on `crates/ehdb-l0/src/fault.rs`. The last green run (2026-10-01) predates the roll.
+#
+# ⚠ cargo honours this file over the rustup default, so it is what decides which
+# clippy runs. The toolchain action's console banner prints the version it INSTALLED,
+# which is not the same thing -- the lint's own `rust-clippy/rust-X.Y.Z` URL is the
+# authoritative signal.
+#
+# NOTE the workspace declares `rust-version = "1.82"`. That MSRV is a promise to
+# consumers and is NOT what this pin tests; the pin fixes the LINT floor, nothing
+# more. If the MSRV is ever raised past 1.99, drop the `#[allow(deprecated)]` in
+# fault.rs and use `try_update`.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
