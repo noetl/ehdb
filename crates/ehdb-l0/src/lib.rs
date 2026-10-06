@@ -139,6 +139,9 @@ pub mod cache_role;
 pub mod catalog;
 pub mod chain;
 pub mod chain_alt;
+#[cfg(feature = "chain-cert")]
+pub mod chain_cert;
+pub mod chain_populator;
 pub mod chain_store_durable;
 pub mod closed_timestamp;
 pub mod columnar;

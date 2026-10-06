@@ -64,6 +64,23 @@ pub(crate) fn should_fail_append() -> bool {
         return false;
     }
     // Armed — take one, without going below zero under concurrency.
+    //
+    // `fetch_update` is deprecated from rustc 1.99.0, which renamed it to
+    // `try_update`. We keep the old name deliberately: this workspace declares
+    // `rust-version = "1.82"`, and `try_update` does not exist before 1.99 — so
+    // adopting the new name would raise the MSRV by 17 releases to silence a pure
+    // rename with identical semantics and no behaviour change.
+    //
+    // ⚠ This allow is why `main` is not red. The clippy step here gates with
+    // `-D warnings` and no allow-list, and CI installs `@stable`, which rolled to
+    // 1.99.0 on 2026-10-03 — so the next run would have failed on a deprecation
+    // that no commit introduced. Found by noetl/ai-meta#378 while pinning the
+    // toolchain, not by the build.
+    //
+    // Scoped to this expression rather than the crate, so a different deprecated
+    // call still fails the gate. Remove it when the MSRV moves past 1.99 and
+    // switch to `try_update`.
+    #[allow(deprecated)]
     FAIL_NEXT_APPENDS
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             if n == 0 {

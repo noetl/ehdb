@@ -1,0 +1,100 @@
+# Validates the chain-certificate build on amd64 in the SAME base image the
+# worker and server images use (Alpine/musl), because `sha2`'s `asm` feature
+# pulls `cc` as a build dependency and musl is where that is most likely to
+# break. noetl/ai-meta#366.
+#
+# Reports three things and does NOT fail on the asm arm, so a failure there is
+# evidence rather than a dead build:
+#   1. does `chain-cert` (portable sha2) build + test on amd64
+#   2. does `chain-cert-asm` build on amd64/musl, and does it need extra packages
+#   3. does the golden digest vector hold on amd64 (arch-independence)
+steps:
+  - name: 'lukemathwalker/cargo-chef:0.1.73-rust-1.91.1-alpine3.22'
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -u
+        echo "=== arch: $(uname -m)  rustc: $(rustc --version)"
+        echo "=== cc present before any apk add?"
+        command -v cc && echo "cc: yes" || echo "cc: NO"
+
+        echo ""
+        echo "=== ARM 1: portable sha2 (the fallback if asm cannot ship)"
+        cargo test -p ehdb-l0 --features chain-cert chain_cert > /tmp/a1.log 2>&1
+        rc=$?
+        grep -E "^test chain_cert::tests::" /tmp/a1.log || true
+        # ⚠ A filter that matches NOTHING also exits 0. Assert the tests were
+        # actually executed, or the green is vacuous — which is the exact
+        # failure class this whole workstream is guarding against.
+        ran=$(grep -cE "^test chain_cert::tests::.* ok$" /tmp/a1.log || true)
+        echo "RESULT portable_tests_ran=$ran"
+        if [ "$rc" -eq 0 ] && [ "$ran" -ge 8 ]; then
+          echo "RESULT portable_build=OK"
+        elif [ "$ran" -lt 8 ]; then
+          echo "RESULT portable_build=VACUOUS (only $ran tests ran, expected >=8)"
+          tail -30 /tmp/a1.log
+        else
+          echo "RESULT portable_build=FAILED"
+          tail -30 /tmp/a1.log
+        fi
+
+        echo ""
+        echo "=== ARM 2: sha2 asm, with NO extra packages installed"
+        if cargo build -p ehdb-l0 --features chain-cert-asm 2>&1 | tail -25; then
+          echo "RESULT asm_build_bare=OK"
+        else
+          echo "RESULT asm_build_bare=FAILED"
+        fi
+
+        echo ""
+        echo "=== ARM 3: sha2 asm after apk add build-base (what it would cost the image)"
+        apk add --no-cache build-base >/dev/null 2>&1 && echo "build-base installed" || echo "apk add failed"
+        if cargo build -p ehdb-l0 --features chain-cert-asm 2>&1 | tail -25; then
+          echo "RESULT asm_build_with_buildbase=OK"
+        else
+          echo "RESULT asm_build_with_buildbase=FAILED"
+        fi
+
+        echo ""
+        echo "=== ARM 4: golden vector under asm on amd64 (arch-independence of the digest)"
+        cargo test -p ehdb-l0 --features chain-cert-asm chain_cert > /tmp/a4.log 2>&1
+        rc4=$?
+        grep -E "^test chain_cert::tests::" /tmp/a4.log || true
+        vec=$(grep -cE "the_digest_matches_an_independent_implementation \.\.\. ok$" /tmp/a4.log || true)
+        ran4=$(grep -cE "^test chain_cert::tests::.* ok$" /tmp/a4.log || true)
+        echo "RESULT asm_tests_ran=$ran4  golden_vector_ran=$vec"
+        if [ "$rc4" -eq 0 ] && [ "$vec" -eq 1 ] && [ "$ran4" -ge 8 ]; then
+          echo "RESULT asm_golden_vector=OK (ran on x86_64, digest is arch-independent)"
+        elif [ "$vec" -ne 1 ]; then
+          echo "RESULT asm_golden_vector=VACUOUS (the vector test did not execute)"
+          tail -30 /tmp/a4.log
+        else
+          echo "RESULT asm_golden_vector=FAILED"
+          tail -30 /tmp/a4.log
+        fi
+
+        echo ""
+        echo "=== ARM 5: is asm even NEEDED on x86_64? sha2 auto-detects SHA-NI there."
+        echo "    (on aarch64 the asm feature was a 6x win; if x86_64 is already"
+        echo "     fast without it, the cc build-dependency can simply be skipped)"
+        cat > /tmp/shabench.rs <<'"'"'RS'"'"'
+        fn main() {
+            use sha2::{Digest, Sha256};
+            let body = vec![7u8; 357];
+            let t = std::time::Instant::now();
+            let n = 200_000;
+            for _ in 0..n {
+                let mut h = Sha256::new();
+                h.update(b"noetl.ehdb.chain-cert.v1");
+                h.update(&body);
+                std::hint::black_box(h.finalize());
+            }
+            let per = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            println!("RESULT sha256_357B_per_hash_us={:.4}", per);
+        }
+        RS
+        echo "    (micro-bench compiled against the same sha2 as the crate)"
+timeout: 3000s
+options:
+  machineType: 'E2_HIGHCPU_8'

@@ -102,6 +102,17 @@ pub struct PartWriter<D: Dataset> {
     /// record rather than the newest.
     first_append_at: Option<Instant>,
     unflushed_since_fsync: u32,
+    /// Per-execution chain certificates (noetl/ai-meta#366).
+    ///
+    /// Fed from [`Self::append`] with the exact bytes written, so certification
+    /// adds only SHA-256 block processing — no second serialisation. Absent
+    /// unless the `chain-cert` feature is on.
+    #[cfg(feature = "chain-cert")]
+    chain_certs: crate::chain_cert::ChainCertRegistry,
+    /// Runtime switch for the above (`L0Config::chain_cert`). Off by default,
+    /// so the compiled-in path stays inert until something turns it on.
+    #[cfg(feature = "chain-cert")]
+    chain_cert_enabled: bool,
 }
 
 impl<D: Dataset> PartWriter<D> {
@@ -139,6 +150,10 @@ impl<D: Dataset> PartWriter<D> {
             first_append_at: None,
             record_count: 0,
             unflushed_since_fsync: 0,
+            #[cfg(feature = "chain-cert")]
+            chain_certs: crate::chain_cert::ChainCertRegistry::new(),
+            #[cfg(feature = "chain-cert")]
+            chain_cert_enabled: false,
         };
         w.open_active()?;
         Ok(w)
@@ -287,6 +302,21 @@ impl<D: Dataset> PartWriter<D> {
         let body = serde_json::to_vec(&record)
             .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
         let frame = encode_frame(&body)?;
+
+        // Chain certificate (noetl/ai-meta#366). `body` IS the bytes this
+        // append writes, so the digest costs only SHA-256 block processing.
+        // Keyed by the dataset's index dimension (`execution_id` for D1)
+        // because the certificate is a per-execution quantity while a
+        // PartWriter carries many executions.
+        //
+        // ⚠ Placed BEFORE the write, so a record that fails to write is not in
+        // a chain that claims to cover it. The chain must describe what is
+        // durable, and the write below is the thing that can fail.
+        #[cfg(feature = "chain-cert")]
+        if self.chain_cert_enabled {
+            self.chain_certs.absorb(D::index_key(&record), &body);
+        }
+
         let mark_offset = self.byte_len;
 
         // Start-of-granule mark: first record of each granule.
@@ -340,6 +370,31 @@ impl<D: Dataset> PartWriter<D> {
         }
         self.records.push(record);
         Ok(mark_offset)
+    }
+
+    /// Turn chain certification on or off for this writer
+    /// (see [`crate::L0Config::chain_cert`]).
+    #[cfg(feature = "chain-cert")]
+    pub fn set_chain_cert(&mut self, on: bool) {
+        self.chain_cert_enabled = on;
+    }
+
+    /// Whether this writer is maintaining chain certificates.
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_cert_enabled(&self) -> bool {
+        self.chain_cert_enabled
+    }
+
+    /// This partition's chain certificate for one execution, if a chunk sealed.
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_certificate(&self, execution_id: &str) -> Option<crate::chain_cert::ChainCert> {
+        self.chain_certs.certificate(execution_id)
+    }
+
+    /// Records absorbed into chain state — proves the path ran (A9).
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_absorbed(&self) -> u64 {
+        self.chain_certs.absorbed()
     }
 
     /// Switch this writer's flush posture (see [`crate::L0Engine::set_flush_policy`]).

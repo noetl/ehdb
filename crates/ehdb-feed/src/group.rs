@@ -158,6 +158,34 @@ where
         self.inflight.remove(&sort_key).is_some()
     }
 
+    /// Make an in-flight record due for redelivery **immediately**, instead of
+    /// waiting out the rest of its `ack_wait`.
+    ///
+    /// This exists for the one case the `ack_wait` timer serves badly: the member
+    /// that holds the record is *gone*. The timer is a bound on how long a LIVE
+    /// consumer may sit on a record; when the consumer has vanished, waiting it
+    /// out buys nothing and costs a full `ack_wait` of dead time. Measured on
+    /// kind: killing the system-pool pod mid-flight stalled executions for
+    /// 30.1-71.3s against a 0.5-0.7s baseline, because the orchestrate command
+    /// sat in `inflight` under a member whose connection had already closed.
+    ///
+    /// Returns `false` when `sort_key` is not in flight — a late release racing a
+    /// real ack is a no-op, not an error.
+    ///
+    /// ⚠ Deliberately keeps the record IN FLIGHT rather than pushing it back to
+    /// `pending`: `poll_assign` must still hand it out ahead of fresh records
+    /// (at-least-once must not starve a retry) and must still mark it
+    /// `redelivered`, so a consumer can tell a retry from a first delivery.
+    pub fn expire_now(&mut self, sort_key: u64) -> bool {
+        match self.inflight.get_mut(&sort_key) {
+            Some(f) => {
+                f.deadline = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The contiguous acked-through cursor: every record at/below it is acked and
     /// not in flight. Safe to persist and resume a fresh group from.
     pub fn committed_cursor(&self) -> u64 {
@@ -417,6 +445,34 @@ where
     /// in flight.
     pub fn ack(&mut self, sort_key: u64) -> bool {
         self.inflight.remove(&sort_key).is_some()
+    }
+
+    /// Make an in-flight record due for redelivery **immediately**, instead of
+    /// waiting out the rest of its `ack_wait`.
+    ///
+    /// This exists for the one case the `ack_wait` timer serves badly: the member
+    /// that holds the record is *gone*. The timer is a bound on how long a LIVE
+    /// consumer may sit on a record; when the consumer has vanished, waiting it
+    /// out buys nothing and costs a full `ack_wait` of dead time. Measured on
+    /// kind: killing the system-pool pod mid-flight stalled executions for
+    /// 30.1-71.3s against a 0.5-0.7s baseline, because the orchestrate command
+    /// sat in `inflight` under a member whose connection had already closed.
+    ///
+    /// Returns `false` when `sort_key` is not in flight — a late release racing a
+    /// real ack is a no-op, not an error.
+    ///
+    /// ⚠ Deliberately keeps the record IN FLIGHT rather than pushing it back to
+    /// `pending`: `poll_assign` must still hand it out ahead of fresh records
+    /// (at-least-once must not starve a retry) and must still mark it
+    /// `redelivered`, so a consumer can tell a retry from a first delivery.
+    pub fn expire_now(&mut self, sort_key: u64) -> bool {
+        match self.inflight.get_mut(&sort_key) {
+            Some(f) => {
+                f.deadline = 0;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The **global** contiguous acked-through cursor: the lowest still-open

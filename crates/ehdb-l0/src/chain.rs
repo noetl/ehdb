@@ -109,6 +109,24 @@ pub enum ChainError {
     Invalid(String),
 }
 
+/// ⚠ `ChainError` had no `Display`, so every caller that wanted to log one
+/// reached for `{:?}` — including the server's populator call site, which uses
+/// `error = ?e` in a `tracing` field where every sibling uses `%`. A named error
+/// whose name cannot be printed gets printed as a struct dump, and a struct dump
+/// in a log line is the thing nobody greps for.
+///
+/// ⚠⚠ Delegates to [`ChainError::message`] rather than restating the text. The
+/// first draft of this impl wrote its own near-identical strings, which is two
+/// copies of one message free to drift — the failure this crate's own rules are
+/// about, self-inflicted. `message()` stays the single wording.
+impl std::fmt::Display for ChainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for ChainError {}
+
 impl ChainError {
     pub fn message(&self) -> String {
         match self {
