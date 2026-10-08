@@ -33,3 +33,7 @@ chain-cert-asm = ["chain-cert", "sha2/asm"]
 [[bench]]
 name = "l0_engine"
 harness = false
+
+[[bench]]
+name = "vector_query"
+harness = false
