@@ -37,6 +37,41 @@ pub enum RuntimeEvent {
     Deregister,
 }
 
+/// **What kind of thing is registered** (north-star P2/B1).
+///
+/// D8 began as a worker table: the key was `worker_id` and the payload a `contract`
+/// string. A fleet registry has to hold every object AND service — a NoETL server API, a
+/// gateway, an EHDB instance, a worker, a playbook, and a **live execution** — so that
+/// "where are the gateways" is a query rather than a naming convention applied to ids.
+///
+/// ⚠ `Worker` is the serde default **because every record written before this field
+/// existed was a worker**. Defaulting to anything else would make those records vanish
+/// from every `discover` call — the same silent-eviction shape P1's `last_seen_micros = 0`
+/// handling avoids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RuntimeKind {
+    /// A noetl-server instance and its API surface.
+    Server,
+    /// A gateway instance.
+    Gateway,
+    /// An EHDB instance / tier service.
+    Ehdb,
+    /// A worker — the only thing D8 held before P2, hence the default.
+    Worker,
+    /// A registered playbook definition.
+    Playbook,
+    /// ⚠ An **ephemeral** runtime unit: a live execution. Registered with a short TTL and
+    /// expected to disappear by **not being renewed** — no tombstone, no reaper. That is
+    /// what makes TTL the right primitive for ephemera rather than a delete.
+    Execution,
+}
+
+impl Default for RuntimeKind {
+    fn default() -> Self {
+        Self::Worker
+    }
+}
+
 /// One runtime lifecycle op in the log (the D8 record schema).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +103,19 @@ pub struct RuntimeOp {
     /// version of the same outage.
     #[serde(default)]
     pub last_seen_micros: u64,
+    /// What kind of thing this registration is for (north-star P2/B1).
+    ///
+    /// ⚠ `#[serde(default)]` → [`RuntimeKind::Worker`], because every pre-P2 record was a
+    /// worker. See [`RuntimeKind`].
+    ///
+    /// ⚠⚠ `RuntimeOp` carries `#[serde(deny_unknown_fields)]`, so adding this field is
+    /// **backward compatible and forward INCOMPATIBLE**: a reader built before it
+    /// *rejects* a record carrying it rather than ignoring it. That is the deliberate
+    /// envelope design recorded in `ehdb-stream/tests/record_envelope_additivity.rs`, and
+    /// it imposes an upgrade ordering requirement — **readers before writers**. Pinned by
+    /// `the_compatibility_asymmetry_is_explicit`.
+    #[serde(default)]
+    pub kind: RuntimeKind,
 }
 
 /// **D8 runtime dataset.** Sort key `op_seq`; partition + index dim `worker_id`.
@@ -101,6 +149,18 @@ pub struct RuntimeState {
     pub heartbeat: u64,
     /// Wall-clock micros of the latest op; `0` when unknown (pre-P1 record).
     pub last_seen_micros: u64,
+    /// What kind of thing this is.
+    pub kind: RuntimeKind,
+}
+
+impl RuntimeState {
+    /// The registered id. An alias for `worker_id`, which is the field name the dataset
+    /// has carried since D8 was worker-only; `id` is what it means now that any kind of
+    /// object registers here. Kept as an accessor rather than a rename because renaming a
+    /// `#[serde(deny_unknown_fields)]` field is a format break for every existing record.
+    pub fn id(&self) -> &str {
+        &self.worker_id
+    }
 }
 
 /// Longest accepted `worker_id`. Bounded because it becomes a substrate key and
@@ -325,7 +385,15 @@ impl RuntimeStore {
         match self.latest(worker_id)? {
             Some(op) if op.event != RuntimeEvent::Deregister => {
                 let next = op.heartbeat + 1;
-                self.append(worker_id, RuntimeEvent::Heartbeat, next, op.contract)?;
+                // Same carry-forward as `heartbeat_at`: `append` defaults the kind.
+                self.append_kinded(
+                    worker_id,
+                    RuntimeEvent::Heartbeat,
+                    next,
+                    op.contract,
+                    0,
+                    op.kind,
+                )?;
                 Ok(Some(next))
             }
             _ => Ok(None),
@@ -337,12 +405,19 @@ impl RuntimeStore {
         match self.latest(worker_id)? {
             Some(op) if op.event != RuntimeEvent::Deregister => {
                 let next = op.heartbeat + 1;
-                self.append_at(
+                // ⚠⚠ The kind must be carried FORWARD, like the contract already is.
+                // `append_at` defaults it to `Worker`, so renewing an Execution through
+                // that path silently reclassified it and `discover(Execution)` stopped
+                // finding it one heartbeat later — a registration that disappears while
+                // being actively renewed. Caught by
+                // `an_execution_registers_as_an_ephemeral_unit_and_expires_without_a_reaper`.
+                self.append_kinded(
                     worker_id,
                     RuntimeEvent::Heartbeat,
                     next,
                     op.contract,
                     now_micros,
+                    op.kind,
                 )?;
                 Ok(Some(next))
             }
@@ -378,6 +453,7 @@ impl RuntimeStore {
                     contract: op.contract,
                     heartbeat: op.heartbeat,
                     last_seen_micros: op.last_seen_micros,
+                    kind: op.kind,
                 })
             }
         }))
@@ -407,6 +483,7 @@ impl RuntimeStore {
                 contract: op.contract,
                 heartbeat: op.heartbeat,
                 last_seen_micros: op.last_seen_micros,
+                kind: op.kind,
             })
             .collect())
     }
@@ -434,6 +511,80 @@ impl RuntimeStore {
                     || now_micros.saturating_sub(s.last_seen_micros) < ttl_micros
             })
             .collect())
+    }
+
+    /// **register any kind of object or service** (north-star P2/B1).
+    ///
+    /// The fleet-registry entry point: a server, gateway, EHDB instance, worker, playbook
+    /// or live execution all register here and become discoverable by kind.
+    ///
+    /// ⚠ `id` must satisfy the existing D8 rule `[A-Za-z0-9-_.:]` — it becomes a substrate
+    /// key and an index dimension, and that validation is deliberate. A path-shaped
+    /// identity (a playbook path like `muno/playbooks/profile`) therefore has to be encoded
+    /// by the caller; `:` is permitted and is the natural separator. Widening the charset
+    /// was considered and rejected: a substrate key with a `/` in it is a directory
+    /// traversal waiting to happen.
+    pub fn register_kind(
+        &mut self,
+        kind: RuntimeKind,
+        id: &str,
+        contract: impl Into<String>,
+        now_micros: u64,
+    ) -> Result<u64> {
+        self.append_kinded(
+            id,
+            RuntimeEvent::Register,
+            1,
+            contract.into(),
+            now_micros,
+            kind,
+        )?;
+        Ok(1)
+    }
+
+    /// **discovery** — every live registration of one kind, in id order.
+    ///
+    /// ⚠ Filtering by kind is the point. Without it a caller asking "where are the
+    /// gateways" has to take a fleet-wide list and infer kind from the shape of an id,
+    /// which is a naming convention masquerading as a schema.
+    pub fn discover(
+        &self,
+        kind: RuntimeKind,
+        now_micros: u64,
+        ttl_micros: u64,
+    ) -> Result<Vec<RuntimeState>> {
+        Ok(self
+            .list_live_at(now_micros, ttl_micros)?
+            .into_iter()
+            .filter(|s| s.kind == kind)
+            .collect())
+    }
+
+    /// **watch** — every op after `after_op_seq`, plus the cursor to resume from
+    /// (north-star P2/B3).
+    ///
+    /// ⚠ Poll-based, and named as such. This is a cursor read over the op log, not a
+    /// server-side push: a consumer's latency is its poll interval. Calling it a watch
+    /// without saying that would overstate it — but it is a watch in the property that
+    /// matters, which is that **resuming from the cursor returns nothing when nothing
+    /// changed**. A "watch" that re-delivers the whole log every poll is a scan, and it
+    /// looks identical in any test that only ever polls from 0.
+    ///
+    /// Departures are delivered too: a `Deregister` is an op like any other, so a
+    /// discovery consumer learns about a service leaving and not only arriving.
+    ///
+    /// The returned cursor is the **highest op_seq seen**, so an empty result leaves it
+    /// unchanged rather than resetting it.
+    pub fn watch_since(&self, after_op_seq: u64) -> Result<(Vec<RuntimeOp>, u64)> {
+        let mut ops: Vec<RuntimeOp> = self
+            .engine
+            .replay_all()?
+            .into_iter()
+            .filter(|op| op.op_seq > after_op_seq)
+            .collect();
+        ops.sort_by_key(|op| op.op_seq);
+        let cursor = ops.last().map(|op| op.op_seq).unwrap_or(after_op_seq);
+        Ok((ops, cursor))
     }
 
     /// `(live, of_which_timestamp_unknown)` for a TTL window.
@@ -466,6 +617,25 @@ impl RuntimeStore {
         contract: String,
         last_seen_micros: u64,
     ) -> Result<()> {
+        self.append_kinded(
+            worker_id,
+            event,
+            heartbeat,
+            contract,
+            last_seen_micros,
+            RuntimeKind::Worker,
+        )
+    }
+
+    fn append_kinded(
+        &mut self,
+        worker_id: &str,
+        event: RuntimeEvent,
+        heartbeat: u64,
+        contract: String,
+        last_seen_micros: u64,
+        kind: RuntimeKind,
+    ) -> Result<()> {
         let op_seq = self.engine.global_sequence() + 1;
         let op = RuntimeOp {
             op_seq,
@@ -474,6 +644,7 @@ impl RuntimeStore {
             heartbeat,
             contract,
             last_seen_micros,
+            kind,
         };
         // noetl/ai-meta#332 — validate BEFORE the append, not on read. A
         // persisted bad op is replayed by every subsequent fold; this is the only
@@ -750,6 +921,7 @@ mod tests {
             heartbeat: 1,
             contract: "shard=0".into(),
             last_seen_micros: 0,
+            kind: RuntimeKind::Worker,
         };
         assert!(validate_op(&ok).is_ok());
 
@@ -804,6 +976,7 @@ mod tests {
             heartbeat: 1,
             contract: "shard=0".into(),
             last_seen_micros: 0,
+            kind: RuntimeKind::Worker,
         };
         assert!(
             validate_op(&op).is_ok(),
