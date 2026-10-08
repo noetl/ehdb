@@ -183,6 +183,119 @@ Resolution control: 2% of samples planted at 5 ms among 1 µs samples. p50 must 
 count, that group commit is materially cheaper, and the planted control. A latency threshold
 would make it flaky on shared CI hardware, which is how a real measure gets deleted.
 
+## Memory — O(parts), not O(records)
+
+`tests/memory_measures.rs`, via a counting `#[global_allocator]`. The question: does an
+engine that has been up for a week still hold RAM proportional to every record it ever saw?
+
+**It does not.** Growth exponent of live bytes over record count is **0.52** — sublinear.
+
+| records | parts | live bytes | B/record | B/part |
+| --: | --: | --: | --: | --: |
+| 500 | 1 | 17,319 | 34.6 | 17,319 |
+| 2,000 | 7 | 29,484 | 14.7 | 4,212 |
+| 8,000 | 31 | 73,482 | 9.2 | 2,370 |
+
+Two-point fit over **parts**, which divides out the fixed cost of opening an engine:
+
+> **~16.6 KB fixed + ~1.8 KB per part.**
+> 1 M records at `seal_max_records=1024` is ~976 parts, so **~1.7 MiB held**.
+
+The bound that matters is therefore **part count**, and merge is what governs it — which
+ties this figure to the Lifecycle section rather than making it an independent reading.
+
+Sealing is confirmed to be the releasing mechanism, not assumed: the same 8,000 records with
+sealing disabled hold **331,604 B vs 73,482 B**, a **4.5x** difference. Had those been
+equal, the bound above would be real but attributed to the wrong mechanism.
+
+**The control runs first**, deliberately: leak a known 1 MiB and require the counter to see
+it. A counting allocator that is not actually installed reports a steady, confident **0
+bytes of growth** — which is also the best possible result. Measuring first and controlling
+second would let a blind instrument read as a perfect one.
+
+⚠ **This file contains exactly one `#[test]` and must keep containing one.** The counter is
+process-global and `cargo test` runs test functions in parallel threads, so two measuring
+tests would each attribute the other's allocations to itself.
+
+⚠ **A denominator bug caught in this file's own first run:** the part count was initially
+taken by walking the directory tree for filenames containing the substring `part`. It
+reported **1 part for 16,000 records at `seal_max_records=256`**, because what it matched was
+the `parts` *directory*. Every per-part number was wrong by ~60x and none of them looked
+wrong. `manifest_snapshot()` publishes the count; the fix was to ask the engine rather than
+infer from the filesystem.
+
+## Concurrency and multi-shard
+
+`tests/concurrency_measures.rs`. Before it, **no test in `ehdb-l0` had ever spawned a
+thread** — every concurrency property the engine has was un-measured.
+
+### The first finding is in the signature
+
+`append_record(&mut self)`. A single `L0Engine` is a **single writer by construction**;
+concurrency is a property of whatever wraps it. Measured, behind one `Mutex`:
+
+| threads | appends/s | out_of_order |
+| --: | --: | --: |
+| 1 | 294 | 0 |
+| 2 | 271 | 0 |
+| 4 | 264 | 0 |
+| 8 | 263 | 0 |
+
+Throughput **decreases** ~10% from 1 to 8 threads: the write path is serialised, so threads
+buy nothing and cost lock handoff. The absolute figure is dominated by the substrate's
+per-append durability (see the fsync decomposition), not by the mutex.
+
+### The second finding reproduces prod's #362 in a unit test
+
+An `AtomicU64` sequencer plus a `Mutex` **is not sufficient**, and the first draft of this
+file asserted that it was — the canary fired 3 times with 2 writers and 32 times across 8
+shards. The window is:
+
+```text
+let s = seq.fetch_add(1);     // A gets 5, B gets 6
+let mut g = engine.lock();    // B wins the race
+g.append_record(..s..);       // 6 is appended before 5
+```
+
+**The sequence must be minted while holding the append lock.** Minted outside it, allocation
+order and append order are independent, and the log is no longer ascending in its own sort
+key. Measured:
+
+| pattern | out_of_order | lost | duplicated |
+| :-- | --: | --: | --: |
+| mint under the lock | **0** of 1,600 | 0 | 0 |
+| mint before the lock | **547** of 1,600 (34.2%) | 0 | 0 |
+| per-thread sequence ranges | 473 of 1,200 (39.4%) | 0 | 0 |
+
+**Nothing is lost and nothing is duplicated in any row.** The ids stay perfectly unique and
+perfectly dense; only their order is wrong. That is exactly why the defect is hard to see in
+production — and it is the same mechanism as
+[ai-meta#362](https://github.com/noetl/ai-meta/issues/362), where snowflake ids minted
+before insert made commit order diverge from id order, so an id-ordered read stopped being
+an append-only prefix. It reopened #360 after a green re-ramp; here it reproduces in 20 ms.
+
+Replay stays strictly ascending in every row — the engine sorts on read. The damage is to
+the **tail canary**, not to read order, which is why `out_of_order_appends` is the only
+signal that sees it.
+
+### Readers concurrent with a writer
+
+3 readers against 1 writer over 400 appends: **142,945 reads, 142,935 strictly mid-write, 0
+invariant violations** — no reader ever observed a non-ascending or duplicated view.
+
+**The coverage control is the load-bearing part.** A clean result with zero mid-write reads
+means the writer finished before any reader looked, which reads identically to "concurrent
+reads are safe". The test counts mid-write reads and **fails at zero** — the same
+"coverage was ~0 by construction" shape as
+[ai-meta#307](https://github.com/noetl/ai-meta/issues/307).
+
+### Multi-shard under contention
+
+8 shards, 4 concurrent writers, keys deliberately shared across all threads so every shard
+is written by every thread: per-shard `[152, 244, 276, 176, 224, 76, 220, 232]`, and the
+union over shards is **set-equal** to what was appended — not merely equal in count. Each
+record also re-hashes to the shard it was read from. `out_of_order_appends == 0`.
+
 ## Invariant measures
 
 `crates/ehdb-l0/tests/invariant_measures.rs`. These are not pass/fail tests — they compute a
@@ -204,25 +317,47 @@ measurement resolves cleanly in `--release`, so it lives in the benchmark.
 
 ## What is NOT measured yet
 
-Named so the gap is visible rather than implied:
+Named so the gap is visible rather than implied.
 
 - ~~p99~~ — **done**, see Tail latency.
 - ~~Seal / merge / reclaim~~ — **done**, see Lifecycle.
-- **Memory** — no allocation or RSS measurement exists. Footprint vs chain length and part
-  count is unmeasured.
-- **Multi-shard and concurrent writers** — every figure here is single-shard,
-  single-threaded. Contention is unmeasured, and so is whether the invariants hold under
-  concurrent writers.
-- **`ehdb-feed`** — 36 files, still 0 benches; the mirror/drain path is unmeasured.
-- **Observability** — `ehdb-l0`'s `metrics.rs` exports **7** public functions for an 88-file
-  engine, three of which are counters. `set_manifest_versions_retained` exists and is
-  written by the sweep; fold/seal/merge/reclaim counters and queue depth do not. Pinned-at-
-  zero series with RED-proven movement are not yet in place, so a `0` on most of this engine
-  cannot be read as healthy.
+- ~~Memory~~ — **done**, see Memory.
+- ~~Multi-shard and concurrent writers~~ — **done**, see Concurrency and multi-shard.
+- **`ehdb-feed`** — 36 files, still 0 benches; the mirror/drain path is unmeasured. This is
+  the next gap, and the one with prod history: ai-meta#344 was 100% transport timeouts
+  because the relay never batched, 0 of 80,264.
+- **Queue depth has an accessor and no exposition.** `ShardConsumerGroup::inflight_len` and
+  `SubjectConsumerGroup::inflight_len` exist and **no `render_*` function emits them** — the
+  "recorder exists, nothing calls it" shape from the reachability lens. A scrape cannot see
+  consumer backlog today.
+- **Benches are not enforced.** Every number on this page was produced by hand. Nothing in
+  CI runs a benchmark or compares one against a baseline, so a regression is silent.
+
+⚠ **This section itself drifted.** It previously claimed `metrics.rs` "exports **7** public
+functions ... three of which are counters" and that "pinned-at-zero series with RED-proven
+movement are not yet in place". Both were stale: `metrics.rs` carries **27** atomic
+counters, a **27**-row `SERIES` table that `every_snapshot_field_is_exported` forces to
+equal them exactly, and `tests/metrics_exposition.rs` holds
+exactly the three guards claimed missing — a denominator guard that reads the field list out
+of the source, a pinned-at-zero check on a fresh engine, and a proven-to-move check driven
+by the lifecycle. A "not measured yet" list is a representation like any other, and it
+drifts in the direction that understates the work.
+
+⚠ And the row count above was itself miscounted once while writing this paragraph:
+`grep -cE '^\s*\("'` over the `SERIES` block returns **10**, because only 10 of the 27 rows
+are short enough for rustfmt to keep the leading string on the same line as the opening
+paren. The other 17 wrap. Counting `^\s*\(` returns 27, which is what
+`every_snapshot_field_is_exported` independently requires. **A line-oriented grep over Rust
+source counts formatting, not code** — the same shape as the `self.field\n    .fetch_add`
+miscount that once reported 4 counters as never written when the real answer was 0 of 27.
 
 ## Related
 
 - `crates/ehdb-l0/benches/l0_engine.rs` — the benchmarks.
 - `crates/ehdb-l0/tests/invariant_measures.rs` — the invariant measures.
+- `crates/ehdb-l0/tests/memory_measures.rs` — the allocator instrument (one `#[test]`, by
+  necessity).
+- `crates/ehdb-l0/tests/concurrency_measures.rs` — concurrent writers, the mint-order trap,
+  reader interleaving with its coverage control, multi-shard set-equality.
 - `agents/rules/representation-drift.md` in noetl/ai-meta — "print the denominator", and
   "volume is not duration".
