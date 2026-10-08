@@ -62,6 +62,16 @@ are real; the tradeoff between them was never quantified. Separately, `poll_assi
 acking is **2.86x slower than with**, because the redelivery scan walks the whole in-flight
 map on every poll — doing less work costs more, and lazy acking is O(n²) in the consumer.
 
+⭐ **Added 2026-10-08 — key-level compaction, measured end to end.**
+`Dataset::supersede_key` plus a compacting merge took a 5,000-op / 500-live vector
+collection from **4,608 stored records at 65.02 ms** to **500 records at 7.13 ms** — 9.2x
+fewer records, 9.1x faster, converging to exactly the live set. Per-record cost is identical
+across every sealed row (**14.11 µs**), so the cost model is linear in *stored* records and
+compaction removes precisely the right term. Control: a dataset declaring no
+`supersede_key` keeps every version and cannot move `records_superseded`.
+⚠ Opt-in is a claim about readers, not a performance switch — `RuntimeDataset` is
+disqualified by `watch_since`. See noetl/ehdb#391.
+
 ## C. Health is OBSERVABLE — a `0` means healthy, not inert
 
 ⚠⚠ **This column's first scoring was wrong, and the correction is instructive.** It said

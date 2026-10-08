@@ -191,6 +191,7 @@ fn a_fresh_engine_emits_every_series_pinned_at_zero() {
         parts_local_only: 0,
         parts_under_replicated: 0,
         dedupe_window_records: 0,
+        records_superseded: 0,
     };
     let text = snap.render_prometheus("expo_d");
     let m = parse(&text);
