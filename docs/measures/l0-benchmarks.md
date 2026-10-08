@@ -96,6 +96,93 @@ worthless, and that is how a benchmark reports a great number for a broken path.
 | 100 | 5.27 µs | 52.7 |
 | 1 000 | 49.1 µs | 49.1 |
 
+## Lifecycle: seal / merge / reclaim, and the manifest quadratic
+
+`crates/ehdb-l0/tests/lifecycle_measures.rs`. Bytes on disk, not timing — deterministic, so
+it is a `cargo test`.
+
+**The question.** On 2026-09-01 the manifest path reached **6,770 snapshots / 19.4 GB behind
+71.8 MB of real data**, filled the prod volume, and made every append fail: snapshot *size*
+grows with part count while snapshot *count* grew with write count. `manifest_retain`
+(noetl/ehdb#344) was the fix. **Is the quadratic actually gone, or still latent?**
+
+**The control is a supported configuration.** `manifest_retain = 0` disables pruning — it
+*is* the pre-fix behaviour by its own doc comment. So the planted defect is not a mutation;
+it is a config the engine still accepts, which makes it the strongest available instrument
+check. If bounded and unbounded measured the same, nothing else here would be evidence.
+
+| appends | `retain=32` bytes | files | `retain=0` bytes | files |
+| --: | --: | --: | --: | --: |
+| 1 024 | 427 636 | 35 | 734 326 | 79 |
+| 2 048 | 1 076 282 | 39 | 2 772 298 | 159 |
+| 4 096 | 2 347 994 | 39 | 10 827 728 | 320 |
+
+Reported as a **growth exponent** — `bytes ~ appends^e`, so `e = ln(ratio)/ln(append_ratio)`.
+A raw ratio cannot be compared across span sizes; an exponent can, and that is what makes
+this a measure rather than an observation. `e = 1` linear, `e = 2` the 2026-09-01 quadratic:
+
+| | bytes | files |
+| :-- | --: | --: |
+| `retain=32` (default) | **1.23** | **0.08** |
+| `retain=0` (pre-fix) | **1.94** | **1.01** |
+
+**Verdict: the quadratic is fixed, and the measure proves it by still seeing it.** The
+pre-fix config reproduces it at **e = 1.94**; retention brings byte growth to **1.23** and
+holds the file **count flat** at ~39 (e = 0.08) across 4x the appends.
+
+⚠ **Residual, asserted so it cannot drift unnoticed.** Bounded bytes still grow *faster than
+linear* (e = 1.23), because retention bounds how MANY snapshots exist, not how BIG one is —
+each retained snapshot legitimately lists more parts as the log grows. Not pathological, not
+free, and calling it "linear" would be wrong. The test asserts `e > 1.0` too: if that ever
+measures sub-linear, the snapshot has stopped listing every part and this measure's premise
+changed.
+
+⚠ **The three lifecycle calls are caller-owned.** `seal_aged_parts`, `run_pending_merges`
+and `reclaim_orphans` run only when a caller drives them. Measured: driving them each seal
+over 1 024 appends performed **15 merges**; a single call at the end performed **8**. A
+measure that never drove them would report 0 and read as "no merges needed" rather than
+"nobody asked" — the configured-but-unreachable shape.
+
+## Tail latency
+
+`crates/ehdb-l0/tests/tail_latency.rs`. Criterion reports mean/median with CIs and **no
+percentiles**, so it cannot answer "how bad is the slow one". Explicit samples, sorted,
+nearest-rank percentiles — no bucketing, because bucketing loses the max and the max is the
+interesting one.
+
+**400 samples each, debug build** (`cargo test`). ⚠ For these I/O-bound paths debug tracks
+release closely — append p50 4 014 µs here against 3 749 µs in the release benchmark, read
+at 900 records 66 µs against 49 µs — because the cost is `fsync` and page cache, not codegen.
+Do not assume that for a CPU-bound path.
+
+| path | n | p50 | p90 | p99 | max |
+| :-- | --: | --: | --: | --: | --: |
+| append, posture A (fsync/append) | 400 | 4 014 µs | 4 815 µs | **7 550 µs** | **11 706 µs** |
+| append, group-committed (no sync) | 400 | **21.4 µs** | 50.4 µs | 75.2 µs | 121 µs |
+| `read_index_after`, len 900 | 400 | 66.0 µs | 110 µs | 248 µs | 928 µs |
+| `read_index_after`, len 1 100 | 400 | **1 910 µs** | 2 013 µs | 2 364 µs | 8 409 µs |
+
+Three things the mean hides:
+
+- **The fsync tail is real**: p99 is **1.9x** p50 and max is **2.9x** p50. A system quoted at
+  "3.7 ms per append" occasionally takes 11.7 ms.
+- **Group commit is 187x cheaper at p50**, far more than the 20.4x the throughput figure
+  shows — because the throughput number includes the batch sync, while the append itself
+  skips the fsync entirely. Both are true; they answer different questions.
+- **The seal boundary is sharper at p50 than in the mean**: 900 → 1 100 records is **29x** at
+  p50 here, against 19x in the criterion mean.
+
+Every line prints `n`. **A percentile over an unstated sample count is not a percentile** — a
+p99 over 50 samples is the single worst of 50, a max wearing a percentile's name.
+
+Resolution control: 2% of samples planted at 5 ms among 1 µs samples. p50 must **not** move
+(1.0 µs) and p99 **must** (5 000 µs). Without it, a p99 equal to p50 could mean "no tail" or
+"the percentile code is broken", and those are not the same.
+
+⚠ This file asserts **no latency bound**. It asserts monotonic percentiles, the stated sample
+count, that group commit is materially cheaper, and the planted control. A latency threshold
+would make it flaky on shared CI hardware, which is how a real measure gets deleted.
+
 ## Invariant measures
 
 `crates/ehdb-l0/tests/invariant_measures.rs`. These are not pass/fail tests — they compute a
@@ -119,14 +206,19 @@ measurement resolves cleanly in `--release`, so it lives in the benchmark.
 
 Named so the gap is visible rather than implied:
 
-- **p99** — criterion reports mean/median with CIs, not tail percentiles. Tail latency needs
-  its own histogram harness.
-- **Memory** — no allocation or RSS measurement exists.
-- **Seal / merge / reclaim cost** — `tick()`'s three lifecycle calls are unmeasured, and the
-  merge path is the one that showed quadratic manifest growth in prod
-  (noetl/ai-meta 2026-09-01).
-- **Multi-shard and concurrent writers** — every figure here is single-shard, single-threaded.
-- **`ehdb-feed`** — 36 files, still 0 benches.
+- ~~p99~~ — **done**, see Tail latency.
+- ~~Seal / merge / reclaim~~ — **done**, see Lifecycle.
+- **Memory** — no allocation or RSS measurement exists. Footprint vs chain length and part
+  count is unmeasured.
+- **Multi-shard and concurrent writers** — every figure here is single-shard,
+  single-threaded. Contention is unmeasured, and so is whether the invariants hold under
+  concurrent writers.
+- **`ehdb-feed`** — 36 files, still 0 benches; the mirror/drain path is unmeasured.
+- **Observability** — `ehdb-l0`'s `metrics.rs` exports **7** public functions for an 88-file
+  engine, three of which are counters. `set_manifest_versions_retained` exists and is
+  written by the sweep; fold/seal/merge/reclaim counters and queue depth do not. Pinned-at-
+  zero series with RED-proven movement are not yet in place, so a `0` on most of this engine
+  cannot be read as healthy.
 
 ## Related
 
