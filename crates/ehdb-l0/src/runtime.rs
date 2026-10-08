@@ -749,6 +749,7 @@ mod tests {
             event: RuntimeEvent::Register,
             heartbeat: 1,
             contract: "shard=0".into(),
+            last_seen_micros: 0,
         };
         assert!(validate_op(&ok).is_ok());
 
@@ -802,6 +803,7 @@ mod tests {
             event: RuntimeEvent::Register,
             heartbeat: 1,
             contract: "shard=0".into(),
+            last_seen_micros: 0,
         };
         assert!(
             validate_op(&op).is_ok(),

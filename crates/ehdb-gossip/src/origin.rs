@@ -96,6 +96,10 @@ mod tests {
             event: RuntimeEvent::Register,
             heartbeat: 1,
             contract: "shard=3;addr=127.0.0.1:9003".into(),
+            // Unstamped on purpose: a membership op arriving over gossip carries the
+            // SENDER's view, and this fixture is about origin trust, not liveness.
+            // `0` is the "unknown" case that `list_live_at` treats as live-not-dead.
+            last_seen_micros: 0,
         }
     }
 

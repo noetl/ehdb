@@ -28,7 +28,7 @@ fn dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ehdb-ttl-{tag}-{}-{n}", std::process::id()))
 }
 
-fn store(root: &PathBuf) -> RuntimeStore {
+fn store(root: &std::path::Path) -> RuntimeStore {
     let obj = root.join("obj");
     let hot = root.join("hot");
     std::fs::create_dir_all(&obj).unwrap();
