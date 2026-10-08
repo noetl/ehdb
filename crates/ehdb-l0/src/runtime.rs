@@ -53,6 +53,21 @@ pub struct RuntimeOp {
     /// descriptor). Carried on register, echoed on heartbeat, empty on
     /// deregister.
     pub contract: String,
+    /// **Wall-clock micros when this op was accepted**, for TTL liveness
+    /// (north-star P1). `0` means *unknown*, which is exactly what a record
+    /// persisted before this field existed decodes to.
+    ///
+    /// ⚠⚠ `0` is **unknown, not dead**. If an absent timestamp were treated as
+    /// expired, the first `list_live_at` after an upgrade would evict the ENTIRE
+    /// fleet — a total outage caused by a liveness improvement. Those records stay
+    /// live and are counted by [`RuntimeStore::liveness_coverage`] so the
+    /// condition is visible rather than inferred.
+    ///
+    /// `#[serde(default)]` is what makes the old frames decode at all; without it
+    /// every pre-upgrade record becomes a decode failure, which is a worse
+    /// version of the same outage.
+    #[serde(default)]
+    pub last_seen_micros: u64,
 }
 
 /// **D8 runtime dataset.** Sort key `op_seq`; partition + index dim `worker_id`.
@@ -84,6 +99,8 @@ pub struct RuntimeState {
     pub contract: String,
     /// The worker's latest heartbeat watermark.
     pub heartbeat: u64,
+    /// Wall-clock micros of the latest op; `0` when unknown (pre-P1 record).
+    pub last_seen_micros: u64,
 }
 
 /// Longest accepted `worker_id`. Bounded because it becomes a substrate key and
@@ -277,6 +294,29 @@ impl RuntimeStore {
         Ok(1)
     }
 
+    /// **register, stamped** — as [`Self::register`] but records `now_micros` so the
+    /// registration can expire by TTL (north-star P1).
+    ///
+    /// The clock is a PARAMETER, not read from the system here. Two reasons: a registry
+    /// whose liveness depends on an ambient clock cannot be tested without sleeping, and a
+    /// caller that already has a commit timestamp should not have a second, disagreeing one
+    /// minted underneath it.
+    pub fn register_at(
+        &mut self,
+        worker_id: &str,
+        contract: impl Into<String>,
+        now_micros: u64,
+    ) -> Result<u64> {
+        self.append_at(
+            worker_id,
+            RuntimeEvent::Register,
+            1,
+            contract.into(),
+            now_micros,
+        )?;
+        Ok(1)
+    }
+
     /// **heartbeat** — advance `worker_id`'s heartbeat watermark by one, echoing
     /// its current contract. Returns the new watermark, or `None` if the worker
     /// is not currently live (never registered or deregistered) — the caller
@@ -286,6 +326,24 @@ impl RuntimeStore {
             Some(op) if op.event != RuntimeEvent::Deregister => {
                 let next = op.heartbeat + 1;
                 self.append(worker_id, RuntimeEvent::Heartbeat, next, op.contract)?;
+                Ok(Some(next))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// **heartbeat, stamped** — renews the TTL window (north-star P1).
+    pub fn heartbeat_at(&mut self, worker_id: &str, now_micros: u64) -> Result<Option<u64>> {
+        match self.latest(worker_id)? {
+            Some(op) if op.event != RuntimeEvent::Deregister => {
+                let next = op.heartbeat + 1;
+                self.append_at(
+                    worker_id,
+                    RuntimeEvent::Heartbeat,
+                    next,
+                    op.contract,
+                    now_micros,
+                )?;
                 Ok(Some(next))
             }
             _ => Ok(None),
@@ -319,6 +377,7 @@ impl RuntimeStore {
                     worker_id: op.worker_id,
                     contract: op.contract,
                     heartbeat: op.heartbeat,
+                    last_seen_micros: op.last_seen_micros,
                 })
             }
         }))
@@ -347,8 +406,46 @@ impl RuntimeStore {
                 worker_id: op.worker_id,
                 contract: op.contract,
                 heartbeat: op.heartbeat,
+                last_seen_micros: op.last_seen_micros,
             })
             .collect())
+    }
+
+    /// **list-live by WALL CLOCK** — the registry's liveness question (north-star P1).
+    ///
+    /// A record is live iff it is not deregistered **and** `now_micros - last_seen < ttl`.
+    /// Replaces the judgement `list_live_since` pushes onto the caller: that one takes a
+    /// watermark in units of an opaque monotonic counter, so the caller has to decide what
+    /// "stale" means in a clock it does not own. This one asks a decidable question.
+    ///
+    /// ⚠ The comparison is strict (`<`), so `now - last_seen == ttl` is **expired**. An
+    /// off-by-one here is the difference between a stable registry and a flapping one, and
+    /// it is invisible to any test that only probes well inside and well outside the window.
+    ///
+    /// ⚠⚠ `last_seen_micros == 0` is **unknown, not dead** — see [`RuntimeOp::last_seen_micros`].
+    /// Such records are returned as live. Use [`Self::liveness_coverage`] to see how many
+    /// of the answer rests on that.
+    pub fn list_live_at(&self, now_micros: u64, ttl_micros: u64) -> Result<Vec<RuntimeState>> {
+        Ok(self
+            .list_live_since(0)?
+            .into_iter()
+            .filter(|s| {
+                s.last_seen_micros == 0
+                    || now_micros.saturating_sub(s.last_seen_micros) < ttl_micros
+            })
+            .collect())
+    }
+
+    /// `(live, of_which_timestamp_unknown)` for a TTL window.
+    ///
+    /// ⚠ Exists because a liveness answer computed partly from records with no timestamp is
+    /// an answer resting on incomplete information, and an operator must be able to SEE
+    /// that rather than infer it. A registry that silently fails open is the same shape as
+    /// a metric that is absent rather than zero.
+    pub fn liveness_coverage(&self, now_micros: u64, ttl_micros: u64) -> Result<(usize, usize)> {
+        let live = self.list_live_at(now_micros, ttl_micros)?;
+        let unknown = live.iter().filter(|s| s.last_seen_micros == 0).count();
+        Ok((live.len(), unknown))
     }
 
     fn append(
@@ -358,6 +455,17 @@ impl RuntimeStore {
         heartbeat: u64,
         contract: String,
     ) -> Result<()> {
+        self.append_at(worker_id, event, heartbeat, contract, 0)
+    }
+
+    fn append_at(
+        &mut self,
+        worker_id: &str,
+        event: RuntimeEvent,
+        heartbeat: u64,
+        contract: String,
+        last_seen_micros: u64,
+    ) -> Result<()> {
         let op_seq = self.engine.global_sequence() + 1;
         let op = RuntimeOp {
             op_seq,
@@ -365,6 +473,7 @@ impl RuntimeStore {
             event,
             heartbeat,
             contract,
+            last_seen_micros,
         };
         // noetl/ai-meta#332 — validate BEFORE the append, not on read. A
         // persisted bad op is replayed by every subsequent fold; this is the only
@@ -640,6 +749,7 @@ mod tests {
             event: RuntimeEvent::Register,
             heartbeat: 1,
             contract: "shard=0".into(),
+            last_seen_micros: 0,
         };
         assert!(validate_op(&ok).is_ok());
 
@@ -693,6 +803,7 @@ mod tests {
             event: RuntimeEvent::Register,
             heartbeat: 1,
             contract: "shard=0".into(),
+            last_seen_micros: 0,
         };
         assert!(
             validate_op(&op).is_ok(),
