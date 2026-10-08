@@ -169,6 +169,7 @@ pub mod registry;
 pub mod replica_targets;
 pub mod retention;
 pub mod runtime;
+pub mod secret_ref;
 pub mod store_role;
 pub mod substrate;
 pub mod unreplicated;
@@ -210,8 +211,10 @@ pub use registry::{
 };
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use runtime::{
-    RuntimeDataset, RuntimeEvent, RuntimeOp, RuntimeState, RuntimeStore, DATASET_D8_RUNTIME,
+    RuntimeDataset, RuntimeEvent, RuntimeKind, RuntimeOp, RuntimeState, RuntimeStore,
+    DATASET_D8_RUNTIME,
 };
+pub use secret_ref::{SecretRef, MAX_SECRET_REF_LEN};
 pub use substrate::{CountingSubstrate, DurableSubstrate, InMemorySubstrate, LocalFsSubstrate};
 pub use unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};

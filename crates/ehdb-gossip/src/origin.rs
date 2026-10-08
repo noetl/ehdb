@@ -100,6 +100,7 @@ mod tests {
             // SENDER's view, and this fixture is about origin trust, not liveness.
             // `0` is the "unknown" case that `list_live_at` treats as live-not-dead.
             last_seen_micros: 0,
+            kind: ehdb_l0::RuntimeKind::Worker,
         }
     }
 
