@@ -466,6 +466,89 @@ Both negative controls were run: removing one `estimates.json` fails with the mi
 and planting an inverted batch ordering fails with the regression named. A guard that has
 never fired is indistinguishable from one that cannot.
 
+## Vectors (P6) — recall is 1.0 by construction, and cost is O(ops)
+
+`crates/ehdb-l0/tests/vector_recall.rs` + `crates/ehdb-l0/benches/vector_query.rs`.
+
+### Measuring first changed what the number means
+
+The north-star spec asked for "an honest recall@k number, because *semantic search works*
+is unfalsifiable without one". `VectorStore::top_k` turns out to be an **exact brute-force
+scan** — every live point, cosine over all, sort, truncate, no approximation anywhere. So:
+
+> **recall@k is 1.0 by construction, and a reported 1.0 is not evidence that search
+> works.** It is evidence that an exhaustive scan was exhaustive.
+
+Recall becomes falsifiable the moment an ANN index exists and **not before**. Publishing
+"recall@10 = 1.00" today would be a vanity metric — unfalsifiable in exactly the way the
+spec warned about, one level up. So recall is kept as a **correctness guard** (anything
+below 1.0 is a defect in the scan or the fold) with a control proving the measure **can**
+report less than 1.0: a complete candidate set scores **1.000**, a damaged one **0.333**,
+and an empty expected set is **undefined rather than 1.0** — otherwise a known-answer set
+that failed to load reports a perfect score.
+
+⚠ **The first known-answer set was silently degenerate.** It built 64 points over 16
+dimensions, so every point with `axis >= 16` carried **no dominant component**, and at
+jitter 0 the query vector was the **zero vector** — cosine against which is undefined.
+`recall@1` read **0.0** and looked like an engine defect. `planted()` now panics on
+`axis >= dim` and each vector's norm and dominant axis are asserted before it is used as
+ground truth. *A fixture that cannot express the answer it claims to know makes every
+assertion about it meaningless.*
+
+### Cost is the number that actually bounds the design
+
+| axis | span | result |
+| :-- | :-- | :-- |
+| dimension (1,000 live) | 32 → 1,024 | 2.36 ms → 54.5 ms — exponent **0.90**, linear, as `cosine` being O(d) predicts |
+| live points (dim 128) | 100 → 5,000 | 33 µs → 66.1 ms — **super-linear** |
+| **op-log depth, live size held at 500** | 1x → 10x | **172 µs → 64.9 ms, a 378x rise for the same 500 live points and the same answer** |
+
+⭐⭐ **Cost tracks op-log depth, not live points.** The decisive comparison is two rows with
+the same op count and a 10x difference in live size:
+
+| collection | ops | live points | query |
+| :-- | --: | --: | --: |
+| 5,000 written once | 5,000 | 5,000 | **66.1 ms** |
+| 500 re-embedded 10x | 5,000 | **500** | **64.9 ms** |
+
+Within **2%**. So **re-embedding a collection is as expensive as growing it** — which is a
+different operational story from "vector search is O(n)", and the same shape as the manifest
+cost that grew with write count rather than data size (ehdb#344).
+
+### ⚠⚠ And compaction does not fix it — verified, not inferred
+
+The obvious remedy is compaction, so it was measured. After a merge actually ran (1 merge),
+the 10x collection went **64.8 ms → 70.5 ms** — **9% worse, not better.** Reading the code
+rather than guessing why:
+
+- `live_points` calls `read_index_after(collection, 0)` — **every op ever written** for the
+  collection — then folds latest-wins in memory. Cost is O(ops) in both I/O and fold.
+- `VectorDataset` defines **no `dedupe_key`**, and the `Dataset` trait exposes **no
+  supersede or compaction hook at all** — only an append-time idempotency window, which is
+  a different thing.
+- Engine merge carries no latest-wins logic: it combines small **parts** into larger parts.
+
+So **merge structurally cannot drop a superseded op.** The prerequisite for vectors at scale
+is a **key-level compaction primitive**, not an approximate index — and the engine has no
+place to put one today. Tracked as noetl/ehdb#391.
+
+This is the same root cause as the note already standing against the catalog work: *EHDB has
+no `Projection`/`Fold` trait, and the pattern is `read_index_after(key, 0)` folded
+latest-wins.* It is cheap at small op counts and quadratic-feeling at large ones.
+
+### The catalog attachment needs no new dataset
+
+`collection` is already both the partition and the index dimension, and `point_id` is
+free-form, so a catalog object's `(resource_type, path)` maps onto `(collection, point_id)`
+directly. Pinned in `vector_recall.rs`: a query on `playbook` returns exactly the playbook
+paths (**set equality**, so cross-type leakage fails the test), a path containing `/`
+round-trips, an object is its own nearest neighbour, and a deleted object leaves the
+results.
+
+⚠ A `point_id` may contain `/` because it is a **payload field**, not a substrate key —
+unlike the runtime registry's id, whose charset is deliberately narrow precisely because it
+becomes a key. The test pins both so the two are not conflated.
+
 ## What is NOT measured yet
 
 Named so the gap is visible rather than implied.
@@ -483,6 +566,8 @@ Named so the gap is visible rather than implied.
 - **The networked transport is still hand-run.** `examples/dispatch_bench.rs` attributes
   publish→claim across the real socket topology, and nothing in CI executes it; the
   benches that run are the in-process drain primitives.
+- **No ANN index exists**, so `recall@k` is not yet a real measurement — see Vectors (P6).
+  It becomes one when an approximate index does.
 - **Nothing measures a multi-node deployment.** Every figure here is one process. Tail
   replication and election (P7/P8 of the north star) are specced, not built, so there is
   nothing to measure yet — and a single-process number must not be quoted as a
@@ -517,6 +602,10 @@ miscount that once reported 4 counters as never written when the real answer was
   move, with a write-refusing substrate for the replica deficits.
 - `crates/ehdb-feed/tests/inflight_exposition.rs` — in-flight depth, and the two states
   lag renders identically.
+- `crates/ehdb-l0/tests/vector_recall.rs` — the recall guard, its control, and the catalog
+  key convention.
+- `crates/ehdb-l0/benches/vector_query.rs` — query cost vs live points, dimension, and
+  op-log depth, plus the post-compaction row.
 - `ci/bench_ratios.py` — the shape guard CI runs.
 - `agents/rules/representation-drift.md` in noetl/ai-meta — "print the denominator", and
   "volume is not duration".
