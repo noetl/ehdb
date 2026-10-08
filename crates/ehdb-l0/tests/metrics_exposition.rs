@@ -183,6 +183,14 @@ fn a_fresh_engine_emits_every_series_pinned_at_zero() {
         parts_pruned: 0,
         parts_bloom_pruned: 0,
         parts_scanned: 0,
+        // The four C6 state gauges. Listed explicitly rather than via
+        // `..Default::default()` on purpose: adding a field must FORCE a decision here,
+        // and a struct-update literal would silently default a new series to 0 and let
+        // this test keep passing without anyone looking at it.
+        manifest_parts: 0,
+        parts_local_only: 0,
+        parts_under_replicated: 0,
+        dedupe_window_records: 0,
     };
     let text = snap.render_prometheus("expo_d");
     let m = parse(&text);

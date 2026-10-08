@@ -61,16 +61,19 @@ fn prometheus_exposition_is_well_formed() {
             shard: 2,
             committed: 5,
             lag: 3,
+            inflight: 0,
         },
         ShardLag {
             shard: 0,
             committed: 9,
             lag: 0,
+            inflight: 0,
         },
         ShardLag {
             shard: 1,
             committed: 4,
             lag: 12,
+            inflight: 0,
         },
     ];
     let text = render_prometheus(&samples);
@@ -109,11 +112,13 @@ async fn metrics_endpoint_is_scrapeable() {
                 shard: 0,
                 committed: 3,
                 lag: 7,
+                inflight: 0,
             },
             ShardLag {
                 shard: 1,
                 committed: 0,
                 lag: 2,
+                inflight: 0,
             },
         ]
     }));

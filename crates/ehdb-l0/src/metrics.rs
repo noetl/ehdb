@@ -200,6 +200,44 @@ pub struct L0Metrics {
     pub parts_bloom_pruned: AtomicU64,
     /// Parts actually opened (local or object-store) across all reads.
     pub parts_scanned: AtomicU64,
+
+    // ---------------------------------------------------------------
+    // State GAUGES (noetl/ai-meta#455 C6). Everything above is a
+    // cumulative counter; these four are the *current* depth of
+    // something, and all four are computed from in-RAM state with no
+    // substrate I/O (`Manifest` + the dedupe window).
+    // ---------------------------------------------------------------
+    /// Live parts in the manifest.
+    ///
+    /// ⭐ This is the gauge that makes the engine's **memory bound observable**:
+    /// `tests/memory_measures.rs` measures RAM at ~16.6 KB fixed + ~1.8 KB per
+    /// part, so part count — not record count — is what predicts footprint. It is
+    /// also what merge exists to bound, so a rising value with a flat `merges`
+    /// counter is the manifest-growth shape that filled the prod volume
+    /// (noetl/ehdb#344).
+    pub manifest_parts: AtomicU64,
+    /// Parts that are sealed but have **no durable replica yet** — the depth of
+    /// the upload backlog.
+    ///
+    /// This is the durability window expressed as a queue rather than as an age.
+    /// A part here exists only in the hot tier: losing the node loses it.
+    pub parts_local_only: AtomicU64,
+    /// **Divergence from the declared replication factor:** parts with at least
+    /// one durable copy but *fewer than the configured replica count*.
+    ///
+    /// ⚠ Distinct from `parts_local_only` on purpose. A part with 0 copies has
+    /// not been uploaded yet, which is latency. A part with 1 of 3 copies has
+    /// been uploaded and is **still under-replicated**, which is a durability
+    /// deficit that no age-based signal reports. `replica_writes` cannot answer
+    /// it either: it is cumulative, so it keeps climbing while the deficit
+    /// persists.
+    pub parts_under_replicated: AtomicU64,
+    /// Records currently held in the append-time idempotency window, summed over
+    /// shards.
+    ///
+    /// `dedupe_window_evictions` says the window is *undersized*; this says how
+    /// full it is before that happens.
+    pub dedupe_window_records: AtomicU64,
 }
 
 impl L0Metrics {
@@ -230,6 +268,28 @@ impl L0Metrics {
         self.manifest_versions_pruned
             .fetch_add(n, Ordering::Relaxed);
     }
+    /// Store the four state gauges in one call.
+    ///
+    /// ⚠ **Called unconditionally at open, including with all-zero values.** A pin
+    /// placed inside a config branch is not a pin — server#315 pinned a reason set
+    /// inside `if event_bus_mode.publishes_ehdb()` and left it absent on exactly the
+    /// configuration whose value someone would be reading.
+    pub(crate) fn set_state_gauges(
+        &self,
+        manifest_parts: u64,
+        parts_local_only: u64,
+        parts_under_replicated: u64,
+        dedupe_window_records: u64,
+    ) {
+        self.manifest_parts.store(manifest_parts, Ordering::Relaxed);
+        self.parts_local_only
+            .store(parts_local_only, Ordering::Relaxed);
+        self.parts_under_replicated
+            .store(parts_under_replicated, Ordering::Relaxed);
+        self.dedupe_window_records
+            .store(dedupe_window_records, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_manifest_versions_retained(&self, n: u64) {
         self.manifest_versions_retained.store(n, Ordering::Relaxed);
     }
@@ -316,6 +376,10 @@ impl L0Metrics {
             parts_pruned: self.parts_pruned.load(Ordering::Relaxed),
             parts_bloom_pruned: self.parts_bloom_pruned.load(Ordering::Relaxed),
             parts_scanned: self.parts_scanned.load(Ordering::Relaxed),
+            manifest_parts: self.manifest_parts.load(Ordering::Relaxed),
+            parts_local_only: self.parts_local_only.load(Ordering::Relaxed),
+            parts_under_replicated: self.parts_under_replicated.load(Ordering::Relaxed),
+            dedupe_window_records: self.dedupe_window_records.load(Ordering::Relaxed),
         }
     }
 }
@@ -358,6 +422,14 @@ pub struct L0MetricsSnapshot {
     pub parts_pruned: u64,
     pub parts_bloom_pruned: u64,
     pub parts_scanned: u64,
+    /// Live parts in the manifest (gauge).
+    pub manifest_parts: u64,
+    /// Sealed parts with no durable replica yet — upload backlog depth (gauge).
+    pub parts_local_only: u64,
+    /// Parts with 1..N-1 durable copies — divergence from the declared RF (gauge).
+    pub parts_under_replicated: u64,
+    /// Records held in the idempotency window, summed over shards (gauge).
+    pub dedupe_window_records: u64,
 }
 
 impl L0MetricsSnapshot {
@@ -485,6 +557,26 @@ const SERIES: &[(&str, &str, &str)] = &[
         "Parts actually scanned by reads.",
         "counter",
     ),
+    (
+        "manifest_parts",
+        "Live parts in the manifest. Predicts engine memory (~1.8 KB each) and is what merge bounds.",
+        "gauge",
+    ),
+    (
+        "parts_local_only",
+        "Sealed parts with no durable replica yet: the upload backlog depth.",
+        "gauge",
+    ),
+    (
+        "parts_under_replicated",
+        "Parts with at least one copy but fewer than the configured replica count: divergence from the declared replication factor.",
+        "gauge",
+    ),
+    (
+        "dedupe_window_records",
+        "Records held in the append-time idempotency window, summed over shards.",
+        "gauge",
+    ),
 ];
 
 impl L0MetricsSnapshot {
@@ -519,6 +611,10 @@ impl L0MetricsSnapshot {
             "parts_pruned" => self.parts_pruned,
             "parts_bloom_pruned" => self.parts_bloom_pruned,
             "parts_scanned" => self.parts_scanned,
+            "manifest_parts" => self.manifest_parts,
+            "parts_local_only" => self.parts_local_only,
+            "parts_under_replicated" => self.parts_under_replicated,
+            "dedupe_window_records" => self.dedupe_window_records,
             other => unreachable!("SERIES names a metric with no accessor: {other}"),
         }
     }

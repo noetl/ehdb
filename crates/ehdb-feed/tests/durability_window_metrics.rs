@@ -70,6 +70,7 @@ fn durability_is_not_consumer_backlog() {
         shard: 0,
         committed: 10,
         lag: 500,
+        inflight: 0,
     }]));
     let durability = render_unreplicated(&[row(0, 0, 0)]);
 

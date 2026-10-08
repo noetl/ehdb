@@ -635,6 +635,7 @@ dependencies = [
 name = "ehdb-feed"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ehdb-core",
  "ehdb-l0",
  "hex",
