@@ -369,3 +369,206 @@ impl L0MetricsSnapshot {
             .unwrap_or(0)
     }
 }
+
+// ===========================================================================
+// Prometheus exposition
+// ===========================================================================
+
+/// The engine's version, stamped at build time.
+///
+/// ⚠ Emitted as a `*_build_info{version}` gauge **pinned at 1**. Without it, a metric's
+/// absence from a scrape has two indistinguishable causes: the series never fired, or the
+/// running binary predates it. `build_info` separates them, and that ambiguity has cost
+/// this fleet a 25-day monitoring outage.
+pub const EHDB_L0_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Every series this engine exports, as `(name, help, kind)`.
+///
+/// ⚠⚠ **This list is the exposition's denominator**, and
+/// `every_snapshot_field_is_exported` asserts it covers every field of
+/// [`L0MetricsSnapshot`]. Adding a counter to the struct without adding it here fails that
+/// test — which is the point. A metric the engine keeps and nothing can scrape is not
+/// observability, and that was the state of all 27 of these before this exposition existed.
+const SERIES: &[(&str, &str, &str)] = &[
+    ("appends", "Records appended to the engine.", "counter"),
+    (
+        "dedupe_hits",
+        "Appends answered from the idempotency window.",
+        "counter",
+    ),
+    (
+        "dedupe_window_evictions",
+        "Keys the idempotency window forgot at capacity; non-zero means it is undersized.",
+        "counter",
+    ),
+    (
+        "out_of_order_appends",
+        "Appends that did not advance their shard tail — the ascending-contract canary.",
+        "counter",
+    ),
+    (
+        "replica_domain_violations",
+        "Failure-domain violations in the replica set at open.",
+        "gauge",
+    ),
+    (
+        "manifest_versions_pruned",
+        "Manifest snapshots deleted by retention.",
+        "counter",
+    ),
+    (
+        "manifest_versions_retained",
+        "Manifest snapshots currently retained.",
+        "gauge",
+    ),
+    (
+        "ingest_append_failed",
+        "Ingest appends that failed.",
+        "counter",
+    ),
+    (
+        "ingest_decode_failed",
+        "Ingest frames that failed to decode.",
+        "counter",
+    ),
+    (
+        "recovered_active_records",
+        "Records recovered from an active part at open.",
+        "counter",
+    ),
+    ("seals", "Parts sealed.", "counter"),
+    (
+        "uploads",
+        "Parts uploaded to the durable substrate.",
+        "counter",
+    ),
+    ("upload_bytes", "Bytes uploaded.", "counter"),
+    (
+        "upload_lag_micros_total",
+        "Summed upload lag in microseconds; divide by uploads for the mean.",
+        "counter",
+    ),
+    ("merges", "Merge operations performed.", "counter"),
+    ("parts_merged", "Parts consumed by merges.", "counter"),
+    ("merged_bytes", "Bytes rewritten by merges.", "counter"),
+    ("orphans_reclaimed", "Orphaned parts reclaimed.", "counter"),
+    ("orphan_bytes", "Bytes reclaimed from orphans.", "counter"),
+    (
+        "parts_dropped",
+        "Parts dropped after a merge superseded them.",
+        "counter",
+    ),
+    (
+        "replica_writes",
+        "Writes issued to replica substrates.",
+        "counter",
+    ),
+    (
+        "read_fallbacks",
+        "Reads that fell back to another replica.",
+        "counter",
+    ),
+    ("cold_loads", "Cold manifest loads.", "counter"),
+    ("reads", "Read operations served.", "counter"),
+    (
+        "parts_pruned",
+        "Parts pruned by manifest metadata before any I/O.",
+        "counter",
+    ),
+    (
+        "parts_bloom_pruned",
+        "Parts pruned by a bloom filter.",
+        "counter",
+    ),
+    (
+        "parts_scanned",
+        "Parts actually scanned by reads.",
+        "counter",
+    ),
+];
+
+impl L0MetricsSnapshot {
+    /// Read one series by name. Kept beside [`SERIES`] so the two cannot drift: a name in
+    /// the list with no arm here fails to compile.
+    fn value(&self, name: &str) -> u64 {
+        match name {
+            "appends" => self.appends,
+            "dedupe_hits" => self.dedupe_hits,
+            "dedupe_window_evictions" => self.dedupe_window_evictions,
+            "out_of_order_appends" => self.out_of_order_appends,
+            "replica_domain_violations" => self.replica_domain_violations,
+            "manifest_versions_pruned" => self.manifest_versions_pruned,
+            "manifest_versions_retained" => self.manifest_versions_retained,
+            "ingest_append_failed" => self.ingest_append_failed,
+            "ingest_decode_failed" => self.ingest_decode_failed,
+            "recovered_active_records" => self.recovered_active_records,
+            "seals" => self.seals,
+            "uploads" => self.uploads,
+            "upload_bytes" => self.upload_bytes,
+            "upload_lag_micros_total" => self.upload_lag_micros_total,
+            "merges" => self.merges,
+            "parts_merged" => self.parts_merged,
+            "merged_bytes" => self.merged_bytes,
+            "orphans_reclaimed" => self.orphans_reclaimed,
+            "orphan_bytes" => self.orphan_bytes,
+            "parts_dropped" => self.parts_dropped,
+            "replica_writes" => self.replica_writes,
+            "read_fallbacks" => self.read_fallbacks,
+            "cold_loads" => self.cold_loads,
+            "reads" => self.reads,
+            "parts_pruned" => self.parts_pruned,
+            "parts_bloom_pruned" => self.parts_bloom_pruned,
+            "parts_scanned" => self.parts_scanned,
+            other => unreachable!("SERIES names a metric with no accessor: {other}"),
+        }
+    }
+
+    /// Render the Prometheus text exposition (format v0.0.4).
+    ///
+    /// ⚠ **Every series is emitted unconditionally, including at 0.** That is the whole
+    /// design. `prometheus::Registry::gather` prunes metric families with no children, so a
+    /// labelled metric is *absent* until something increments it — and an absent series and
+    /// a healthy zero look identical to every alert. Emitting from a plain snapshot avoids
+    /// that by construction: there are no label children to be empty.
+    ///
+    /// `dataset` becomes a label so one process serving several datasets is separable.
+    pub fn render_prometheus(&self, dataset: &str) -> String {
+        let ds = escape_label(dataset);
+        let mut out = String::with_capacity(SERIES.len() * 160);
+        out.push_str("# HELP ehdb_l0_build_info Engine version, pinned at 1 so an absent series can be told from an old binary.\n");
+        out.push_str("# TYPE ehdb_l0_build_info gauge\n");
+        out.push_str(&format!(
+            "ehdb_l0_build_info{{version=\"{}\"}} 1\n",
+            escape_label(EHDB_L0_VERSION)
+        ));
+        for (name, help, kind) in SERIES {
+            out.push_str(&format!("# HELP ehdb_l0_{name} {help}\n"));
+            out.push_str(&format!("# TYPE ehdb_l0_{name} {kind}\n"));
+            out.push_str(&format!(
+                "ehdb_l0_{name}{{dataset=\"{ds}\"}} {}\n",
+                self.value(name)
+            ));
+        }
+        // Derived, because a mean is what an operator reads and `total/count` invites the
+        // divide-by-zero that reports 0 lag for "no uploads yet".
+        out.push_str("# HELP ehdb_l0_upload_lag_micros_mean Mean upload lag; 0 when no uploads have happened.\n");
+        out.push_str("# TYPE ehdb_l0_upload_lag_micros_mean gauge\n");
+        out.push_str(&format!(
+            "ehdb_l0_upload_lag_micros_mean{{dataset=\"{ds}\"}} {}\n",
+            self.mean_upload_lag_micros()
+        ));
+        out
+    }
+
+    /// The series names this exposition emits, for tests and for a scrape-coverage check.
+    pub fn series_names() -> Vec<&'static str> {
+        SERIES.iter().map(|(n, _, _)| *n).collect()
+    }
+}
+
+/// Escape a Prometheus label value (backslash, quote, newline).
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}

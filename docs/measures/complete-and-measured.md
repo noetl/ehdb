@@ -50,15 +50,31 @@ caught by its own planted control. So the control is a criterion, not a nicety.
 
 ## C. Health is OBSERVABLE — a `0` means healthy, not inert
 
-| # | criterion | status |
-| :-- | :-- | :-- |
-| C1 | Counters for fold / seal / merge / reclaim | ❌ `metrics.rs` exports **7** public functions for an 88-file engine |
-| C2 | Divergence and queue depth exported | ⚠ `set_replica_domain_violations` and the ingest-failure counters exist; divergence and depth do not |
-| C3 | Every closed label set **pinned at 0** at startup, so absence ≠ zero | ❌ |
-| C4 | Each series **RED-proven to move** — a test that fails if the recorder is never called | ⚠ `set_manifest_versions_retained` is written by the sweep; most are unproven |
+⚠⚠ **This column's first scoring was wrong, and the correction is instructive.** It said
+"`metrics.rs` exports **7** public functions for an 88-file engine" and concluded the
+counters were missing. That count matched `pub fn` only — **17 of the 20 incrementers are
+`pub(crate) fn`**, and all **27** metric fields are `pub`. A follow-up pass then reported 4
+fields as never written; also wrong, a line-oriented grep missing
+`self.field\n    .fetch_add(..)`. Checked multi-line-aware: **0 of 27 are unwritten.**
 
-⚠ C is the weakest column and the honest headline of this document: **most of this engine's
-health cannot be read from its metrics, so a `0` on it is not evidence of anything.**
+The real gap was narrower and was not about missing counters at all: **27 good counters that
+nothing could scrape.** `L0Metrics` was in-process only, and the workspace's single
+Prometheus exposition lives in `ehdb-feed/src/scaler.rs` for consumer lag, not the engine.
+
+| # | criterion | check | status |
+| :-- | :-- | :-- | :-- |
+| C1 | Counters for seal / merge / reclaim / read | `metrics.rs` | ✅ **27 fields, all written** — `seals`, `merges`, `parts_merged`, `orphans_reclaimed`, `parts_dropped`, `reads`, … |
+| C2 | Those counters are **scrapable** | `render_prometheus` | ✅ Prometheus text v0.0.4, `dataset` label, plus a derived mean-lag gauge |
+| C3 | Every series **pinned**, present at 0 on a fresh engine | `metrics_exposition.rs` | ✅ 27/27 emitted at 0; `build_info` pinned at 1 so an absent series can be told from an old binary |
+| C4 | Each series **RED-proven to move** | same | ✅ `appends` 512, `seals` 32, `merges` 7, `parts_merged` 28, `reads` 5, `manifest_versions_retained` 26 — and the ascending canary **stays 0** |
+| C5 | The exposition's **denominator is self-maintaining** | same | ✅ a snapshot field with no series fails the build-or-test; mutation-proven |
+| C6 | Divergence and queue depth | — | ❌ still absent; `replica_domain_violations` is the nearest thing |
+
+⚠ **Why pinning matters rather than using `prometheus::Registry`**: `Registry::gather`
+**prunes metric families with no children**, so a labelled metric is *absent* until something
+increments it — and an absent series and a healthy zero are indistinguishable to every
+alert. Rendering from a plain snapshot has no label children to be empty, so the pin holds
+by construction.
 
 ## D. A regression is LOUD
 
@@ -83,8 +99,15 @@ cargo clippy --workspace --all-targets -- -D warnings   # a real gate in this re
 
 ## The shortest honest summary
 
-**A is nearly met, B is met except memory/concurrency/feed, C is barely started, D is met
-except CI enforcement.** The gap between EHDB today and "complete and measured" is almost
-entirely **column C** — observability — plus **B6–B8**.
+**A nearly met · B met except memory/concurrency/feed · C met except divergence and queue
+depth · D met except CI enforcement.**
+
+The remaining gap is **B6–B8** (memory, concurrency/multi-shard, `ehdb-feed`), **C6**
+(divergence + queue depth), **A5** (fold determinism has no engine-side enforcement point)
+and **D5** (CI does not run the benches, so there is no stored baseline).
+
+⚠ **A6 is not a gap — it is a category error I made.** Single-root is **not an EHDB
+invariant**: `single root` has zero mentions in this repo. It belongs to `noetl/server`'s
+chain work. Recorded so nobody looks for it here.
 
 See [`l0-benchmarks.md`](l0-benchmarks.md) for the numbers and the methodology.
