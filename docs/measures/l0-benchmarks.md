@@ -515,26 +515,95 @@ Within **2%**. So **re-embedding a collection is as expensive as growing it** �
 different operational story from "vector search is O(n)", and the same shape as the manifest
 cost that grew with write count rather than data size (ehdb#344).
 
-### ⚠⚠ And compaction does not fix it — verified, not inferred
+### ⚠⚠ Compaction did not fix it — and the reason was structural (noetl/ehdb#391)
 
-The obvious remedy is compaction, so it was measured. After a merge actually ran (1 merge),
-the 10x collection went **64.8 ms → 70.5 ms** — **9% worse, not better.** Reading the code
-rather than guessing why:
+The obvious remedy is compaction, so it was measured. After a merge actually ran, the 10x
+collection went **64.8 ms → 70.5 ms** — **9% worse, not better.** Reading the code rather
+than guessing why:
 
 - `live_points` calls `read_index_after(collection, 0)` — **every op ever written** for the
-  collection — then folds latest-wins in memory. Cost is O(ops) in both I/O and fold.
-- `VectorDataset` defines **no `dedupe_key`**, and the `Dataset` trait exposes **no
-  supersede or compaction hook at all** — only an append-time idempotency window, which is
-  a different thing.
+  collection — then folds latest-wins in memory. O(ops) in both I/O and fold.
+- `VectorDataset` defined **no `dedupe_key`**, and the `Dataset` trait exposed **no supersede
+  or compaction hook at all** — only an append-time idempotency window, a different thing.
 - Engine merge carries no latest-wins logic: it combines small **parts** into larger parts.
 
-So **merge structurally cannot drop a superseded op.** The prerequisite for vectors at scale
-is a **key-level compaction primitive**, not an approximate index — and the engine has no
-place to put one today. Tracked as noetl/ehdb#391.
+So **merge structurally could not drop a superseded op**, because nothing told it one op
+superseded another.
 
-This is the same root cause as the note already standing against the catalog work: *EHDB has
-no `Projection`/`Fold` trait, and the pattern is `read_index_after(key, 0)` folded
-latest-wins.* It is cheap at small op counts and quadratic-feeling at large ones.
+### ✅ Fixed: `Dataset::supersede_key` and a compacting merge
+
+`Dataset::supersede_key(record) -> Option<&str>` declares that a later record with the same
+key makes an earlier one semantically dead. `merge_once` then keeps, per key, only the
+maximum-sort-key record **among its own sources**.
+
+**Why dropping records during a merge is safe:** a latest-wins fold answers, for each key,
+*the record with the maximum sort key*. Every record a compacting merge drops already lost
+that fold to a record the merge keeps, so the global per-key maximum — and therefore the
+answer — cannot move. That holds regardless of what other parts contain.
+
+⚠⚠ **It is only safe where nothing reads history, which is why it is opt-in — and that is
+not a theoretical caveat.** `RuntimeDataset` (D8) must **not** opt in, because
+`RuntimeStore::watch_since`, added by the P2 registry work, returns the **op log** after a
+cursor: compacting D8 would silently delete the history a watcher resumes from. **One
+history reader disqualifies a dataset.** `D1EventLog` must never opt in either — append-only
+and immutable by platform rule, with replay as the source of truth. Only `VectorDataset`
+opts in today.
+
+A tombstone is the maximum-sort-key record for its key, so the rule keeps it and a delete
+cannot be resurrected. Tombstones accumulate until retention drops their part —
+deliberately: dropping one early is corruption, not a missed optimisation.
+
+#### Before and after, with the denominator printed
+
+| row | sealed parts | stored records | superseded | query | µs per stored record |
+| :-- | --: | --: | --: | --: | --: |
+| 1x500ops | **0** | **0** | 0 | 172 µs | *(unsealed path — see below)* |
+| 4x500ops | 3 | 1,536 | 0 | 21.67 ms | **14.11** |
+| 10x500ops | 9 | 4,608 | 0 | 65.02 ms | **14.11** |
+| 10x compacted, default policy | 3 | 1,404 | 3,596 | 19.81 ms | **14.11** |
+| **10x compacted, tuned policy** | **1** | **500** | **4,500** | **7.13 ms** | **14.26** |
+
+> **9.2x fewer stored records, 9.1x faster.** Per-record cost is **identical** across every
+> sealed row, so query cost is purely a function of *stored* records — and compaction
+> converged to **exactly** the live set (500 records in 1 part).
+
+⚠ **The `1x500ops` row is not a floor, and printing the denominator is what showed it.** 500
+appends at `seal_max_records = 512` produce **zero sealed parts**, so that row reads the
+in-RAM active writer while every other row reads sealed parts off disk. Without the parts
+column it reads as a 172 µs target that compaction misses by 40x; with it, the residual is a
+sealed-vs-unsealed regime difference and compaction has in fact converged.
+
+⚠ **Merge policy matters, and the default is not the right one for a compacting dataset.**
+Merge is one-level: an output above `small_part_max_records` is never re-merged. Under the
+default (`with_seal_max_records` ties that bound to the seal size) compaction stalls at
+**1,404 records** — not because the bound was exceeded, but because only **3** small parts
+remained and `trigger_run_len = 4` never fires again. Lowering the trigger converges to the
+live set. A compacting dataset wants the bound at or above its expected live-set size **and**
+a trigger it can actually reach.
+
+#### `records_superseded`, proven to move
+
+A new counter, pinned at 0 and asserted to equal exactly the records dropped — 2,100 of
+2,400 in the test, 4,500 of 5,000 in the bench. A dataset declaring no `supersede_key` can
+never move it, so a permanent 0 on a compacting dataset is the #391 defect, and would
+otherwise read exactly like a store with nothing to collapse.
+
+#### Mutation battery: 5 of 6 caught, 1 verified benign
+
+| mutant | result |
+| :-- | :-- |
+| the trait default compacts by `index_key` (leaking to every dataset) | ✅ caught |
+| keep the **first** per key instead of the last | ✅ caught — **by the tombstone test**, which resurrects the delete |
+| `VectorDataset` compacts by `collection` instead of `point_id` | ✅ caught |
+| the counter is never incremented | ✅ caught |
+| compaction skipped entirely (the pre-fix behaviour) | ✅ caught |
+| a tombstone is excluded from being a compaction key | ⚪ **survived, verified behaviour-preserving** |
+
+The last row is stated rather than hidden: a tombstone returning `None` is *always* kept and
+still outranks older upserts in the fold, so the answer is unchanged and only an extra
+record per deleted point is retained. **A surviving mutant is a gap only when the mutant is
+a defect** — this one is not, confirmed by running it and getting identical results. And the
+tombstone guard is independently proven able to fire, because the keep-first mutant fails it.
 
 ### The catalog attachment needs no new dataset
 

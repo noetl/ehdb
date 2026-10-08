@@ -1177,6 +1177,16 @@ impl<D: Dataset> L0Engine<D> {
         }
         records.sort_by_key(D::sort_key);
 
+        // **Key-level compaction** (noetl/ehdb#391). For a dataset that declares a
+        // `supersede_key`, keep only the highest-sort-key record per key among THESE
+        // sources. Every dropped record already lost a latest-wins fold to a record that
+        // is kept, so the global per-key maximum — and therefore the fold's answer — is
+        // unchanged. A dataset that declares nothing is untouched.
+        let superseded = compact_superseded::<D>(&mut records);
+        if superseded > 0 {
+            self.metrics.add_records_superseded(superseded);
+        }
+
         // Build the merged immutable part (in a per-partition `merged/` subdir so
         // its active-file name can never collide with the append-path writer).
         let merged_dir = self.config.local_root.join(format!(
@@ -1748,6 +1758,35 @@ impl<D: Dataset> Drop for L0Engine<D> {
             let _ = handle.join();
         }
     }
+}
+
+/// Drop records superseded by a later record with the same [`Dataset::supersede_key`].
+///
+/// `records` must already be sorted ascending by sort key. Walks backwards keeping the
+/// first occurrence of each key — which, in ascending order, is the **last**, i.e. the
+/// maximum-sort-key record. A record whose `supersede_key` is `None` is always kept, so a
+/// dataset that does not opt in loses nothing. Returns how many were dropped.
+fn compact_superseded<D: Dataset>(records: &mut Vec<D::Record>) -> u64 {
+    let before = records.len();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut keep = vec![true; before];
+    for i in (0..before).rev() {
+        if let Some(key) = D::supersede_key(&records[i]) {
+            if !seen.insert(key.to_string()) {
+                keep[i] = false;
+            }
+        }
+    }
+    if keep.iter().all(|k| *k) {
+        return 0;
+    }
+    let mut idx = 0usize;
+    records.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+    (before - records.len()) as u64
 }
 
 fn decrement(outstanding: &Arc<(Mutex<usize>, Condvar)>) {

@@ -68,6 +68,56 @@ pub trait Dataset: 'static {
         None
     }
 
+    /// **Key-level compaction identity** (noetl/ehdb#391). `Some(key)` declares that a
+    /// later record with the same key makes an earlier one *semantically dead*, so a merge
+    /// may drop the earlier one. `None` — the default — means no compaction, and every
+    /// record survives every merge exactly as before.
+    ///
+    /// # This is a claim about READERS, not a performance switch
+    ///
+    /// A latest-wins fold answers, for each key, *the record with the maximum sort key*. A
+    /// compacting merge keeps, for each key, the maximum-sort-key record **among its own
+    /// sources**, so every record it drops already lost that fold and the answer cannot
+    /// move. That argument holds only if **nothing reads this dataset's history**.
+    ///
+    /// ⚠⚠ Concretely, [`crate::RuntimeDataset`] (D8) must **not** opt in, even though its
+    /// `RuntimeStore` get/list paths are latest-wins folds: `RuntimeStore::watch_since`
+    /// returns the **op log** after a cursor, so compacting D8 would silently delete the
+    /// history a watcher resumes from. One history reader is enough to disqualify a
+    /// dataset.
+    ///
+    /// Likewise `D1EventLog` must never opt in — the event log is append-only and immutable
+    /// by platform rule, and replay is the source of truth.
+    ///
+    /// # Not `dedupe_key`, and not `index_key`
+    ///
+    /// [`Self::dedupe_key`] is an **append-time idempotency window**: it suppresses a
+    /// *duplicate* append. It says nothing about one record superseding another, and its
+    /// window is bounded, so it cannot be reused here.
+    ///
+    /// [`Self::index_key`] is the **partition and index dimension** — for
+    /// [`crate::VectorDataset`] that is the *collection*, while the compaction identity is
+    /// the *point id*. They are different granularities and conflating them would collapse
+    /// a whole collection to one record.
+    ///
+    /// # Tombstones
+    ///
+    /// A tombstone is the maximum-sort-key record for its key, so the rule above keeps it
+    /// and a delete cannot be resurrected. Tombstones therefore accumulate until retention
+    /// drops their part — deliberately: dropping one early is data corruption, not a missed
+    /// optimisation.
+    ///
+    /// # Merge policy interaction
+    ///
+    /// Merge is one-level: an output larger than
+    /// [`MergePolicy::small_part_max_records`](crate::MergePolicy::small_part_max_records)
+    /// is never re-merged. A compacting dataset should therefore set that bound **at or
+    /// above its expected live-set size**, or compaction stalls after the first pass with
+    /// one big part per merged run.
+    fn supersede_key(_record: &Self::Record) -> Option<&str> {
+        None
+    }
+
     /// Stamp a **writer-assigned** sort key onto a record at append time,
     /// returning the re-keyed record. The default returns it unchanged — the
     /// caller's sort key is authoritative (the intrinsic case: an op-log id, a
