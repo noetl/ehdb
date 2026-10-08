@@ -1,0 +1,107 @@
+name: "Semantic Release ⚙️"
+
+# ehdb had NO release automation: every v0.4.x tag was pushed by hand, so the
+# version was whatever a human typed and nothing connected it to the commits.
+#
+# ⚠⚠ THIS WORKFLOW IS GATED OFF BY DEFAULT. The `release` job runs only when the
+# repository variable `EHDB_RELEASE_ENABLED` is exactly `true`. Until an owner
+# sets it, a push to `main` reaches this workflow and does nothing — because
+# cutting an ehdb tag moves the version that `noetl/server` pins for the
+# production event store, and both of its pins (`ehdb-feed` and `ehdb-l0`) must
+# move together. That is a deliberate human decision, not a side effect of a
+# merge.
+#
+# A skipped job reports success, which would make "the automation works"
+# unfalsifiable. The falsifiable part lives in `ci.yml`'s `release-dryrun` job,
+# which runs the real plugin chain against the real history on every pull
+# request and fails if it cannot compute a version.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute the next version and print the notes WITHOUT tagging or releasing."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  # Create the tag and the GitHub Release.
+  contents: write
+  # Dispatch `release.yml` — see the step comment below for why that is needed.
+  actions: write
+  # The GitHub plugin's successComment.
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    # ⚠ The gate. Unset variable => skipped. An owner enables releases by
+    # setting the repository variable EHDB_RELEASE_ENABLED to `true`.
+    # `workflow_dispatch` with dry_run still runs, so the pipeline stays
+    # exercisable while releases are off.
+    if: >-
+      vars.EHDB_RELEASE_ENABLED == 'true' ||
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # semantic-release reads the whole history to analyse commits.
+          fetch-depth: 0
+
+      - name: Release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24.2.3
+          dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ⚠⚠ A tag pushed with GITHUB_TOKEN does NOT trigger workflows — GitHub
+      # suppresses it to prevent recursion. `release.yml` is configured on
+      # `push: tags: ['v*']` and would therefore NEVER fire for a
+      # semantic-release tag. noetl/server lost a crates.io publish to exactly
+      # this and had to dispatch by hand; the explicit dispatch below is the
+      # fix, and it is why this job needs `actions: write`.
+      - name: Dispatch release verification for the new tag
+        if: steps.semantic.outputs.new_release_published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.semantic.outputs.new_release_version }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching release.yml for $TAG"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --field "tag=$TAG"
+
+      # Read the tag back rather than assuming it. A release-triggering type is
+      # easy to get wrong (`chore:` and `refactor:` release NOTHING, silently),
+      # and the tag is this repo's only version authority.
+      - name: Report what actually happened
+        if: always()
+        env:
+          PUBLISHED: ${{ steps.semantic.outputs.new_release_published }}
+          VERSION: ${{ steps.semantic.outputs.new_release_version }}
+        run: |
+          set -euo pipefail
+          if [ "${PUBLISHED:-false}" = "true" ]; then
+            echo "released: v${VERSION}"
+          else
+            echo "NO RELEASE. Either the gate is off, this was a dry run, or no"
+            echo "commit since the last tag carried a release-triggering type."
+            echo "feat: => minor, fix: => patch, feat!: / BREAKING CHANGE => major."
+            echo "chore:/docs:/test:/refactor: and any non-conventional subject"
+            echo "release nothing, and do so SILENTLY."
+          fi

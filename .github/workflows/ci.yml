@@ -63,3 +63,79 @@ jobs:
           name: criterion-estimates
           path: target/criterion/**/new/estimates.json
           if-no-files-found: error
+
+  # The FALSIFIABLE half of the release automation.
+  #
+  # `semantic-release.yml` is gated off, and a skipped job reports success — so on
+  # its own it proves nothing. This job runs the real plugin chain against the real
+  # commit history on every pull request and fails if the pipeline cannot analyse
+  # commits. It never tags and never publishes: `--dry-run` skips tag creation and
+  # every publish step.
+  #
+  # ⚠ It asserts on the analyzeCommits step having COMPLETED, not merely on a zero
+  # exit. semantic-release exits 0 when a branch "is not configured to release",
+  # which is exactly what a broken branch config produces — a green run that
+  # analysed nothing.
+  release-dryrun:
+    name: Release pipeline (dry run, never tags)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ⚠⚠ Check out the HEAD BRANCH, not the default merge ref. On a
+          # `pull_request` event actions/checkout lands on `refs/pull/N/merge`, so
+          # semantic-release reports its current branch as `refs/pull/393/merge`,
+          # does not match `--branches`, analyses nothing — and EXITS 0.
+          #
+          # That is exactly the green-run-that-examined-nothing this job's assertion
+          # exists to catch, and it is how the assertion earned its place: it failed
+          # on its own first run for this reason.
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compute the next version without releasing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # ⚠⚠ semantic-release takes its current branch from **env-ci**, not from git
+          # HEAD, so checking out the head ref does NOT change what it believes it is on.
+          # On a `pull_request` event env-ci reads GITHUB_REF and reports
+          # `refs/pull/N/merge`, which matches no `--branches` value, so it analyses
+          # nothing and exits 0. Checking out `github.head_ref` was tried first and
+          # changed nothing for exactly this reason.
+          #
+          # Presenting the child process as a push to the head branch is what makes the
+          # analyser run. The assignments are inline so they apply to this one command
+          # and nothing else; a real release runs on `push: main`, where none of this is
+          # needed and the committed .releaserc.json applies unchanged.
+          GITHUB_EVENT_NAME=push \
+          GITHUB_REF="refs/heads/$HEAD_BRANCH" \
+          npx -y -p semantic-release@24.2.3 \
+                 -p conventional-changelog-conventionalcommits@8.0.0 \
+                 semantic-release --dry-run --branches "$HEAD_BRANCH" 2>&1 | tee sr.log
+
+          if ! grep -q 'Completed step "analyzeCommits"' sr.log; then
+            echo
+            echo "FAIL: analyzeCommits never completed, so no commit was examined."
+            echo "A zero exit here is consistent with a branch the config refuses to"
+            echo "release — which is a broken pipeline, not a quiet one."
+            exit 1
+          fi
+
+          # Print the denominator: what it decided, and from how many commits.
+          SINCE=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$SINCE" ]; then
+            N=$(git rev-list --count "${SINCE}..HEAD")
+            echo "analysed $N commit(s) since $SINCE"
+          fi
+          if grep -q 'The next release version is' sr.log; then
+            grep 'The next release version is' sr.log
+          else
+            echo "no release would be cut from these commits (no release-triggering type)."
+            echo "feat: => minor, fix: => patch, feat!: / BREAKING CHANGE => major;"
+            echo "chore:/docs:/test:/refactor: release nothing, silently."
+          fi
