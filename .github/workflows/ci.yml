@@ -101,8 +101,19 @@ jobs:
           HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
-          # `--branches` is overridden to this branch so the analyser actually runs
-          # here; on `main` the committed .releaserc.json config applies unchanged.
+          # ⚠⚠ semantic-release takes its current branch from **env-ci**, not from git
+          # HEAD, so checking out the head ref does NOT change what it believes it is on.
+          # On a `pull_request` event env-ci reads GITHUB_REF and reports
+          # `refs/pull/N/merge`, which matches no `--branches` value, so it analyses
+          # nothing and exits 0. Checking out `github.head_ref` was tried first and
+          # changed nothing for exactly this reason.
+          #
+          # Presenting the child process as a push to the head branch is what makes the
+          # analyser run. The assignments are inline so they apply to this one command
+          # and nothing else; a real release runs on `push: main`, where none of this is
+          # needed and the committed .releaserc.json applies unchanged.
+          GITHUB_EVENT_NAME=push \
+          GITHUB_REF="refs/heads/$HEAD_BRANCH" \
           npx -y -p semantic-release@24.2.3 \
                  -p conventional-changelog-conventionalcommits@8.0.0 \
                  semantic-release --dry-run --branches "$HEAD_BRANCH" 2>&1 | tee sr.log

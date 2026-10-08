@@ -86,11 +86,19 @@ when a branch "is not configured to release", which is exactly what a broken bra
 produces: a green run that examined nothing. Proven by planting a nonexistent branch in
 `.releaserc.json` and confirming the guard fails.
 
-⭐ **It caught a real defect on its own first run.** On a `pull_request` event
-`actions/checkout` lands on `refs/pull/N/merge`, so semantic-release reported its branch as
-`refs/pull/393/merge`, failed to match `--branches`, analysed nothing, and **exited 0**. The
-job now checks out `github.head_ref` explicitly. A guard that has never fired is
-indistinguishable from one that cannot — this one fired immediately, on itself.
+⭐ **It caught a real defect on its own first run, twice.** On a `pull_request` event
+semantic-release reported its branch as `refs/pull/393/merge`, matched no `--branches`
+value, analysed nothing, and **exited 0**.
+
+The first fix — checking out `github.head_ref` instead of the merge ref — **changed
+nothing**, which located the real cause: semantic-release takes its branch from **env-ci**,
+reading `GITHUB_REF`, not from git HEAD. The job now presents the child process as a push to
+the head branch (`GITHUB_EVENT_NAME=push`, `GITHUB_REF=refs/heads/<branch>`), inline so it
+affects that one command only. A real release runs on `push: main`, where none of this
+applies.
+
+A guard that has never fired is indistinguishable from one that cannot — this one fired
+immediately, on itself, and its second failure is what identified the actual mechanism.
 
 ## Why `release.yml` is dispatched explicitly
 
