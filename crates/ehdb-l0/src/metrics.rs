@@ -238,6 +238,12 @@ pub struct L0Metrics {
     /// `dedupe_window_evictions` says the window is *undersized*; this says how
     /// full it is before that happens.
     pub dedupe_window_records: AtomicU64,
+    /// Records dropped by **key-level compaction** during a merge (noetl/ehdb#391).
+    ///
+    /// Cumulative. A dataset that declares no `supersede_key` can never move this, so a
+    /// permanent 0 on a compacting dataset means merges are not collapsing anything — which
+    /// is the #391 defect, and reads exactly like a store that has no superseded records.
+    pub records_superseded: AtomicU64,
 }
 
 impl L0Metrics {
@@ -274,6 +280,11 @@ impl L0Metrics {
     /// placed inside a config branch is not a pin — server#315 pinned a reason set
     /// inside `if event_bus_mode.publishes_ehdb()` and left it absent on exactly the
     /// configuration whose value someone would be reading.
+    /// Record `n` superseded records dropped by a compacting merge.
+    pub(crate) fn add_records_superseded(&self, n: u64) {
+        self.records_superseded.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_state_gauges(
         &self,
         manifest_parts: u64,
@@ -380,6 +391,7 @@ impl L0Metrics {
             parts_local_only: self.parts_local_only.load(Ordering::Relaxed),
             parts_under_replicated: self.parts_under_replicated.load(Ordering::Relaxed),
             dedupe_window_records: self.dedupe_window_records.load(Ordering::Relaxed),
+            records_superseded: self.records_superseded.load(Ordering::Relaxed),
         }
     }
 }
@@ -430,6 +442,8 @@ pub struct L0MetricsSnapshot {
     pub parts_under_replicated: u64,
     /// Records held in the idempotency window, summed over shards (gauge).
     pub dedupe_window_records: u64,
+    /// Records dropped by key-level compaction during merges (counter).
+    pub records_superseded: u64,
 }
 
 impl L0MetricsSnapshot {
@@ -577,6 +591,11 @@ const SERIES: &[(&str, &str, &str)] = &[
         "Records held in the append-time idempotency window, summed over shards.",
         "gauge",
     ),
+    (
+        "records_superseded",
+        "Records dropped by key-level compaction during a merge. A permanent 0 on a dataset that declares a supersede_key means merges are not collapsing anything.",
+        "counter",
+    ),
 ];
 
 impl L0MetricsSnapshot {
@@ -615,6 +634,7 @@ impl L0MetricsSnapshot {
             "parts_local_only" => self.parts_local_only,
             "parts_under_replicated" => self.parts_under_replicated,
             "dedupe_window_records" => self.dedupe_window_records,
+            "records_superseded" => self.records_superseded,
             other => unreachable!("SERIES names a metric with no accessor: {other}"),
         }
     }

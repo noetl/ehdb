@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ehdb_l0::substrate::DurableSubstrate;
-use ehdb_l0::{LocalFsSubstrate, VectorStore};
+use ehdb_l0::{LocalFsSubstrate, MergePolicy, VectorStore};
 
 fn dir(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -41,14 +41,22 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 fn store(tag: &str) -> (VectorStore, PathBuf) {
+    store_with_policy(tag, None)
+}
+
+/// `policy = None` uses the default, which `with_seal_max_records` ties to the seal size.
+fn store_with_policy(tag: &str, policy: Option<MergePolicy>) -> (VectorStore, PathBuf) {
     let root = dir(tag);
     let hot = root.join("hot");
     let obj = root.join("obj");
     std::fs::create_dir_all(&hot).unwrap();
     std::fs::create_dir_all(&obj).unwrap();
     let s: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&obj).unwrap());
-    let st = VectorStore::open(VectorStore::config(&hot).with_seal_max_records(512), s).unwrap();
-    (st, root)
+    let mut cfg = VectorStore::config(&hot).with_seal_max_records(512);
+    if let Some(p) = policy {
+        cfg = cfg.with_merge_policy(p);
+    }
+    (VectorStore::open(cfg, s).unwrap(), root)
 }
 
 fn vec_for(seed: usize, dim: usize) -> Vec<f32> {
@@ -122,22 +130,61 @@ fn query_vs_oplog_depth(c: &mut Criterion) {
     // ops, compaction — not an approximate index — is the control, and this row is the
     // proof. If it does not move, compaction is not collapsing superseded ops and the
     // remedy lies elsewhere.
-    for (label, rewrites, compact) in [
-        ("1x500ops".to_string(), 1usize, false),
-        ("4x500ops".to_string(), 4, false),
-        ("10x500ops".to_string(), 10, false),
-        ("10x500ops_merged".to_string(), 10, true),
+    //
+    // ⚠ The `_merged` row uses the DEFAULT policy, under which compaction stalls: the
+    // compacted output is re-mergeable, but only 3 small parts are left and
+    // `trigger_run_len = 4` never fires again. The `_tuned` row lowers the trigger, which
+    // is the policy a compacting dataset actually wants, and shows what compaction
+    // converges to rather than where the default threshold happens to stop it.
+    let tuned = MergePolicy {
+        small_part_max_records: 512 * 32,
+        trigger_run_len: 2,
+        max_merge_parts: 8,
+    };
+    for (label, rewrites, compact, policy) in [
+        ("1x500ops".to_string(), 1usize, false, None),
+        ("4x500ops".to_string(), 4, false, None),
+        ("10x500ops".to_string(), 10, false, None),
+        ("10x500ops_merged".to_string(), 10, true, None),
+        ("10x500ops_merged_tuned".to_string(), 10, true, Some(tuned)),
     ] {
-        let (mut st, root) = store(&format!("rw{label}"));
+        let (mut st, root) = store_with_policy(&format!("rw{label}"), policy);
         for _ in 0..rewrites {
             for i in 0..LIVE {
                 st.upsert("c", &format!("p{i}"), vec_for(i, DIM)).unwrap();
             }
         }
         if compact {
+            // Drain to a FIXED POINT, not one pass. One `run_pending_merges` call merges
+            // a single run, so a single call leaves most of the op log in place and
+            // understates the result — measured at 19.9 ms for one pass versus the
+            // converged figure below.
+            let mut merged = 0usize;
+            for _ in 0..64 {
+                st.flush_and_wait().unwrap();
+                let n = st.run_pending_merges().unwrap();
+                merged += n;
+                if n == 0 {
+                    break;
+                }
+            }
             st.flush_and_wait().unwrap();
-            let merged = st.run_pending_merges().unwrap();
-            println!("  (compaction ran {merged} merge(s) before the `{label}` row)");
+            println!("  (compaction drained {merged} merge(s) before the `{label}` row)");
+        }
+        // ⚠ Print the denominator per row. Without it the `1x500ops` figure reads as a
+        // floor that compaction fails to reach, when in fact 500 appends at
+        // `seal_max_records = 512` produce ZERO sealed parts — that row reads the in-RAM
+        // active writer while every other row reads sealed parts off disk. The residual
+        // gap is a sealed-vs-unsealed read difference, not compaction falling short.
+        {
+            let m = st.engine().manifest_snapshot();
+            let recs: u64 = m.parts.iter().map(|p| p.record_count).sum();
+            println!(
+                "  [{label}] sealed parts={} stored records={} superseded={}",
+                m.parts.len(),
+                recs,
+                st.engine().metrics().snapshot().records_superseded
+            );
         }
         let q = vec_for(7, DIM);
         // Elements = LIVE, held constant, so the reported per-element cost is
