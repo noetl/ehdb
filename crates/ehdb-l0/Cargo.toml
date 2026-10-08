@@ -20,6 +20,7 @@ serde_json.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 
@@ -28,3 +29,7 @@ chain-cert = ["dep:sha2", "dep:hex"]
 # Hardware SHA-256. Carries most of the win on aarch64; pulls `cc` as a build
 # dependency, so it is a separate opt-in from the certificate itself.
 chain-cert-asm = ["chain-cert", "sha2/asm"]
+
+[[bench]]
+name = "l0_engine"
+harness = false
