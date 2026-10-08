@@ -315,6 +315,157 @@ was 2049 / 287 / 2256 ns per record at 50 / 500 / 2000 — a 10x length step cos
 because a ~100 µs fixed floor dominates. Its resolution control failed, correctly. The same
 measurement resolves cleanly in `--release`, so it lives in the benchmark.
 
+## The feed drain path — and what an unbatched relay costs
+
+`crates/ehdb-feed/benches/drain.rs`. `ehdb-feed` is 36 files and had **0 benchmarks**: the
+networked publish path has an attribution harness run by hand
+(`examples/dispatch_bench.rs`), but the *drain* primitives every consumer runs in a hot
+loop had nothing measured at all.
+
+### The batch axis, which has prod history
+
+[ai-meta#344](https://github.com/noetl/ai-meta/issues/344) was **100% transport timeouts**
+because the relay never batched — **0 of 80,264** fan-outs used a batch. The fix was real
+and the cost it avoided was never quantified. Draining a 4,000-record backlog:
+
+| batch limit | total drain | per-record throughput |
+| --: | --: | --: |
+| 1 | 1.353 s | 2.95 K/s |
+| 16 | 84.8 ms | 47.1 K/s |
+| 256 | 6.47 ms | 617 K/s |
+| 1024 | 2.55 ms | 1.56 M/s |
+| 4000 *(one poll)* | 2.55 ms | 1.57 M/s |
+
+> **530x** between a batch of 1 and a batch of 1024. That number is what not batching
+> costs.
+
+### ⚠ The attribution control refuted the obvious explanation
+
+The reading that suggests itself is "each poll re-scans the backlog, so the cost is poll
+count × backlog". **The control refutes it:** 4 polls of 1,024 (2.551 ms) and **1** poll of
+4,000 (2.554 ms) are the same to within 0.1%. Poll count does not dominate once the batch
+is large.
+
+So a second probe holds the limit at 1 and varies the backlog, reporting cost **per poll**:
+
+| backlog | polls | total | **per poll** |
+| --: | --: | --: | --: |
+| 200 | 200 | 1.45 ms | **7.3 µs** |
+| 2,000 | 2,000 | 465.7 ms | **232.8 µs** |
+
+Per-poll cost rises **32x for a 10x backlog** — so it is not a fixed overhead either.
+
+Three measured facts, then: per-poll cost is **not** fixed; poll count does **not** dominate
+at part-sized batches; and total drain cost goes as **~n^2.5** at limit 1 while staying
+linear at limit ≥ 256. Together they say the cost is governed by **how far the cursor
+advances per poll** — a batch smaller than the span a poll must touch re-reads that span
+once per record. The precise mechanism in the read path is **not yet attributed**, and is
+tracked rather than asserted here.
+
+### Drain cost vs backlog, and a quadratic the #298 fix introduced
+
+Draining the **whole** backlog, repeated polls, default batch limit:
+
+| backlog | total | throughput |
+| --: | --: | --: |
+| 100 | 7.45 µs | 13.4 M/s |
+| 1,000 | 69.3 µs | 14.4 M/s |
+| 10,000 | 7.96 ms | 1.26 M/s |
+
+**Throughput collapses 11x between 1,000 and 10,000** — growth exponent **2.06**, i.e.
+quadratic. The transition is at the batch cap: `ChangeFeed::poll` uses
+`default_batch_limit()` = **2,000** (`EHDB_FEED_BATCH_LIMIT`), bounded deliberately because
+unbounded is what caused [ai-meta#298](https://github.com/noetl/ai-meta/issues/298). Below
+the cap a drain is one poll and linear; above it, the drain is quadratic.
+
+Both the bound and the quadratic are real. **The tradeoff between them had never been
+measured** — which is the finding.
+
+⚠ **An in-region assertion is the only reason the cap surfaced at all.** The first version
+of the backlog sweep called `poll` once and asserted it got the whole backlog; at 10,000 it
+got **2,000**. Without the check it would have reported a comfortable time for draining
+**20% of the backlog**: a short read and a fast drain are the same number.
+
+### ⭐ Lazy acking is quadratic in the consumer
+
+| loop | 2,000 records | throughput |
+| :-- | --: | --: |
+| `poll_assign` + `ack` | 2.08 ms | 960 K/s |
+| `poll_assign` only (never ack) | 5.93 ms | 337 K/s |
+
+**Doing less work is 2.86x slower.** The mechanism is visible in the source:
+
+```rust
+let expired = self.inflight.iter().find(|(_, f)| f.deadline <= now)
+```
+
+`inflight` is a `BTreeMap` ordered by **sort key, not deadline**, so when nothing is
+expired `find` examines **every** entry — on every poll. A consumer holding k records in
+flight pays O(k) per delivery, so draining n while acking lazily is O(n²).
+
+This connects directly to the new `ehdb_feed_shard_inflight` gauge: the operational state
+that gauge exists to reveal — high lag with high in-flight — is also the state in which the
+drain loop degrades quadratically. Tracked for a fix (a deadline-ordered index makes it
+O(log n)).
+
+Subject-routed drain, for comparison: 2.49 ms / 802 K/s for the same 2,000 records, so
+per-record subject matching costs ~20% over the plain group.
+
+## Queue depth and divergence are now scrapable
+
+`ehdb-l0` gained four **state gauges** — current depth, as against the 27 cumulative
+counters — all computed from in-RAM state with no substrate I/O:
+
+| gauge | what is outstanding |
+| :-- | :-- |
+| `manifest_parts` | live parts. **Predicts memory** (~1.8 KB each, per Memory above) and is what merge bounds |
+| `parts_local_only` | sealed parts with **no** durable copy — the upload backlog |
+| `parts_under_replicated` | parts with **some but not enough** copies |
+| `dedupe_window_records` | records held in the idempotency window |
+
+⭐ **`parts_under_replicated` closes a real hole.** The uploader assigns
+`p.replicas = locations` — the *successful* writes only — so a part that landed 1 of 2
+copies is recorded durable, `on_upload_done` fires, and **the age-based durability window
+reports it done**. `replica_writes` cannot fill the gap either: it is cumulative, so it
+climbs while the deficit stands. Proven in `tests/state_gauges.rs` with a substrate that
+refuses writes: 7 parts, `is_durable() == true`, each holding 1 of 2 copies.
+
+And `ehdb_feed_shard_inflight` + `ehdb_feed_total_inflight` now expose
+`ShardConsumerGroup::inflight_len`, which **existed all along with no `render_*` emitting
+it**. It is not derivable from lag, because lag counts undelivered **plus** unacked:
+
+| lag | inflight | state |
+| --: | --: | :-- |
+| 10 | **0** | stalled — consumers absent or not polling |
+| 10 | **4** | busy — saturated and making progress |
+
+Measured, in `tests/inflight_exposition.rs`: **identical lag of 10 in both**. An alert on
+lag alone pages for both and distinguishes neither.
+
+## The benchmarks run in CI
+
+`.github/workflows/ci.yml` gained a `bench` job. Previously CI ran
+`cargo bench --workspace --no-run` — it compiled the benches and never executed one.
+
+**Running them is most of the value on its own**, because every case asserts inside its
+timed region that it got the records it claims; that is what caught the 2,000-of-10,000
+short read. `--no-run` structurally cannot catch it.
+
+Absolute times are **not** gated, per D6: a latency bound on a shared runner is flaky and a
+flaky measure gets deleted. `ci/bench_ratios.py` gates the **shape** instead —
+
+- **the denominator first**: it states `expected=13 parsed=13` and fails on a missing
+  benchmark, because a parser that finds nothing asserts nothing and exits 0;
+- **monotonicity**: a larger batch must never be slower (25% noise tolerance). Ratios are
+  taken within one run on one runner, so machine speed cancels;
+- **reported, never gated**: the 530x, the 0.999x control, the 32x per-poll figure and the
+  2.86x lazy-ack penalty. A guard asserting "batch 1 is ≥50x slower" would fail the day
+  somebody fixes small batches — that is a guard against progress.
+
+Both negative controls were run: removing one `estimates.json` fails with the missing name,
+and planting an inverted batch ordering fails with the regression named. A guard that has
+never fired is indistinguishable from one that cannot.
+
 ## What is NOT measured yet
 
 Named so the gap is visible rather than implied.
@@ -323,31 +474,32 @@ Named so the gap is visible rather than implied.
 - ~~Seal / merge / reclaim~~ — **done**, see Lifecycle.
 - ~~Memory~~ — **done**, see Memory.
 - ~~Multi-shard and concurrent writers~~ — **done**, see Concurrency and multi-shard.
-- **`ehdb-feed`** — 36 files, still 0 benches; the mirror/drain path is unmeasured. This is
-  the next gap, and the one with prod history: ai-meta#344 was 100% transport timeouts
-  because the relay never batched, 0 of 80,264.
-- **Queue depth has an accessor and no exposition.** `ShardConsumerGroup::inflight_len` and
-  `SubjectConsumerGroup::inflight_len` exist and **no `render_*` function emits them** — the
-  "recorder exists, nothing calls it" shape from the reachability lens. A scrape cannot see
-  consumer backlog today.
-- **Benches are not enforced.** Every number on this page was produced by hand. Nothing in
-  CI runs a benchmark or compares one against a baseline, so a regression is silent.
+- ~~`ehdb-feed`~~ — **done**, see The feed drain path.
+- ~~Queue depth~~ — **done**, see Queue depth and divergence.
+- ~~Benches are not enforced~~ — **done**, see The benchmarks run in CI.
+- **The drain cost mechanism is measured but not attributed.** Three facts constrain it
+  (per-poll cost is not fixed; poll count does not dominate at part-sized batches; ~n^2.5
+  at limit 1) and the exact read-path cause is not yet pinned down.
+- **The networked transport is still hand-run.** `examples/dispatch_bench.rs` attributes
+  publish→claim across the real socket topology, and nothing in CI executes it; the
+  benches that run are the in-process drain primitives.
+- **Nothing measures a multi-node deployment.** Every figure here is one process. Tail
+  replication and election (P7/P8 of the north star) are specced, not built, so there is
+  nothing to measure yet — and a single-process number must not be quoted as a
+  distributed one.
 
-⚠ **This section itself drifted.** It previously claimed `metrics.rs` "exports **7** public
-functions ... three of which are counters" and that "pinned-at-zero series with RED-proven
-movement are not yet in place". Both were stale: `metrics.rs` carries **27** atomic
-counters, a **27**-row `SERIES` table that `every_snapshot_field_is_exported` forces to
-equal them exactly, and `tests/metrics_exposition.rs` holds
-exactly the three guards claimed missing — a denominator guard that reads the field list out
-of the source, a pinned-at-zero check on a fresh engine, and a proven-to-move check driven
-by the lifecycle. A "not measured yet" list is a representation like any other, and it
-drifts in the direction that understates the work.
+⚠ **This section itself drifted once.** It previously claimed `metrics.rs` "exports **7**
+public functions ... three of which are counters" and that "pinned-at-zero series with
+RED-proven movement are not yet in place". Both were stale: `metrics.rs` carries **31**
+atomic counters and gauges, a 31-row `SERIES` table that `every_snapshot_field_is_exported`
+forces to equal them exactly, and `tests/metrics_exposition.rs` holds exactly the three
+guards claimed missing. A "not measured yet" list is a representation like any other, and
+it drifts in the direction that understates the work.
 
-⚠ And the row count above was itself miscounted once while writing this paragraph:
-`grep -cE '^\s*\("'` over the `SERIES` block returns **10**, because only 10 of the 27 rows
-are short enough for rustfmt to keep the leading string on the same line as the opening
-paren. The other 17 wrap. Counting `^\s*\(` returns 27, which is what
-`every_snapshot_field_is_exported` independently requires. **A line-oriented grep over Rust
+⚠ And the row count was itself miscounted while writing that correction:
+`grep -cE '^\s*\("'` over the `SERIES` block returns **10**, because only 10 rows are
+short enough for rustfmt to keep the leading string on the same line as the opening paren.
+The rest wrap. Counting `^\s*\(` gives the real number. **A line-oriented grep over Rust
 source counts formatting, not code** — the same shape as the `self.field\n    .fetch_add`
 miscount that once reported 4 counters as never written when the real answer was 0 of 27.
 
@@ -359,5 +511,12 @@ miscount that once reported 4 counters as never written when the real answer was
   necessity).
 - `crates/ehdb-l0/tests/concurrency_measures.rs` — concurrent writers, the mint-order trap,
   reader interleaving with its coverage control, multi-shard set-equality.
+- `crates/ehdb-feed/benches/drain.rs` — the drain path, the batch axis, and the per-poll
+  attribution probe.
+- `crates/ehdb-l0/tests/state_gauges.rs` — the four state gauges, pinned and proven to
+  move, with a write-refusing substrate for the replica deficits.
+- `crates/ehdb-feed/tests/inflight_exposition.rs` — in-flight depth, and the two states
+  lag renders identically.
+- `ci/bench_ratios.py` — the shape guard CI runs.
 - `agents/rules/representation-drift.md` in noetl/ai-meta — "print the denominator", and
   "volume is not duration".

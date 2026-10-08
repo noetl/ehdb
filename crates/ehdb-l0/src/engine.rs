@@ -521,6 +521,11 @@ impl<D: Dataset> L0Engine<D> {
         // neither is visible from the writer's own unit tests.
         engine.recover_active_parts()?;
         engine.start_uploader();
+        // ⚠ Unconditional, including on a fresh engine where every value is 0. A pin
+        // inside a config branch is not a pin (server#315): it leaves the series absent
+        // on exactly the configuration whose value someone would be reading, and an
+        // absent series is indistinguishable from a healthy zero to every alert.
+        engine.refresh_state_gauges();
         Ok(engine)
     }
 
@@ -1114,6 +1119,7 @@ impl<D: Dataset> L0Engine<D> {
                 sealed_count += 1;
             }
         }
+        self.refresh_state_gauges();
         Ok(sealed_count)
     }
 
@@ -1140,6 +1146,7 @@ impl<D: Dataset> L0Engine<D> {
             self.merge_once(plan)?;
             count += 1;
         }
+        self.refresh_state_gauges();
         Ok(count)
     }
 
@@ -1287,6 +1294,7 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
 
+        self.refresh_state_gauges();
         Ok(reclaimed)
     }
 
@@ -1668,6 +1676,40 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     /// A snapshot clone of the in-RAM manifest.
+    /// Recompute the four state gauges from in-RAM state (noetl/ai-meta#455 C6).
+    ///
+    /// Cheap but **not free**: it walks the manifest once, so it is O(parts). That is
+    /// why it is called on manifest *mutations* (open, seal, merge, reclaim) and not on
+    /// every append — a per-append O(parts) scan would make append cost grow with part
+    /// count, which is precisely the quadratic shape `manifest_parts` exists to detect.
+    /// Instrumenting a thing must not reproduce the defect it measures.
+    ///
+    /// Public so a scrape handler can force a refresh: between mutations the part
+    /// gauges cannot change, but `dedupe_window_records` moves on every append, so its
+    /// staleness is bounded by the seal interval unless a scraper calls this.
+    pub fn refresh_state_gauges(&self) {
+        let want_replicas = self.replicas.len();
+        let (parts, local_only, under) = {
+            let m = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+            let mut local_only = 0u64;
+            let mut under = 0u64;
+            for part in &m.parts {
+                let n = part.replica_count();
+                if n == 0 {
+                    local_only += 1;
+                } else if n < want_replicas {
+                    under += 1;
+                }
+            }
+            (m.parts.len() as u64, local_only, under)
+        };
+        let dedupe: u64 = (0..self.config.shard_count)
+            .map(|shard| self.dedupe.len(shard) as u64)
+            .sum();
+        self.metrics
+            .set_state_gauges(parts, local_only, under, dedupe);
+    }
+
     pub fn manifest_snapshot(&self) -> Manifest {
         self.manifest.lock().unwrap().clone()
     }

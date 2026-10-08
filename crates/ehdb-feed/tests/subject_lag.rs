@@ -180,6 +180,7 @@ fn the_exposition_line_is_byte_stable_for_kedas_prefix_match() {
             shard: 0,
             committed: 41,
             lag: 12,
+            inflight: 0,
         }],
         subjects: vec![
             SubjectLag {
@@ -219,6 +220,7 @@ async fn the_metrics_endpoint_serves_the_per_subject_series() {
             shard: 0,
             committed: 5,
             lag: 4,
+            inflight: 0,
         }],
         subjects: vec![SubjectLag {
             subject: "commands.shared.shard.0".to_string(),

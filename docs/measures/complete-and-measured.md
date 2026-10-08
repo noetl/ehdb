@@ -44,9 +44,23 @@ caught by its own planted control. So the control is a criterion, not a nicety.
 | B3 | Read cost is characterised **against chain length**, with the non-linearity located | ✅ linear at ~55 ns/record to 1 024, then a **15.6x step** at `seal_max_records` |
 | B4 | **Tail** latency (p50/p90/p99/max), with `n` printed on every line | ✅ append p99 7 550 µs vs p50 4 014 µs |
 | B5 | **Lifecycle** (seal/merge/reclaim) cost measured against size, with the known prod failure mode as the control | ✅ manifest exponent **1.23** bounded vs **1.94** pre-fix |
-| B6 | **Memory** vs chain length and part count | ❌ |
-| B7 | **Concurrent writers / multi-shard** — contention, and invariants under concurrency | ❌ every figure is single-shard, single-threaded |
-| B8 | `ehdb-feed`'s mirror/drain path | ❌ 36 files, 0 benches |
+| B6 | **Memory** vs chain length and part count | ✅ exponent **0.52** over records — **O(parts), not O(records)**: ~16.6 KB fixed + ~1.8 KB/part, control = a planted 1 MiB leak checked FIRST |
+| B7 | **Concurrent writers / multi-shard** — contention, and invariants under concurrency | ✅ single-writer by construction (throughput **falls** 10% from 1→8 threads); multi-shard union **set-equal**; reader interleaving carries a coverage control that fails at 0 mid-write reads |
+| B8 | `ehdb-feed`'s mirror/drain path | ✅ **530x** batch-1 vs batch-1024; the obvious attribution was **refuted by its own control** (4 polls of 1024 ≈ 1 poll of 4000) |
+
+⚠ **B7 found a caller trap rather than an engine defect.** An `AtomicU64` sequencer plus a
+`Mutex` is **not** sufficient: minting the sequence *before* taking the append lock reorders
+**34.2% of appends** while losing and duplicating exactly nothing. That is prod's
+[ai-meta#362](https://github.com/noetl/ai-meta/issues/362) mechanism — ids minted before
+insert, so commit order is not id order — reproduced in 20 ms. The first draft of that test
+asserted the sequencer was sufficient, and the canary caught it.
+
+⚠ **B8 found a tradeoff nobody had measured.** The batch cap that fixed
+[ai-meta#298](https://github.com/noetl/ai-meta/issues/298)'s unbounded memory makes a drain
+**quadratic (exponent 2.06)** for backlogs above the cap. Both the bound and the quadratic
+are real; the tradeoff between them was never quantified. Separately, `poll_assign` **without**
+acking is **2.86x slower than with**, because the redelivery scan walks the whole in-flight
+map on every poll — doing less work costs more, and lazy acking is O(n²) in the consumer.
 
 ## C. Health is OBSERVABLE — a `0` means healthy, not inert
 
@@ -68,7 +82,38 @@ Prometheus exposition lives in `ehdb-feed/src/scaler.rs` for consumer lag, not t
 | C3 | Every series **pinned**, present at 0 on a fresh engine | `metrics_exposition.rs` | ✅ 27/27 emitted at 0; `build_info` pinned at 1 so an absent series can be told from an old binary |
 | C4 | Each series **RED-proven to move** | same | ✅ `appends` 512, `seals` 32, `merges` 7, `parts_merged` 28, `reads` 5, `manifest_versions_retained` 26 — and the ascending canary **stays 0** |
 | C5 | The exposition's **denominator is self-maintaining** | same | ✅ a snapshot field with no series fails the build-or-test; mutation-proven |
-| C6 | Divergence and queue depth | — | ❌ still absent; `replica_domain_violations` is the nearest thing |
+| C6 | Divergence and queue depth | `state_gauges.rs`, `inflight_exposition.rs` | ✅ **4 engine state gauges + 2 feed gauges**, pinned at 0 and each proven to move — see below |
+
+### C6, as landed
+
+Four **state gauges** on the engine — current depth, as against the 27 cumulative counters
+— all computed from in-RAM state with no substrate I/O: `manifest_parts`,
+`parts_local_only`, `parts_under_replicated`, `dedupe_window_records`. Plus
+`ehdb_feed_shard_inflight` / `ehdb_feed_total_inflight` on the delivery side.
+
+Two of these close holes rather than adding numbers:
+
+- ⭐ **`parts_under_replicated`.** The uploader assigns `p.replicas = locations` — the
+  *successful* writes only — so a part that landed 1 of 2 copies is recorded durable,
+  `on_upload_done` fires, and the age-based durability window reports it **done**.
+  `replica_writes` is cumulative and climbs while the deficit stands. Nothing reported a
+  standing replication deficit before. Proven with a write-refusing substrate: 7 parts,
+  `is_durable() == true`, each holding 1 of 2 copies.
+- ⭐ **`inflight`.** `ShardConsumerGroup::inflight_len` existed all along and **no
+  `render_*` emitted it** — the "recorder exists, nothing calls it" shape, where the
+  accessor's existence makes the capability look present. It is not derivable from lag,
+  which counts undelivered **plus** unacked: a lag of 10 with 0 in flight (stalled) and a
+  lag of 10 with 4 in flight (busy) are **measured to be the same lag** and are opposite
+  operational conditions.
+
+⚠ `manifest_parts` is refreshed on manifest **mutations** and at open, not per append: a
+per-append manifest walk would be O(parts) per append, which is precisely the quadratic
+shape the gauge exists to detect. *Instrumenting a thing must not reproduce the defect it
+measures.* `refresh_state_gauges()` is public so a scrape handler can force a refresh.
+
+⚠ The pin at open is **unconditional, including all-zero**. A pin inside a config branch is
+not a pin — server#315 pinned a reason set inside `if event_bus_mode.publishes_ehdb()` and
+left it absent on exactly the configuration whose value someone would be reading.
 
 ⚠ **Why pinning matters rather than using `prometheus::Registry`**: `Registry::gather`
 **prunes metric families with no children**, so a labelled metric is *absent* until something
@@ -84,8 +129,36 @@ by construction.
 | D2 | The lifecycle measure fails if retention stops bounding the file count | bounded file exponent **≥ 0.3** | ✅ asserted |
 | D3 | Read measures fail if a read stops returning what it claims | `got.len() == len` asserted **inside** the timed region | ✅ |
 | D4 | Tail measures fail if percentiles stop being meaningful | non-monotonic percentiles, wrong `n`, or group commit not materially cheaper | ✅ |
-| D5 | Benchmarks run in CI on a comparable machine, with a stored baseline | — | ❌ benches are not run by CI; numbers are machine-local and only a human comparison catches drift |
+| D5 | Benchmarks run in CI, with the result shape enforced and the numbers recorded | missing benchmark, or an inverted batch ordering beyond 25% noise | ✅ `bench` job runs them; `ci/bench_ratios.py` gates shape; estimates uploaded per run |
 | D6 | Latency **thresholds** gated | deliberately **not** asserted — a latency bound on shared CI hardware is flaky, and a flaky measure gets deleted | n/a by choice |
+
+### D5, as landed — and why it gates ratios, not times
+
+CI previously ran `cargo bench --workspace --no-run`: it compiled every benchmark and
+executed none. **Running them is most of the value on its own**, because each case asserts
+inside its timed region that it got the records it claims — which is what caught
+`ChangeFeed::poll` returning **2,000 of a 10,000** backlog. A short read and a fast drain
+are otherwise the same number, and `--no-run` structurally cannot see the difference.
+
+The guard gates **shape**, consistent with D6's refusal to gate absolute latency:
+
+1. **The denominator first.** It prints `expected=13 parsed=13` and fails on any missing
+   benchmark, because a parser that finds nothing asserts nothing and exits 0.
+2. **Monotonicity.** A larger batch must never be slower, with 25% noise tolerance. The
+   ratio is taken within one run on one runner, so machine speed cancels out — which is
+   what makes it stable where a threshold is not.
+3. **Reported, never gated:** the 530x batch effect, the 0.999x poll-count control, the 32x
+   per-poll figure, the 2.86x lazy-ack penalty. Gating any of these would fail CI the day
+   somebody *improves* the drain path. A guard against progress is the wrong guard.
+
+Both negative controls were run before it was trusted: removing one `estimates.json` fails
+naming it, and planting an inverted batch ordering fails naming the regression. A guard
+that has never fired is indistinguishable from one that cannot.
+
+⚠ **No baseline file is committed.** A checked-in set of absolute times from one machine is
+a representation that nothing forces to stay true, and it would drift silently the first
+time the runner image changed. The per-run estimates are uploaded as an artifact instead,
+and the figures in `l0-benchmarks.md` are taken deliberately with the machine named.
 
 ## How to check all of it
 

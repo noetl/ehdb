@@ -219,6 +219,7 @@ async fn the_writers_endpoint_serves_the_resume_facts_and_the_per_subject_lag_to
                 shard: 0,
                 committed: 41,
                 lag: 6,
+                inflight: 0,
             }],
             subjects: vec![ehdb_feed::SubjectLag {
                 subject: "commands.shared.shard.0".to_string(),
