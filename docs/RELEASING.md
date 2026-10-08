@@ -86,6 +86,12 @@ when a branch "is not configured to release", which is exactly what a broken bra
 produces: a green run that examined nothing. Proven by planting a nonexistent branch in
 `.releaserc.json` and confirming the guard fails.
 
+⭐ **It caught a real defect on its own first run.** On a `pull_request` event
+`actions/checkout` lands on `refs/pull/N/merge`, so semantic-release reported its branch as
+`refs/pull/393/merge`, failed to match `--branches`, analysed nothing, and **exited 0**. The
+job now checks out `github.head_ref` explicitly. A guard that has never fired is
+indistinguishable from one that cannot — this one fired immediately, on itself.
+
 ## Why `release.yml` is dispatched explicitly
 
 ⚠⚠ **A tag pushed with `GITHUB_TOKEN` does not trigger workflows.** GitHub suppresses it to

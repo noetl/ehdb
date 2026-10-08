@@ -82,6 +82,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # ⚠⚠ Check out the HEAD BRANCH, not the default merge ref. On a
+          # `pull_request` event actions/checkout lands on `refs/pull/N/merge`, so
+          # semantic-release reports its current branch as `refs/pull/393/merge`,
+          # does not match `--branches`, analyses nothing — and EXITS 0.
+          #
+          # That is exactly the green-run-that-examined-nothing this job's assertion
+          # exists to catch, and it is how the assertion earned its place: it failed
+          # on its own first run for this reason.
+          ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
