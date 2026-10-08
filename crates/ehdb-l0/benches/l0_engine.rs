@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{shard_for_execution, Dataset, FlushPolicy, L0Config, L0Engine, LocalFsSubstrate};
 use serde::{Deserialize, Serialize};
