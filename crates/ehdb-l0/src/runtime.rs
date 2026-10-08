@@ -48,7 +48,9 @@ pub enum RuntimeEvent {
 /// existed was a worker**. Defaulting to anything else would make those records vanish
 /// from every `discover` call — the same silent-eviction shape P1's `last_seen_micros = 0`
 /// handling avoids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub enum RuntimeKind {
     /// A noetl-server instance and its API surface.
     Server,
@@ -57,6 +59,7 @@ pub enum RuntimeKind {
     /// An EHDB instance / tier service.
     Ehdb,
     /// A worker — the only thing D8 held before P2, hence the default.
+    #[default]
     Worker,
     /// A registered playbook definition.
     Playbook,
@@ -64,12 +67,6 @@ pub enum RuntimeKind {
     /// expected to disappear by **not being renewed** — no tombstone, no reaper. That is
     /// what makes TTL the right primitive for ephemera rather than a delete.
     Execution,
-}
-
-impl Default for RuntimeKind {
-    fn default() -> Self {
-        Self::Worker
-    }
 }
 
 /// One runtime lifecycle op in the log (the D8 record schema).
