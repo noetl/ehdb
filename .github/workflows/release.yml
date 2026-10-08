@@ -1,0 +1,130 @@
+name: release-ehdb
+
+# What "release" means for ehdb: it is a **library consumed by git tag**, not a
+# crate on crates.io and not a container image. `noetl/server` depends on it as
+#   ehdb-feed = { git = "...", tag = "v0.4.5" }
+#   ehdb-l0   = { git = "...", tag = "v0.4.5" }
+# so the deliverable of a release is a tag whose tree a consumer can actually
+# build. This workflow proves that, which is the only artifact check available.
+#
+# ⚠ THE TAG IS THE VERSION AUTHORITY, NOT Cargo.toml. Every crate here is
+# `version = "0.1.0"` and always has been; the published versions are v0.4.x
+# tags. This workflow therefore does NOT assert tag == Cargo.toml. noetl/server
+# used to make that assertion and it held only because semantic-release pushed a
+# version bump to main first — a push a required status check rejects, because
+# the commit is `[skip ci]` so the check never runs on it and stays "expected"
+# forever (GH006). This repo's `.releaserc.json` deliberately omits
+# `@semantic-release/git`, so nothing is ever pushed to main and GH006 cannot
+# occur here by construction.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (e.g. v0.5.0)."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag-builds:
+    name: Verify the released tag builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "refusing a tag without a leading v: '$TAG'"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: $TAG"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The consumer's build, as the consumer runs it: a release profile build of
+      # the whole workspace. A tag that does not build is not a release.
+      - name: Build the workspace in release mode
+        run: cargo build --release --workspace
+
+      # A storage library's on-disk format is its compatibility contract, so the
+      # release records it. `FORMAT_VERSION` is what refuses to open a store
+      # written by an incompatible build; a silent change to it is the thing a
+      # consumer most needs to know about a new tag.
+      - name: Record the on-disk format version
+        id: fmt
+        run: |
+          set -euo pipefail
+          FV=$(grep -rhoE 'FORMAT_VERSION: *u[0-9]+ *= *[0-9]+' crates/ehdb-l0/src/format_version.rs \
+               | grep -oE '[0-9]+$' | head -1)
+          if [ -z "${FV:-}" ]; then
+            echo "could not read FORMAT_VERSION — the grep found nothing, which is a"
+            echo "broken extraction rather than a missing constant. Fix the pattern."
+            exit 1
+          fi
+          echo "format_version=$FV" >> "$GITHUB_OUTPUT"
+          echo "on-disk FORMAT_VERSION = $FV"
+
+      # Assert the artifacts exist by name rather than trusting a zero exit.
+      - name: Assert the library artifacts exist
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for lib in ehdb_l0 ehdb_feed ehdb_core; do
+            if ls target/release/lib${lib}.rlib >/dev/null 2>&1 \
+               || ls target/release/deps/lib${lib}-*.rlib >/dev/null 2>&1; then
+              echo "ok: ${lib}"
+            else
+              echo "MISSING: ${lib}"
+              MISSING=1
+            fi
+          done
+          # Print the denominator: a loop over an empty list also exits 0.
+          echo "checked 3 crates"
+          [ "$MISSING" = "0" ]
+
+      - name: Run the test suite at the tag
+        run: cargo test --workspace
+
+      - name: Attach a build manifest to the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          FV: ${{ steps.fmt.outputs.format_version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tag: $TAG"
+            echo "commit: $GITHUB_SHA"
+            echo "on-disk FORMAT_VERSION: $FV"
+            echo "rustc: $(rustc --version)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Consumers pin this tag directly:"
+            echo "  ehdb-feed = { git = \"https://github.com/noetl/ehdb\", tag = \"$TAG\" }"
+            echo "  ehdb-l0   = { git = \"https://github.com/noetl/ehdb\", tag = \"$TAG\" }"
+            echo
+            echo "⚠ Both pins must move together: ehdb-feed depends on ehdb-l0, so"
+            echo "  different tags put two ehdb-l0 versions in one dependency graph."
+          } > build-manifest.txt
+          gh release upload "$TAG" build-manifest.txt --repo "$GITHUB_REPOSITORY" --clobber
