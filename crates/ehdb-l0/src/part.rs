@@ -470,7 +470,33 @@ impl<D: Dataset> PartWriter<D> {
     }
 
     /// How long the oldest record in the active part has been waiting, if any.
+    ///
+    /// ⚠ `record_count > 0` is a DEFENSIVE invariant here, not a demonstrated bug fix, and
+    /// the distinction is recorded because it would otherwise read as one.
+    ///
+    /// Without it this returns an age whenever `first_append_at` outlives the records — a
+    /// climbing age for an EMPTY active part, i.e. a phantom unsealed tail. [`Self::seal`]
+    /// returns early on `record_count == 0` before its reset block, which looks like it
+    /// makes that state reachable.
+    ///
+    /// ⚠⚠ But a RED control FAILED TO REPRODUCE IT: with this check removed,
+    /// `tests/active_age_empty_part.rs` still passes, because the seal path does clear
+    /// `first_append_at` in every sequence the tests can drive. So the state is not reachable
+    /// by any path exercised here, and the production divergence that prompted this — the
+    /// server's `oldest_unsealed_age_seconds` climbing 59 → 779 s across 15-minute stretches
+    /// while `unreplicated_records` read 0 — is **NOT explained by this function** and
+    /// remains open.
+    ///
+    /// The check is kept because it is unconditionally correct (an empty part has no oldest
+    /// record, so there is no age to report) and costs one comparison. It must not be cited
+    /// as the cause of that divergence.
+    ///
+    /// For contrast [`Self::aged_out`] already asks `record_count > 0`, so the seal trigger
+    /// was never at risk either way.
     pub fn active_age(&self) -> Option<Duration> {
+        if self.record_count == 0 {
+            return None;
+        }
         self.first_append_at.map(|t| t.elapsed())
     }
 
