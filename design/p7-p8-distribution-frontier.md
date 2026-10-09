@@ -86,47 +86,116 @@ right, the predicate is right, and no code path can make either of them true.
 `on_upload_done` / `replica_writes` / under-replication machinery is replica copies
 **between local substrates**.
 
-### 1.4 ⚠⚠ The exposure is the unsealed tail, and on the tier it is unbounded in time
+### 1.4 ⚠⚠ The exposure is the unsealed tail — MEASURED, and my first framing was wrong
 
-Sealed-part replication is implemented. The tail is not — and the two seal triggers are
-configured differently on the two stores:
+> ⚠⚠ **Correction (A1/B1 pass).** The first version of this section said the fix was to
+> wire `with_seal_max_age` into the tier, on the evidence that `tier_store.rs` calls it zero
+> times. That is true and it was **misleadingly framed**: the tier store is **not an
+> L0 engine at all**, so `with_seal_max_age` — an `L0Config` knob — does not apply to it.
+> The tier is a **JSONL append file with segment sealing by rename** (`<active>.<seq>`,
+> same directory, same format; "sealing renames; it never rewrites and never deletes"),
+> gated by `NOETL_EHDB_TIER_SEAL_MAX_BYTES`. The equivalent of an age bound there is
+> **age-based segment sealing, which does not exist** — a new feature on a
+> primary-serving store, not a knob to wire up.
+
+Measured on `noetl-cmdbus-writer-0` 2026-10-09:
 
 ```
-bus    NOETL_EHDB_SEAL_MAX_AGE_MS     = 5000           → seals every 5s
-tier   NOETL_EHDB_TIER_SEAL_MAX_BYTES = 268435456      → seals every 256 MiB
-tier   (no age bound configured)
+/data/eventbus (PVC /dev/nvme0n3)   19.5G total, 12.7G used, 6.8G free  (65%)
+  /data/eventbus/ehdb-tier          11.4G
+
+sealed eventlog segments            13      } all 256.0–256.8 MiB — byte sealing
+sealed projection segments           3      } works exactly as configured
+oldest sealed segment               eventlog.jsonl.1   2026-09-21 (18 days)
+
+ACTIVE (unsealed) segments:
+  eventlog.jsonl      62.0 MiB   last write 14:21Z
+  projection.jsonl   129.0 MiB   last write 14:00Z
+  catalog.jsonl        7.1 MiB   last write 07:14Z   ← ⚠ ~7 HOURS unsealed
 ```
 
-⭐ **Verified in code, not recalled.** `with_seal_max_age` is called at exactly three
-sites, all in `noetl/worker` — `command_bus.rs:225`, `event_bus.rs:262` and
-`ehdb/eventlog_backend.rs:1379`. `ehdb/tier_store.rs` reads **only**
-`NOETL_EHDB_TIER_SEAL_MAX_BYTES` and calls `with_seal_max_age` **zero** times, and the
-library default is `None`.
+⭐ **`catalog.jsonl` is the age exposure made concrete**: 7.1 MiB, unsealed for about seven
+hours, because a low-rate tier will never approach a 256 MiB threshold quickly. A
+byte-only trigger bounds the *high*-rate tiers and leaves the quiet ones arbitrarily
+exposed — the opposite of the intuition that low traffic means low risk.
 
-So the **tier's unsealed tail is bounded by bytes and not by time**: it can hold up to
-256 MiB of acked events, on one PVC, for as long as it takes to accumulate them. The two
-buses *and* the eventlog backend all get the 5 s bound — so the reassuring number is real
-and applies to all three of the engines that are not the store at risk. This is the
-per-engine asymmetry that has bitten before: the writer pod hosts two L0 engines plus the
-tier, and configuring one is not configuring another.
+⚠ `tier_seal_max_bytes()` is `Option<u64>` and **fail-safe OFF** by design: *"a typo must
+not start rotating a primary-serving tier's store behind the operator's back."* Any
+age-based sealing must adopt the same default, which is why it is B2 and owner-gated rather
+than something to land inert and forget.
 
-⚠ Separately: `noetl_ehdb_crossstore_pending_total{tier="eventlog"} = 552` — a different
-concern (mirror lag), recorded here so it is not conflated with the tail.
+⚠ Separately, a capacity fact that is not about the tail: **segments are never deleted**,
+so 18 days of history is 11.4 GiB and `/data/eventbus` is at 65%. At 256 MiB per segment
+that is roughly 27 segments of headroom. Related to but distinct from
+[#457](https://github.com/noetl/ai-meta/issues/457)/[#459](https://github.com/noetl/ai-meta/issues/459),
+which cover the *server's* volume, not the writer's.
 
-### 1.5 Election and fencing: a state machine, no binding, and a shipped asymmetry
+⚠ One more of my own errors worth recording: I first read `df /data` on the writer, got the
+**overlay mounted at `/`**, and briefly concluded the tier was on ephemeral storage. `/data`
+is not a mount — the PVCs are at `/data/cmdbus`, `/data/eventbus`, `/data/eventkv`.
+Checking the mount table rather than publishing the first reading caught it.
+
+### 1.5 Election and fencing — better placed than the first pass implied
 
 `ehdb-reference::election` + `::fencing` ship the state machine against a `LeaseStore` with
-real compare-and-swap. **The server links neither** — its only ehdb dependencies are
-`ehdb-feed` and `ehdb-l0` at `v0.5.0`. The Kubernetes adapter is specified and not built,
-parked on a dependency decision (`kube` drags `k8s-openapi` + `tower` + `hyper` + TLS into
-a crate tree with none of it).
+real compare-and-swap.
 
-⚠⚠ And there is operational precedent that the fencing *placement* is the hard part, not
-the algorithm: on 2026-09 the M5 fencing guard was "ACTIVE, ENFORCING" and **served a
-superseded writer**, because the guard sat on `append_segment` and the publish path skips
-it when the stale writer's segment is no longer than the holder's. The existing spec
-already states the rule that follows — *"a stale writer must be rejected **by the store**,
-not asked to check first"* — and that rule is the whole of P8's difficulty.
+> ⚠ **Correction.** The first version said "the server links neither", which is true and
+> was the wrong binary to check. **The *writer* — the `noetl-worker` binary that runs
+> `cmdbus-writer` — DOES link `ehdb-reference`**, and the fence is already integrated there
+> as a **selectable decorator** (`eventlog_backend.rs:516–524`): `NOETL_EHDB_FENCING` ∈
+> {Off, Shadow, Enforce}, where `Off` yields `Arc::new(plain)` — an unwrapped store.
+>
+> So P8's code-reachability story is considerably better than "specified, not built". What
+> is missing is the **election** that mints tokens, not the fence that checks them.
+
+⭐ And the writer's own metrics already state the C1 answer, in their HELP text:
+
+```
+# HELP ehdb_election_active Whether a shard-lease election is running and issuing fencing
+#   tokens. 0 means single-writer rests on StatefulSet replicas:1 alone, and fencing
+#   enforce would be an outage.
+ehdb_election_epoch 0
+# HELP ehdb_fencing_active Whether the shared store is wrapped by the fencing decorator at
+#   all (0 = not wrapped, today's behaviour).
+```
+
+Measured on prod: **`NOETL_EHDB_FENCING` is unset (0 of 36 env vars)**, so the decorator is
+`Off` and the store is plain. Single-writer rests on `replicas: 1` alone.
+
+⚠⚠ **That sharpens C3 materially.** It is not merely "enforcing the fence reduces write
+availability under partition" — **with no election issuing tokens, enforcing it is an
+immediate outage**, because the writer would fence itself against an epoch nobody mints.
+**C2 must precede C3**, and the metric already says so in prose. Any plan that arms
+`Enforce` before an election is live is reading `ehdb_election_active 0` as decoration.
+
+⚠ Version skew worth noting: the **worker pins all four ehdb crates at `v0.3.2`** while the
+server is at `v0.5.0`. Any P8 work that needs a newer `ehdb-reference` has a pin bump and a
+worker release in front of it.
+
+⚠⚠ And the operational precedent stands: on 2026-09 the M5 fencing guard was "ACTIVE,
+ENFORCING" and **served a superseded writer**, because the guard sat on `append_segment` and
+the publish path skips it. The existing spec's rule — *"a stale writer must be rejected by
+the store, not asked to check first"* — is the whole of P8's difficulty, and the decorator
+shape above is the right answer to it precisely because a decorator cannot be skipped by a
+caller that forgot.
+
+### 1.6 C1 — the durable-state mutation paths
+
+Enumerated in `noetl/worker`, since that is the binary that writes:
+
+| path | file | passes the fence today? |
+| :-- | :-- | :-- |
+| `tier_store::append` / `append_with_seal` / `append_batch` | `ehdb/tier_store.rs:400,428,477` | ⚠ no — decorator `Off` |
+| `tier_shadow::append` | `ehdb/tier_shadow.rs:112` | ⚠ no |
+| `dataplane::append_domain_record` | `ehdb/dataplane.rs:236` | ⚠ no |
+| `eventlog_backend::append_selected` | `ehdb/eventlog_backend.rs:577` | ⚠ no |
+| `tier_client::append*` (client side) | `ehdb/tier_client.rs:273–323` | n/a — not the store |
+
+**Five server-side mutation paths, none wrapped**, which is the honest answer and is
+consistent with `ehdb_fencing_active 0`. C1's remaining work is not discovery but a
+*structural guard*: a test that enumerates these and fails when a new one appears unwrapped,
+so the M5 shape — a path added later that bypasses the fence — cannot recur silently.
 
 ---
 
@@ -335,15 +404,15 @@ The adapter needs a Kubernetes client. Two ways out, and it is an owner choice:
 
 | phase | content | changes semantics? | risk | gate |
 | :-- | :-- | :-- | :-- | :-- |
-| **A1** | Make RF=1 **visible**: call `survives_node_loss` and expose it; stop pinning a green 0 for an unevaluated check | no — observability only | 🟢 low | mine |
+| **A1** | ✅ **DONE** (server#511) — four always-computed gauges, seeded pessimistically; the alert keys on `survives_node_loss`, not on a count | no — observability only | 🟢 low | mine |
 | **A2** | `GcsSubstrate` in the server + the conformance suite passing **unchanged**, wired as a second `ReplicaTarget` **behind a default-off flag** | no while off | 🟢 low | ⚠ needs the §3.1 injection decision |
 | **A3** | Enable RF>1 on one non-critical dataset, measure uploader latency and part-write amplification | durability improves; write path unchanged | 🟡 medium | **owner** |
-| **B1** | Measure (a) the tier's actual tail size/age distribution — the exposure above is inferred from config, not observed — and (b) a real same-region GCS `put` latency from the writer pod, which option (i) was provisionally rejected on | no | 🟢 low | mine |
-| **B2** | Bound the tail: set `seal_max_age` on the tier, measure the part-count / memory / merge cost | ⚠ **yes** — part distribution, memory O(parts) | 🟡 medium | **owner** |
+| **B1** | ✅ **tail measured** (§1.4): active segments 62 / 129 / 7.1 MiB, `catalog.jsonl` unsealed **~7 h**. ⏳ GCS-put latency: histogram shipped (server#511), awaiting prod traffic | no | 🟢 low | mine |
+| **B2** | Bound the tail: **age-based segment sealing in `tier_store.rs`** — a NEW feature, not a knob (`with_seal_max_age` does not apply; the tier is not an L0 engine). Must default **off**, matching `tier_seal_max_bytes`'s fail-safe-off rule | ⚠ **yes** — touches a primary-serving store | 🟡 medium | **owner** |
 | **B3** | Streaming tail replica (the real P7b) | ⚠⚠ **yes** — a new deployable and a replication protocol | 🔴 high | **owner, design-first** |
-| **C1** | Enumerate every durable-state mutation path and prove each passes the fence; `fencing_stale_observed` at 0 over a soak | no — audit | 🟢 low | mine |
+| **C1** | ✅ **enumerated** (§1.6): five mutation paths, none wrapped, consistent with `ehdb_fencing_active 0`. Remaining: a **structural guard** so a newly-added path cannot bypass the fence silently | no — audit | 🟢 low | mine |
 | **C2** | `LeaseStore` binding (A or B of §4.3) | no while unwired | 🟡 medium | ⚠ **owner: dependency decision** |
-| **C3** | Enforce the fence on the live writer path | ⚠⚠ **yes** — a partitioned writer stops accepting; **write availability drops** | 🔴 high | **owner, with the §2.3 trade stated** |
+| **C3** | Enforce the fence on the live writer path | ⚠⚠⚠ **yes — and with no election live this is an IMMEDIATE OUTAGE**, not merely reduced availability: the writer would fence itself against an epoch nobody mints. **C2 strictly precedes C3** | 🔴 high | **owner, with the §2.3 trade stated** |
 
 ### 5.1 ⚠ What must not be built blind
 
