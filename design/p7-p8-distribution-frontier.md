@@ -334,7 +334,7 @@ semantics. Three shapes, none free:
 
 | option | what it costs | what it buys |
 | :-- | :-- | :-- |
-| **(i) synchronous remote append per record** | ⚠ **estimated, not measured**: a same-region GCS `put` is conventionally single-digit-to-tens of ms against the ~4 ms local `fsync` this architecture already treats as its append ceiling. Order-of-magnitude on every append. **B1 must measure a real put from the writer pod before this option is dismissed on the number** | tail RF>1, no loss window |
+| **(i) synchronous remote append per record** | ⭐ **MEASURED 2026-10-09** on prod v3.135.0: **mean 468.5 ms over 4 real samples** (seed subtracted), distributed 1 ≤100 ms, 1 in (100,250] ms, **2 in (500 ms, 1 s]**. Against the ~4 ms local `fsync` that is **25–250×** — two orders of magnitude, not the one I estimated. ⚠ n=4, and these are *result-tier* puts of unmeasured object size, so the honest claim is "nothing in the distribution supports *tens of ms*" rather than a p50 for a single event record | tail RF>1, no loss window |
 | **(ii) a streaming replica** (a second EHDB instance tailing the WAL) | a new deployable, its own failure modes, and the replication protocol this architecture has avoided | tail RF>1 with low added latency; **this is the real "truly distributed" step** |
 | **(iii) bound the window** (set `seal_max_age` on the tier, shrink `seal_max_bytes`) | more, smaller parts ⇒ more manifest churn, and memory is O(parts) | a **bounded, stated** loss window — not elimination |
 
@@ -343,11 +343,15 @@ unbounded-in-time exposure into a bounded one, which is a genuine improvement *a
 change in part-size distribution that affects memory and merge cost. It must be measured,
 not assumed.
 
-⭐ **Recommendation: do (iii) first, measured, and treat (ii) as the actual P7b.** ⚠ (i) is
-*provisionally* rejected on the latency arithmetic above — but that arithmetic rests on an
-**unmeasured** put latency, so B1 owes a real number from the writer pod before the
-rejection is treated as settled. Rejecting an option on an estimate and then citing the
-rejection as established is how a guess becomes a constraint.
+⭐ **Recommendation: do (iii) first, measured, and treat (ii) as the actual P7b.**
+
+✅ **(i) is now rejected on a measurement, not an estimate.** B1 shipped the histogram, prod
+rolled to v3.135.0, and the first real samples came in at **~470 ms mean** — so the
+rejection stands *more* strongly than the guess justified. ⚠ Worth recording that my
+estimate was wrong by 1–2 orders of magnitude **in the direction that makes the rejected
+option worse**. Had it been wrong the other way I would have been dismissing a viable design
+on a number I never took, which is exactly why the rejection was labelled provisional until
+measured.
 
 ---
 
@@ -407,7 +411,7 @@ The adapter needs a Kubernetes client. Two ways out, and it is an owner choice:
 | **A1** | ✅ **DONE** (server#511) — four always-computed gauges, seeded pessimistically; the alert keys on `survives_node_loss`, not on a count | no — observability only | 🟢 low | mine |
 | **A2** | `GcsSubstrate` in the server + the conformance suite passing **unchanged**, wired as a second `ReplicaTarget` **behind a default-off flag** | no while off | 🟢 low | ⚠ needs the §3.1 injection decision |
 | **A3** | Enable RF>1 on one non-critical dataset, measure uploader latency and part-write amplification | durability improves; write path unchanged | 🟡 medium | **owner** |
-| **B1** | ✅ **tail measured** (§1.4): active segments 62 / 129 / 7.1 MiB, `catalog.jsonl` unsealed **~7 h**. ⏳ GCS-put latency: histogram shipped (server#511), awaiting prod traffic | no | 🟢 low | mine |
+| **B1** | ✅ **DONE.** Tail measured (§1.4): active segments 62 / 129 / 7.1 MiB, `catalog.jsonl` unsealed **~7 h**. GCS-put latency **measured on prod v3.135.0: ~470 ms mean**, settling option (i) | no | 🟢 low | mine |
 | **B2** | Bound the tail: **age-based segment sealing in `tier_store.rs`** — a NEW feature, not a knob (`with_seal_max_age` does not apply; the tier is not an L0 engine). Must default **off**, matching `tier_seal_max_bytes`'s fail-safe-off rule | ⚠ **yes** — touches a primary-serving store | 🟡 medium | **owner** |
 | **B3** | Streaming tail replica (the real P7b) | ⚠⚠ **yes** — a new deployable and a replication protocol | 🔴 high | **owner, design-first** |
 | **C1** | ✅ **enumerated** (§1.6): five mutation paths, none wrapped, consistent with `ehdb_fencing_active 0`. Remaining: a **structural guard** so a newly-added path cannot bypass the fence silently | no — audit | 🟢 low | mine |
