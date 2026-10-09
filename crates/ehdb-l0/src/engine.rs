@@ -1249,6 +1249,78 @@ impl<D: Dataset> L0Engine<D> {
     ///
     /// Single-writer assumption: the caller is the shard owner, so no concurrent
     /// appender is racing an object into existence as GC lists.
+    /// **Stranded active parts** — [noetl/ehdb#396](https://github.com/noetl/ehdb/issues/396).
+    ///
+    /// Every `*.active` file under this dataset's local parts root that is **not** the active
+    /// path of a live writer. Read-only: it surveys, it does not delete.
+    ///
+    /// How these arise: a process appends records, acknowledges them, writes them into the
+    /// active part file — and then exits before the part seals. The successor opens its own
+    /// active path (`part-{next_local_id:06}.active`, and `next_local_id` restarts at 0), so
+    /// the abandoned file is left behind. It is referenced by no manifest entry, so no read
+    /// path reaches it, and until this change nothing deleted it either: the orphan sweep
+    /// collected `.eslog` only. They accumulated **one per restart, forever** — measured at
+    /// 11.2 MiB across 9 files on a production volume, the oldest 15 days old.
+    ///
+    /// ⚠⚠ The records in them were **acknowledged to a caller** and never made it into the
+    /// manifest. Reclaiming them is therefore a data-disposition decision, not housekeeping,
+    /// which is why this survey exists separately from the reclaim and why neither is wired
+    /// into [`Self::apply_retention`]: a retention pass must not silently delete acked data
+    /// as a side effect.
+    pub fn stranded_active(&self) -> Result<Vec<(PathBuf, u64)>> {
+        let live = self.live_active_paths();
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let mut files = Vec::new();
+        collect_files_with_extension(&parts_root, "active", &mut files)?;
+        let mut out = Vec::new();
+        for path in files {
+            if live.contains(&path) {
+                continue;
+            }
+            let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            out.push((path, bytes));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The active path of every live writer — the files being appended to **right now**.
+    ///
+    /// ⚠⚠⚠ This is the single safety invariant of the reclaim below. Deleting one of these
+    /// destroys in-flight acknowledged records that have not sealed yet, which is strictly
+    /// worse than the leak it is meant to fix. It is excluded by exact path, taken from the
+    /// writers themselves rather than reconstructed from a naming convention — a convention
+    /// can drift from what the writer actually opened.
+    fn live_active_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.writers
+            .values()
+            .map(|w| w.active_path().to_path_buf())
+            .collect()
+    }
+
+    /// Delete the stranded active parts [`Self::stranded_active`] reports.
+    ///
+    /// Returns `(files_deleted, bytes_freed)`. Idempotent: a second call finds nothing.
+    ///
+    /// ⚠ Deliberately **not** called from [`Self::apply_retention`] or
+    /// [`Self::reclaim_orphans`]. The caller decides, because the records being discarded
+    /// were acked. See [`Self::stranded_active`] for the full reasoning.
+    pub fn reclaim_stranded_active(&mut self) -> Result<(usize, u64)> {
+        let stranded = self.stranded_active()?;
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        for (path, size) in stranded {
+            fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+            self.metrics.record_orphan_reclaim(size);
+            files += 1;
+            bytes += size;
+        }
+        Ok((files, bytes))
+    }
+
     pub fn reclaim_orphans(&mut self) -> Result<usize> {
         let (referenced_objects, referenced_locals) = {
             let m = self.manifest.lock().unwrap();
@@ -1799,6 +1871,33 @@ fn decrement(outstanding: &Arc<(Mutex<usize>, Condvar)>) {
 }
 
 /// Recursively collect `*.eslog` part files under `dir` (for orphan reclaim).
+/// Collect files under `dir` whose extension is `ext`, recursively.
+///
+/// ⚠ `collect_eslog_files` below is the `"eslog"` case of this, kept as its own function
+/// because callers read better that way. The extension filter is the whole reason
+/// noetl/ehdb#396 existed: the orphan sweep collected **only** `.eslog`, so abandoned
+/// `.active` parts were never seen by anything — not the manifest, not a read path, and not
+/// the reclaimer.
+fn collect_files_with_extension(
+    dir: &std::path::Path,
+    ext: &str,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).map_err(|err| EhdbError::Storage(err.to_string()))? {
+        let entry = entry.map_err(|err| EhdbError::Storage(err.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_extension(&path, ext, out)?;
+        } else if path.extension().map(|e| e == ext).unwrap_or(false) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn collect_eslog_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
