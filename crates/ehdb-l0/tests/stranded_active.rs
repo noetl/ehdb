@@ -35,10 +35,13 @@ fn engine_with_active(
 ) -> L0EventLogEngine {
     // seal_max_records high enough that `n` appends do NOT seal — the point is to have a
     // live active part. A fixture that sealed would leave nothing to protect.
-    let cfg = L0Config::d1(local).with_shard_count(1).with_seal_max_records(10_000);
+    let cfg = L0Config::d1(local)
+        .with_shard_count(1)
+        .with_seal_max_records(10_000);
     let mut e = L0EventLogEngine::open(cfg, store(objects)).unwrap();
     for i in 0..n {
-        e.append("7001", &format!("t{i}"), format!("payload-{i}")).unwrap();
+        e.append("7001", &format!("t{i}"), format!("payload-{i}"))
+            .unwrap();
     }
     e
 }
@@ -68,16 +71,29 @@ fn a_stranded_active_part_is_surveyed_and_reclaimed() {
 
     // Survey first — it must SEE it, and must not delete it.
     let seen = e.stranded_active().unwrap();
-    assert_eq!(seen.len(), 1, "expected exactly the planted stale file: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        1,
+        "expected exactly the planted stale file: {seen:?}"
+    );
     assert_eq!(seen[0].0, stale);
     assert_eq!(seen[0].1, 4096, "the survey must report the real byte size");
-    assert!(stale.exists(), "the SURVEY must be read-only — it reported and deleted");
+    assert!(
+        stale.exists(),
+        "the SURVEY must be read-only — it reported and deleted"
+    );
 
     // Then reclaim.
     let (files, bytes) = e.reclaim_stranded_active().unwrap();
     assert_eq!(files, 1);
-    assert_eq!(bytes, 4096, "bytes freed must be the file's real size, not an estimate");
-    assert!(!stale.exists(), "the stranded file was not reclaimed — the leak is still open");
+    assert_eq!(
+        bytes, 4096,
+        "bytes freed must be the file's real size, not an estimate"
+    );
+    assert!(
+        !stale.exists(),
+        "the stranded file was not reclaimed — the leak is still open"
+    );
 
     drop(e);
     let _ = std::fs::remove_dir_all(&local);
@@ -97,10 +113,17 @@ fn the_live_active_part_is_never_reclaimed() {
         .filter_map(|x| x.ok().map(|x| x.path()))
         .filter(|p| p.extension().map(|e| e == "active").unwrap_or(false))
         .collect();
-    assert_eq!(live.len(), 1, "fixture: exactly one live active file, got {live:?}");
+    assert_eq!(
+        live.len(),
+        1,
+        "fixture: exactly one live active file, got {live:?}"
+    );
     let live = live[0].clone();
     let live_len = std::fs::metadata(&live).unwrap().len();
-    assert!(live_len > 0, "fixture: the live active file must hold the appended records");
+    assert!(
+        live_len > 0,
+        "fixture: the live active file must hold the appended records"
+    );
 
     let stale = plant_stale(&local, 44, 2048);
 
@@ -123,8 +146,13 @@ fn the_live_active_part_is_never_reclaimed() {
     // And the engine still works afterwards: the records are readable and it can append on.
     let before = e.replay_all().unwrap().len();
     assert_eq!(before, 7, "the live records must survive the reclaim");
-    e.append("7001", "after", "payload-after".to_string()).unwrap();
-    assert_eq!(e.replay_all().unwrap().len(), 8, "the writer must still be usable");
+    e.append("7001", "after", "payload-after".to_string())
+        .unwrap();
+    assert_eq!(
+        e.replay_all().unwrap().len(),
+        8,
+        "the writer must still be usable"
+    );
 
     drop(e);
     let _ = std::fs::remove_dir_all(&local);
@@ -150,7 +178,10 @@ fn many_stranded_parts_are_reclaimed_and_the_bytes_add_up() {
 
     let (files, bytes) = e.reclaim_stranded_active().unwrap();
     assert_eq!(files, 4);
-    assert_eq!(bytes, expect, "the total must be the sum of the real file sizes");
+    assert_eq!(
+        bytes, expect,
+        "the total must be the sum of the real file sizes"
+    );
 
     // Idempotent: nothing left, and a second call is not an error.
     assert_eq!(e.stranded_active().unwrap().len(), 0);
@@ -168,10 +199,13 @@ fn sealed_parts_are_not_in_scope() {
     let local = unique_dir("local");
     let objects = unique_dir("obj");
     // Seal quickly so there IS a sealed part on disk.
-    let cfg = L0Config::d1(&local).with_shard_count(1).with_seal_max_records(4);
+    let cfg = L0Config::d1(&local)
+        .with_shard_count(1)
+        .with_seal_max_records(4);
     let mut e = L0EventLogEngine::open(cfg, store(&objects)).unwrap();
     for i in 0..12u64 {
-        e.append("7002", &format!("t{i}"), format!("p-{i}")).unwrap();
+        e.append("7002", &format!("t{i}"), format!("p-{i}"))
+            .unwrap();
     }
     e.flush_and_wait_uploads().unwrap();
 
@@ -184,14 +218,22 @@ fn sealed_parts_are_not_in_scope() {
 
     let seen = e.stranded_active().unwrap();
     assert!(
-        seen.iter().all(|(p, _)| p.extension().map(|x| x == "active").unwrap_or(false)),
+        seen.iter()
+            .all(|(p, _)| p.extension().map(|x| x == "active").unwrap_or(false)),
         "the survey returned a non-.active path: {seen:?}"
     );
     e.reclaim_stranded_active().unwrap();
     for p in &eslogs {
-        assert!(p.exists(), "a SEALED part was deleted by the active reclaim: {p:?}");
+        assert!(
+            p.exists(),
+            "a SEALED part was deleted by the active reclaim: {p:?}"
+        );
     }
-    assert_eq!(e.replay_all().unwrap().len(), 12, "sealed records must survive");
+    assert_eq!(
+        e.replay_all().unwrap().len(),
+        12,
+        "sealed records must survive"
+    );
 
     drop(e);
     let _ = std::fs::remove_dir_all(&local);
