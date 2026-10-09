@@ -45,17 +45,24 @@ fn store(dir: &std::path::Path) -> Arc<dyn DurableSubstrate> {
 fn after_a_seal_the_active_age_is_absent_not_climbing() {
     let local = unique_dir("local");
     let objects = unique_dir("obj");
-    let cfg = L0Config::d1(&local).with_shard_count(1).with_seal_max_records(10_000);
+    let cfg = L0Config::d1(&local)
+        .with_shard_count(1)
+        .with_seal_max_records(10_000);
     let mut e = L0EventLogEngine::open(cfg, store(&objects)).unwrap();
 
     for i in 0..6u64 {
-        e.append("8001", &format!("t{i}"), format!("p-{i}")).unwrap();
+        e.append("8001", &format!("t{i}"), format!("p-{i}"))
+            .unwrap();
     }
 
     // With records pending there IS an age — the positive control, without which this test
     // passes for a function that always returns None.
     let pending = e.active_ages();
-    assert_eq!(pending.len(), 1, "expected one shard with a pending age: {pending:?}");
+    assert_eq!(
+        pending.len(),
+        1,
+        "expected one shard with a pending age: {pending:?}"
+    );
 
     // Seal everything. The active part is now empty.
     e.flush_and_wait_uploads().unwrap();
@@ -82,7 +89,9 @@ fn after_a_seal_the_active_age_is_absent_not_climbing() {
 fn the_age_returns_when_appending_resumes() {
     let local = unique_dir("local");
     let objects = unique_dir("obj");
-    let cfg = L0Config::d1(&local).with_shard_count(1).with_seal_max_records(10_000);
+    let cfg = L0Config::d1(&local)
+        .with_shard_count(1)
+        .with_seal_max_records(10_000);
     let mut e = L0EventLogEngine::open(cfg, store(&objects)).unwrap();
 
     e.append("8002", "t0", "p0".to_string()).unwrap();
@@ -123,7 +132,11 @@ fn an_empty_part_never_ages_out_however_long_it_sits() {
     // first draft asserted 1 and failed for that reason. The property under test is what
     // happens to an EMPTY part, so the seal just needs to be deterministic.
     e.flush_and_wait_uploads().unwrap();
-    assert_eq!(e.replay_all().unwrap().len(), 1, "fixture: the record did seal");
+    assert_eq!(
+        e.replay_all().unwrap().len(),
+        1,
+        "fixture: the record did seal"
+    );
 
     // Now empty. However long it sits, there is nothing to seal.
     assert_eq!(
