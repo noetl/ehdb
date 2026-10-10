@@ -196,7 +196,7 @@ fn unrep_age_is_always_at_least_unsealed_age() {
     let mut e = L0EventLogEngine::open(cfg, store(&objects)).unwrap();
 
     // Deterministic pseudo-random op mix (no rand dependency).
-    let mut seed: u64 = 0x5EED_462;
+    let mut seed: u64 = 0x5EED_0462;
     let mut next = || {
         seed = seed
             .wrapping_mul(6364136223846793005)
