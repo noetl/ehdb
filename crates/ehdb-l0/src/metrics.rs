@@ -191,6 +191,21 @@ pub struct L0Metrics {
     /// Records recovered from tail objects on a cold load — the number that
     /// would otherwise have been lost.
     pub tail_recovered_records: AtomicU64,
+    /// **Tail objects deleted** because a contiguous run of durable parts
+    /// already covers them (D2 cleanup).
+    pub tail_objects_reclaimed: AtomicU64,
+    /// Bytes those deletions freed.
+    pub tail_reclaim_bytes: AtomicU64,
+    /// Delete calls that failed — the object is still there and is retried.
+    pub tail_reclaim_failed: AtomicU64,
+    /// Tail objects currently **kept** because their interval is not yet
+    /// covered by durable parts.
+    ///
+    /// ⚠ A gauge, and reported on purpose: a reclaimer that is deleting
+    /// nothing and one that has nothing to delete both leave
+    /// `tail_objects_reclaimed` flat. A rising retained count with a flat
+    /// reclaimed count is a stalled seal or upload, not a quiet cleanup.
+    pub tail_objects_retained: AtomicU64,
     /// Tail objects whose records were ALL already covered by the durable
     /// manifest, so they contributed nothing.
     ///
@@ -386,6 +401,16 @@ impl L0Metrics {
     pub(crate) fn add_tail_objects_superseded(&self, n: u64) {
         self.tail_objects_superseded.fetch_add(n, Ordering::Relaxed);
     }
+    pub(crate) fn add_tail_reclaimed(&self, n: u64, bytes: u64) {
+        self.tail_objects_reclaimed.fetch_add(n, Ordering::Relaxed);
+        self.tail_reclaim_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn add_tail_reclaim_failed(&self, n: u64) {
+        self.tail_reclaim_failed.fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn set_tail_objects_retained(&self, n: u64) {
+        self.tail_objects_retained.store(n, Ordering::Relaxed);
+    }
     /// Record one **append → substrate-durable** latency.
     pub(crate) fn record_replicated_lag(&self, micros: u64) {
         self.replicated_lag.observe(micros);
@@ -444,6 +469,10 @@ impl L0Metrics {
             tail_replication_failed: self.tail_replication_failed.load(Ordering::Relaxed),
             tail_recovered_records: self.tail_recovered_records.load(Ordering::Relaxed),
             tail_objects_superseded: self.tail_objects_superseded.load(Ordering::Relaxed),
+            tail_objects_reclaimed: self.tail_objects_reclaimed.load(Ordering::Relaxed),
+            tail_reclaim_bytes: self.tail_reclaim_bytes.load(Ordering::Relaxed),
+            tail_reclaim_failed: self.tail_reclaim_failed.load(Ordering::Relaxed),
+            tail_objects_retained: self.tail_objects_retained.load(Ordering::Relaxed),
             merges: self.merges.load(Ordering::Relaxed),
             parts_merged: self.parts_merged.load(Ordering::Relaxed),
             merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
@@ -499,6 +528,10 @@ pub struct L0MetricsSnapshot {
     pub tail_replication_failed: u64,
     pub tail_recovered_records: u64,
     pub tail_objects_superseded: u64,
+    pub tail_objects_reclaimed: u64,
+    pub tail_reclaim_bytes: u64,
+    pub tail_reclaim_failed: u64,
+    pub tail_objects_retained: u64,
     pub merges: u64,
     pub parts_merged: u64,
     pub merged_bytes: u64,
@@ -700,6 +733,26 @@ const SERIES: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
+        "tail_objects_reclaimed",
+        "Tail objects deleted because a CONTIGUOUS run of durable parts already covers them (D2). Deletion is gated on contiguity: a later durable part does not prove a middle one is durable.",
+        "counter",
+    ),
+    (
+        "tail_reclaim_bytes",
+        "Bytes freed by tail-object reclamation.",
+        "counter",
+    ),
+    (
+        "tail_reclaim_failed",
+        "Tail-object delete calls that failed. The object remains and is retried; distinct from a flat reclaimed count, which an idle reclaimer also produces.",
+        "counter",
+    ),
+    (
+        "tail_objects_retained",
+        "Tail objects currently kept because durable parts do not yet cover them. Rising with a flat tail_objects_reclaimed means sealing or uploading has stalled, not that cleanup is quiet.",
+        "gauge",
+    ),
+    (
         "tail_objects_superseded",
         "Tail objects whose records were already covered by the durable manifest. Non-zero is expected in steady state; a permanent 0 alongside non-zero tail_batches means the overlap dedup is not being exercised.",
         "counter",
@@ -759,6 +812,10 @@ impl L0MetricsSnapshot {
             "tail_replication_failed" => self.tail_replication_failed,
             "tail_recovered_records" => self.tail_recovered_records,
             "tail_objects_superseded" => self.tail_objects_superseded,
+            "tail_objects_reclaimed" => self.tail_objects_reclaimed,
+            "tail_reclaim_bytes" => self.tail_reclaim_bytes,
+            "tail_reclaim_failed" => self.tail_reclaim_failed,
+            "tail_objects_retained" => self.tail_objects_retained,
             "dedupe_window_records" => self.dedupe_window_records,
             "records_superseded" => self.records_superseded,
             other => unreachable!("SERIES names a metric with no accessor: {other}"),

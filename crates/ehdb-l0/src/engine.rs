@@ -1412,6 +1412,42 @@ impl<D: Dataset> L0Engine<D> {
         report.failed_shards.push(batch.shard);
     }
 
+    /// **The highest sort key per shard covered by a CONTIGUOUS run of durable
+    /// parts** — what makes a tail object safe to delete (D2).
+    ///
+    /// Walks each shard's parts in ascending `min_sequence` and advances the
+    /// watermark only while they are durable, stopping at the **first**
+    /// non-durable part.
+    ///
+    /// ⚠⚠ Stopping is the point. Taking `max(max_sequence)` over durable parts
+    /// would skip a local-only part in the middle and authorise deleting a tail
+    /// object whose records exist nowhere off-box — turning a cleanup into the
+    /// destruction of the only remote copy of those events. The conservative
+    /// answer costs some retained objects; the other answer costs data.
+    ///
+    /// No I/O: reads the in-RAM manifest only, so it is safe under the lock.
+    pub fn contiguous_durable_watermarks(&self) -> Vec<(u32, u64)> {
+        let m = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_shard: std::collections::BTreeMap<u32, Vec<&crate::catalog::PartMeta>> =
+            std::collections::BTreeMap::new();
+        for p in &m.parts {
+            by_shard.entry(p.partition).or_default().push(p);
+        }
+        let mut out = Vec::new();
+        for (shard, mut parts) in by_shard {
+            parts.sort_by_key(|p| p.min_sequence);
+            let mut watermark = 0u64;
+            for p in parts {
+                if !p.is_durable() {
+                    break;
+                }
+                watermark = watermark.max(p.max_sequence);
+            }
+            out.push((shard, watermark));
+        }
+        out
+    }
+
     /// The per-shard tail watermark — the highest sort key already copied
     /// off-box. Exposed so a test or an operator can see the replicator's
     /// progress without inferring it from a counter.
@@ -2382,6 +2418,108 @@ fn manifest_version_key(dataset: &str, version: u64) -> String {
 /// Parts are immutable so `put_if_absent` is idempotent — a replica that already
 /// holds the part still counts (it is durable there). Records a `replica_write`
 /// metric per successful copy.
+/// What one tail-reclaim pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TailReclaimReport {
+    /// Objects deleted because a durable part already covers them.
+    pub reclaimed: usize,
+    /// Bytes those objects occupied, as the manifest-free `get_all` saw them.
+    pub bytes: u64,
+    /// Objects kept because their interval is NOT yet covered by a contiguous
+    /// run of durable parts. **Deliberately reported**: a reclaimer that is
+    /// deleting nothing and one that has nothing to delete both leave
+    /// `reclaimed` at 0.
+    pub retained: usize,
+    /// Objects whose key could not be parsed, so they were left alone.
+    ///
+    /// ⚠ Never deleted on a parse failure. An unparseable key is a thing this
+    /// code does not understand, and the safe response to not understanding an
+    /// object in an event-log bucket is to leave it there.
+    pub unparsed: usize,
+    /// Delete calls that failed. Retried next pass; the object is still there.
+    pub failed: usize,
+}
+
+/// The `(shard, high_sort_key)` a tail object's key encodes, or `None` when the
+/// key is not one this code wrote.
+fn parse_tail_key(dataset: &str, key: &str) -> Option<(u32, u64)> {
+    let rest = key.strip_prefix(&format!("tail/{dataset}/shard-"))?;
+    let (shard, rest) = rest.split_once("/seq-")?;
+    let shard: u32 = shard.parse().ok()?;
+    let core = rest.strip_suffix(".eslog")?;
+    let (_lo, hi) = core.split_once('-')?;
+    Some((shard, hi.parse().ok()?))
+}
+
+/// **Delete tail objects a durable part already covers** (noetl/ehdb#394 D2).
+///
+/// A free function, so every byte of I/O here happens with the engine lock
+/// released — the same rule `upload_tail_batch` follows and for the same
+/// measured reason. It takes the watermarks as data
+/// ([`L0Engine::contiguous_durable_watermarks`]) rather than borrowing the
+/// engine.
+///
+/// ⚠⚠ **Safety is the whole design.** An object is deleted only when its
+/// `high_sort_key` is at or below a **contiguous** run of durable parts for its
+/// shard. "Contiguous" is load-bearing: a later part being durable does not
+/// mean a middle one is, and a durable part beyond the gap would otherwise
+/// authorise deleting a tail object whose records are still single-copy in that
+/// gap. That is the difference between reclaiming a redundant copy and
+/// destroying the only off-box copy of an event.
+///
+/// Anything not understood is kept — unparseable keys, other datasets, other
+/// prefixes.
+pub fn reclaim_superseded_tail_objects(
+    replicas: &[ReplicaTarget],
+    dataset: &str,
+    watermarks: &[(u32, u64)],
+    metrics: &L0Metrics,
+) -> TailReclaimReport {
+    let mut report = TailReclaimReport::default();
+    let wm: std::collections::HashMap<u32, u64> = watermarks.iter().copied().collect();
+    let prefix = tail_prefix(dataset);
+    for target in replicas {
+        let keys = match target.substrate.list_prefix(&prefix) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        for key in keys {
+            let Some((shard, hi)) = parse_tail_key(dataset, &key) else {
+                report.unparsed += 1;
+                continue;
+            };
+            let covered = wm.get(&shard).copied().unwrap_or(0);
+            if hi > covered {
+                report.retained += 1;
+                continue;
+            }
+            // Size before deleting, so the reclaimed-bytes figure is real
+            // rather than estimated. A failure to size is not a reason to keep
+            // the object, only a reason not to count its bytes.
+            let size = target
+                .substrate
+                .get_all(&key)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
+            match target.substrate.delete(&key) {
+                Ok(()) => {
+                    report.reclaimed += 1;
+                    report.bytes += size;
+                }
+                Err(_) => report.failed += 1,
+            }
+        }
+    }
+    if report.reclaimed > 0 {
+        metrics.add_tail_reclaimed(report.reclaimed as u64, report.bytes);
+    }
+    if report.failed > 0 {
+        metrics.add_tail_reclaim_failed(report.failed as u64);
+    }
+    metrics.set_tail_objects_retained(report.retained as u64);
+    report
+}
+
 /// Write one prepared tail batch to the replica set. `true` when at least one
 /// replica took it.
 ///
