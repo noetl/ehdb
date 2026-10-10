@@ -313,15 +313,34 @@ impl ReplicaTarget {
     }
 }
 
+/// Where the uploader reads a part's bytes from.
+///
+/// ⚠ Two cases, because a backfilled part has **no local file to read**.
+/// [`Manifest::durable_view`] stores `local_path: None`, and the durable view is
+/// what [`load_durable_manifest`] seeds the in-RAM manifest from at open — so
+/// after any restart every recovered part's `local_path` is gone, and an
+/// uploader that only knew how to `fs::read` could never repair one.
+enum UploadSource {
+    /// A part sealed in this process: its bytes are still on local disk.
+    LocalFile(String),
+    /// A **backfill**: read the part back out of a replica that already holds
+    /// it, and copy it to the ones that do not.
+    Replica { replica: String, key: String },
+}
+
 /// A unit of upload work handed to the background uploader thread.
 struct UploadJob {
     substrate_key: String,
-    local_path: String,
+    source: UploadSource,
     part_id: String,
     /// The part's shard — needed to close its durability window on the
     /// [`UnreplicatedTracker`] when the upload lands (noetl/ehdb#328).
     shard: u32,
-    sealed_at: Instant,
+    /// When the part was sealed — `None` for a backfill, whose seal happened in
+    /// an earlier process. A fabricated near-zero lag here would be added to
+    /// `upload_lag_micros_total` and deflate the reported mean seal→durable
+    /// latency, so the backfill path records its own counters instead.
+    sealed_at: Option<Instant>,
 }
 
 /// The generic L0 storage engine for one [`Dataset`] `D` (single writer per
@@ -661,8 +680,20 @@ impl<D: Dataset> L0Engine<D> {
                     // replica** (N-way, L0.6). The append path never does this —
                     // durability is asynchronous (RFC §2.3). Parts are immutable,
                     // so each copy is byte-identical and no consensus is needed.
-                    let read_result = fs::read(&job.local_path)
-                        .map_err(|err| EhdbError::Storage(err.to_string()));
+                    let read_result = match &job.source {
+                        UploadSource::LocalFile(path) => {
+                            fs::read(path).map_err(|err| EhdbError::Storage(err.to_string()))
+                        }
+                        UploadSource::Replica { replica, key } => replicas
+                            .iter()
+                            .find(|t| &t.id == replica)
+                            .ok_or_else(|| {
+                                EhdbError::InvalidState(format!(
+                                    "backfill source replica {replica} is not in the replica set"
+                                ))
+                            })
+                            .and_then(|t| t.substrate.get_all(key)),
+                    };
                     let bytes = match read_result {
                         Ok(b) => b,
                         Err(_) => {
@@ -695,8 +726,14 @@ impl<D: Dataset> L0Engine<D> {
                     // of them can serve a cold-load alone.
                     write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
 
-                    let lag = job.sealed_at.elapsed().as_micros() as u64;
-                    metrics.record_upload(bytes.len() as u64, lag);
+                    match job.sealed_at {
+                        Some(sealed_at) => {
+                            let lag = sealed_at.elapsed().as_micros() as u64;
+                            metrics.record_upload(bytes.len() as u64, lag);
+                        }
+                        // A backfill has no seal→durable interval to report.
+                        None => metrics.record_backfill_upload(bytes.len() as u64),
+                    }
                     // Close this part's durability window and record the
                     // **append→durable** latency. ⚠ `lag` above is measured from
                     // the SEAL and cannot see the pre-seal term; this one can.
@@ -1030,10 +1067,10 @@ impl<D: Dataset> L0Engine<D> {
         if let Some(tx) = &self.upload_tx {
             let job = UploadJob {
                 substrate_key,
-                local_path,
+                source: UploadSource::LocalFile(local_path),
                 part_id,
                 shard,
-                sealed_at: Instant::now(),
+                sealed_at: Some(Instant::now()),
             };
             if tx.send(job).is_err() {
                 // Uploader gone (engine closing) — undo the outstanding bump.
@@ -1043,6 +1080,87 @@ impl<D: Dataset> L0Engine<D> {
             decrement(&self.outstanding);
         }
         Ok(())
+    }
+
+    /// **Copy every already-sealed part that is short of replicas to the
+    /// replicas it is missing.** Returns the number of parts enqueued; pair it
+    /// with [`Self::flush_and_wait_uploads`] to wait for them to land.
+    ///
+    /// ⚠⚠ **Why this has to exist.** Uploads are enqueued at exactly one site —
+    /// [`Self::register_and_upload`], on seal — so attaching a new replica to an
+    /// *existing* store replicates nothing that already exists. Every part
+    /// sealed before the attach keeps its old replica count **forever**, and the
+    /// only thing that ever said so was `parts_under_replicated` sitting at a
+    /// non-zero constant, which reads exactly like a transient upload backlog
+    /// draining slowly. On prod this was 39 parts: an off-box replica was armed,
+    /// every domain gauge flipped to "survives node loss", and all 39 parts of
+    /// actual history were still single-copy (noetl/ehdb#400).
+    ///
+    /// Safe to call repeatedly. The substrate write is `put_if_absent`, and
+    /// [`replicate_bytes`] records a location for an already-present object
+    /// (`Ok(false)`) as well as a freshly-written one — so a re-drive re-states
+    /// the copies that exist instead of dropping them from the manifest.
+    ///
+    /// Returns `0` when the replica set has one member: a single replica makes
+    /// no spreading claim, so nothing is under-replicated by definition.
+    pub fn backfill_under_replicated(&mut self) -> Result<usize> {
+        let want = self.replicas.len();
+        if want < 2 {
+            return Ok(0);
+        }
+        let jobs: Vec<UploadJob> = {
+            let m = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+            m.parts
+                .iter()
+                .filter(|p| p.replica_count() < want)
+                .filter_map(|p| {
+                    let source = match (&p.local_path, p.primary_replica()) {
+                        // Sealed in this process and not yet reclaimed.
+                        (Some(path), _) => UploadSource::LocalFile(path.clone()),
+                        // Recovered from the durable manifest: read it back out
+                        // of a replica that has it.
+                        (None, Some(loc)) => UploadSource::Replica {
+                            replica: loc.replica.clone(),
+                            key: loc.key.clone(),
+                        },
+                        // No local file and no replica — there is no copy of
+                        // this part anywhere to read from, so there is nothing
+                        // a backfill can do. `parts_local_only` is the gauge
+                        // that reports these.
+                        (None, None) => return None,
+                    };
+                    Some(UploadJob {
+                        substrate_key: substrate_key_for(
+                            &self.config.dataset,
+                            p.partition,
+                            &p.part_id,
+                        ),
+                        source,
+                        part_id: p.part_id.clone(),
+                        shard: p.partition,
+                        sealed_at: None,
+                    })
+                })
+                .collect()
+        };
+        let enqueued = jobs.len();
+        for job in jobs {
+            // Bump outstanding BEFORE sending so `flush_and_wait_uploads`
+            // never races a job, exactly as the seal path does.
+            {
+                let (lock, _) = &*self.outstanding;
+                *lock.lock().unwrap() += 1;
+            }
+            match &self.upload_tx {
+                Some(tx) => {
+                    if tx.send(job).is_err() {
+                        decrement(&self.outstanding);
+                    }
+                }
+                None => decrement(&self.outstanding),
+            }
+        }
+        Ok(enqueued)
     }
 
     /// Seal every pending active part and block until the uploader has shipped
