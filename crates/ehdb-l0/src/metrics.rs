@@ -160,6 +160,20 @@ pub struct L0Metrics {
     /// Cumulative upload lag in **microseconds** (seal → object-store durable),
     /// summed across uploads. Mean lag = `upload_lag_micros_total / uploads`.
     pub upload_lag_micros_total: AtomicU64,
+    /// Parts uploaded by a **backfill** — a part that was already sealed when
+    /// the replica it is now being copied to was attached.
+    ///
+    /// ⚠ Counted separately from [`Self::uploads`] on purpose. Uploads are
+    /// enqueued on seal and nowhere else, so a substrate attached to an
+    /// existing store leaves every already-sealed part at its old replica
+    /// count forever; the backfill is what closes that, and it has no
+    /// meaningful seal→durable lag because the seal happened in an earlier
+    /// process. Folding these into `uploads` would divide the real lag total
+    /// by a larger denominator and quietly deflate the mean
+    /// (noetl/ehdb#400).
+    pub backfill_uploads: AtomicU64,
+    /// Bytes uploaded by a backfill.
+    pub backfill_upload_bytes: AtomicU64,
     /// **Append → substrate-durable latency** (noetl/ehdb#328) — the D1
     /// durability window, end to end.
     ///
@@ -324,6 +338,14 @@ impl L0Metrics {
         self.upload_lag_micros_total
             .fetch_add(lag_micros, Ordering::Relaxed);
     }
+    /// Record one **backfill** upload. Deliberately does not touch
+    /// `uploads` / `upload_bytes` / `upload_lag_micros_total` — see
+    /// [`Self::backfill_uploads`].
+    pub(crate) fn record_backfill_upload(&self, bytes: u64) {
+        self.backfill_uploads.fetch_add(1, Ordering::Relaxed);
+        self.backfill_upload_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
     /// Record one **append → substrate-durable** latency.
     pub(crate) fn record_replicated_lag(&self, micros: u64) {
         self.replicated_lag.observe(micros);
@@ -374,6 +396,8 @@ impl L0Metrics {
             uploads: self.uploads.load(Ordering::Relaxed),
             upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
             upload_lag_micros_total: self.upload_lag_micros_total.load(Ordering::Relaxed),
+            backfill_uploads: self.backfill_uploads.load(Ordering::Relaxed),
+            backfill_upload_bytes: self.backfill_upload_bytes.load(Ordering::Relaxed),
             merges: self.merges.load(Ordering::Relaxed),
             parts_merged: self.parts_merged.load(Ordering::Relaxed),
             merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
@@ -421,6 +445,8 @@ pub struct L0MetricsSnapshot {
     pub uploads: u64,
     pub upload_bytes: u64,
     pub upload_lag_micros_total: u64,
+    pub backfill_uploads: u64,
+    pub backfill_upload_bytes: u64,
     pub merges: u64,
     pub parts_merged: u64,
     pub merged_bytes: u64,
@@ -587,6 +613,16 @@ const SERIES: &[(&str, &str, &str)] = &[
         "gauge",
     ),
     (
+        "backfill_uploads",
+        "Parts copied to a replica by a backfill (already sealed when that replica was attached). A permanent 0 while parts_under_replicated is non-zero means existing history is not being repaired.",
+        "counter",
+    ),
+    (
+        "backfill_upload_bytes",
+        "Bytes copied by backfill uploads.",
+        "counter",
+    ),
+    (
         "dedupe_window_records",
         "Records held in the append-time idempotency window, summed over shards.",
         "gauge",
@@ -633,6 +669,8 @@ impl L0MetricsSnapshot {
             "manifest_parts" => self.manifest_parts,
             "parts_local_only" => self.parts_local_only,
             "parts_under_replicated" => self.parts_under_replicated,
+            "backfill_uploads" => self.backfill_uploads,
+            "backfill_upload_bytes" => self.backfill_upload_bytes,
             "dedupe_window_records" => self.dedupe_window_records,
             "records_superseded" => self.records_superseded,
             other => unreachable!("SERIES names a metric with no accessor: {other}"),

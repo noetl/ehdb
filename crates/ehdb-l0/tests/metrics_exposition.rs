@@ -170,6 +170,8 @@ fn a_fresh_engine_emits_every_series_pinned_at_zero() {
         uploads: 0,
         upload_bytes: 0,
         upload_lag_micros_total: 0,
+        backfill_uploads: 0,
+        backfill_upload_bytes: 0,
         merges: 0,
         parts_merged: 0,
         merged_bytes: 0,
