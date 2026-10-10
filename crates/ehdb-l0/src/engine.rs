@@ -94,6 +94,26 @@ pub struct L0Config {
     /// appends, so something must drive [`L0Engine::seal_aged_parts`] on a
     /// timer; the flag alone is inert on exactly the shard it protects.
     pub seal_max_age: Option<Duration>,
+    /// **Replicate the UNSEALED tail off-box** (B3, noetl/ehdb#394).
+    ///
+    /// A sealed part is copied to every replica by the uploader. Until a part
+    /// seals, its records exist **only on local disk** — so the loss window is
+    /// the seal interval, which `seal_max_age` bounds but does not close. With
+    /// this on, [`L0Engine::replicate_tail`] copies records that are still in an
+    /// active writer to the replica set as their own write-once objects, and
+    /// a cold load reads them back.
+    ///
+    /// `false` — the default — is today's behaviour: the tail stays RF=1.
+    ///
+    /// ⚠ Necessary but not sufficient, the same shape as `seal_max_age`: an
+    /// active writer takes no action on its own, so something must drive
+    /// [`L0Engine::replicate_tail`] on a timer. The flag alone replicates
+    /// nothing.
+    ///
+    /// ⚠⚠ This does not make durability synchronous. Loss becomes bounded by
+    /// the **driver's tick interval** instead of the seal interval; it is not
+    /// eliminated, and no remote ack gates the local append.
+    pub tail_replication: bool,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
     /// Maintain per-execution chain certificates (noetl/ai-meta#366).
@@ -154,6 +174,7 @@ impl L0Config {
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
             seal_max_age: None,
+            tail_replication: false,
             require_distinct_domains: false,
             survival_goal: crate::failure_domain::SurvivalGoal::Zone,
             hlc_mode: None,
@@ -223,6 +244,14 @@ impl L0Config {
     /// the size/count-only default.
     pub fn with_seal_max_age(mut self, seal_max_age: Option<Duration>) -> Self {
         self.seal_max_age = seal_max_age;
+        self
+    }
+
+    /// Enable off-box replication of the unsealed tail (B3). See
+    /// [`Self::tail_replication`] — the flag is inert without a driver calling
+    /// [`L0Engine::replicate_tail`].
+    pub fn with_tail_replication(mut self, on: bool) -> Self {
+        self.tail_replication = on;
         self
     }
 
@@ -367,6 +396,11 @@ pub struct L0Engine<D: Dataset> {
     /// not advance its shard's tail — the ascending-contract-violation canary
     /// behind [`L0Metrics::out_of_order_appends`] (noetl/ai-meta#203).
     shard_tail_max: HashMap<u32, u64>,
+    /// Per-shard highest sort key already copied off-box as a **tail** object
+    /// (B3). Monotonic and deliberately NOT reset on seal: the next active
+    /// part's records carry strictly higher keys, so the same watermark keeps
+    /// selecting only what has not been replicated.
+    tail_cursor: HashMap<u32, u64>,
     /// Append-time idempotency window (noetl/ai-meta#313).
     dedupe: crate::dedupe::DedupeIndex,
     /// The M2 commit clock, and the mode that decides whether it is consulted.
@@ -613,6 +647,22 @@ impl<D: Dataset> L0Engine<D> {
         metrics.incr_cold_loads();
         let mut engine = Self::assemble(config, replicas, metrics, manifest, global_sequence);
         engine.start_uploader();
+        // B3 — replay the unsealed tail (noetl/ehdb#394).
+        //
+        // ⚠ AFTER `start_uploader`, because the recovered records are appended
+        // through the ordinary path and the part they land in must be able to
+        // seal and upload like any other.
+        //
+        // ⚠⚠ Unconditional, and deliberately not gated on `tail_replication`.
+        // The flag governs whether this node *writes* tail objects; whether
+        // there are any to read is a property of the replica set, which may
+        // have been written by a node whose flag was on. Gating recovery on the
+        // reader's own config is how a durability feature silently fails to
+        // deliver on exactly the node doing the recovering.
+        let recovered = engine.recover_tail_from_replicas(global_sequence)?;
+        if recovered > 0 {
+            engine.refresh_state_gauges();
+        }
         Ok(engine)
     }
 
@@ -635,6 +685,7 @@ impl<D: Dataset> L0Engine<D> {
             metrics,
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
+            tail_cursor: HashMap::new(),
             global_sequence,
             shard_tail_max: HashMap::new(),
             dedupe: dedupe_capacity_init,
@@ -1239,6 +1290,172 @@ impl<D: Dataset> L0Engine<D> {
         }
         self.refresh_state_gauges();
         Ok(sealed_count)
+    }
+
+    /// **Copy the unsealed tail off-box** (B3, noetl/ehdb#394). Returns what
+    /// moved.
+    ///
+    /// Until a part seals it exists only on local disk, so the loss window is
+    /// the seal interval — `seal_max_age` bounds that window but cannot close
+    /// it. This copies records still held in an active writer to the replica
+    /// set as their own **write-once** objects, so a cold load can replay them
+    /// ([`Self::recover_tail_from_replicas`]).
+    ///
+    /// ⚠ Why per-batch objects and not a re-upload of the active part: the part
+    /// grows, so re-uploading it every tick is O(size) per tick and therefore
+    /// quadratic over the part's life — a 7 MiB part re-uploaded every 60 s for
+    /// 7 h is ~1.5 GB of puts for ~7 MiB of data. A batch per tick writes ~the
+    /// data volume, once.
+    ///
+    /// A no-op when `tail_replication` is false, so a driver can call it
+    /// unconditionally.
+    ///
+    /// ⚠⚠ **A failing tail put does not fail anything** (noetl/ehdb#394 D3).
+    /// The record is already durable locally; failing an append because a
+    /// *replica* is unreachable would convert a durability feature into an
+    /// availability regression — the same trade A2 made when it chose to open
+    /// at RF=1 rather than refuse. The cursor is left where it was, so the next
+    /// tick re-drives the same records, and the failure is counted rather than
+    /// silent.
+    ///
+    /// ⚠ Honest bound: this makes loss bounded by **the driver's tick
+    /// interval**, not zero. No remote ack gates the local append, so a loss
+    /// between a tick and the next one is still a loss. It is not consensus and
+    /// not a quorum.
+    pub fn replicate_tail(&mut self) -> Result<TailReplicationReport> {
+        let mut report = TailReplicationReport::default();
+        if !self.config.tail_replication {
+            return Ok(report);
+        }
+        let shards: Vec<u32> = {
+            let mut v: Vec<u32> = self.writers.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        for shard in shards {
+            let cursor = self.tail_cursor.get(&shard).copied().unwrap_or(0);
+            let pending: Vec<D::Record> = match self.writers.get(&shard) {
+                Some(w) => w
+                    .pending_records()
+                    .iter()
+                    .filter(|r| D::sort_key(r) > cursor)
+                    .cloned()
+                    .collect(),
+                None => continue,
+            };
+            if pending.is_empty() {
+                continue;
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for rec in &pending {
+                let body = serde_json::to_vec(rec)
+                    .map_err(|err| EhdbError::Storage(format!("encode tail record: {err}")))?;
+                bytes.extend_from_slice(&crate::frame::encode_frame(&body)?);
+                let k = D::sort_key(rec);
+                lo = lo.min(k);
+                hi = hi.max(k);
+            }
+            let key = tail_key(&self.config.dataset, shard, lo, hi);
+            let locations = replicate_bytes(&self.replicas, &key, &bytes, &self.metrics);
+            if locations.is_empty() {
+                // Every replica refused. Leave the cursor; the next tick retries.
+                self.metrics.incr_tail_replication_failed();
+                report.failed_shards.push(shard);
+                continue;
+            }
+            self.tail_cursor.insert(shard, hi);
+            self.metrics
+                .record_tail_batch(pending.len() as u64, bytes.len() as u64);
+            report.batches += 1;
+            report.records += pending.len();
+            report.bytes += bytes.len();
+            report.shards.push(shard);
+        }
+        Ok(report)
+    }
+
+    /// The per-shard tail watermark — the highest sort key already copied
+    /// off-box. Exposed so a test or an operator can see the replicator's
+    /// progress without inferring it from a counter.
+    pub fn tail_watermarks(&self) -> Vec<(u32, u64)> {
+        let mut out: Vec<(u32, u64)> = self
+            .tail_cursor
+            .iter()
+            .map(|(shard, seq)| (*shard, *seq))
+            .collect();
+        out.sort_by_key(|(shard, _)| *shard);
+        out
+    }
+
+    /// **Replay tail objects from the replica set** (B3 recovery). Returns how
+    /// many records were recovered — records that existed nowhere but the dead
+    /// node's local disk and the replicas' tail objects.
+    ///
+    /// `after_seq` is the durable manifest's `max_sequence`: everything at or
+    /// below it is already covered by a sealed part.
+    ///
+    /// ⚠⚠ The overlap is real and expected, not an error (the noetl/ai-meta#335
+    /// shape): a part that sealed *after* its tail objects were written makes
+    /// them redundant, so the same record legitimately exists in both a tail
+    /// object and a sealed part. Dedup is by sort key against `after_seq` and
+    /// then across objects, which is why this cannot simply append everything
+    /// it finds.
+    ///
+    /// ⚠ Recovered records are appended through the ordinary append path, so
+    /// they land in a fresh active part, become readable through the existing
+    /// tail read in [`Self::read_partition_after_limited`], and will seal and
+    /// upload normally. B3 needs no new read path — that is the point.
+    /// Appending in ascending sort-key order is required by the
+    /// ascending-contract canary.
+    fn recover_tail_from_replicas(&mut self, after_seq: u64) -> Result<usize> {
+        let prefix = tail_prefix(&self.config.dataset);
+        let mut recovered: std::collections::BTreeMap<u64, D::Record> =
+            std::collections::BTreeMap::new();
+        let mut superseded_objects = 0u64;
+        for target in &self.replicas {
+            let keys = match target.substrate.list_prefix(&prefix) {
+                Ok(k) => k,
+                // A replica that cannot be listed is skipped; the survivors
+                // carry the tail, exactly as they carry parts.
+                Err(_) => continue,
+            };
+            for key in keys {
+                let bytes = match target.substrate.get_all(&key) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let frames = crate::frame::iter_frames_from(&bytes, 0)?;
+                let mut contributed = false;
+                for frame in frames {
+                    let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
+                        EhdbError::Storage(format!("decode tail record in {key}: {err}"))
+                    })?;
+                    let k = D::sort_key(&rec);
+                    if k > after_seq {
+                        recovered.entry(k).or_insert(rec);
+                        contributed = true;
+                    }
+                }
+                if !contributed {
+                    superseded_objects += 1;
+                }
+            }
+        }
+        if superseded_objects > 0 {
+            self.metrics.add_tail_objects_superseded(superseded_objects);
+        }
+        let n = recovered.len();
+        // BTreeMap iteration is ascending by sort key, which the append path
+        // requires.
+        for (_, rec) in recovered {
+            self.append_record(rec)?;
+        }
+        if n > 0 {
+            self.metrics.add_tail_recovered(n as u64);
+        }
+        Ok(n)
     }
 
     /// The age of the oldest un-sealed record per shard — what the age trigger
@@ -2040,6 +2257,51 @@ fn read_local_range(path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
     f.read_exact(&mut buf)
         .map_err(|err| EhdbError::Storage(err.to_string()))?;
     Ok(buf)
+}
+
+/// Prefix under which **tail** objects live.
+///
+/// ⚠⚠ Deliberately NOT under `parts/`. A tail object is not a part — it is a
+/// copy of records still held in an active writer, with no `PartMeta`, no
+/// sparse index and no manifest row. If one were ever treated as a part,
+/// `plan_retention` could drop it as though it were one, and
+/// `read_partition_after_limited` would try to read it through a sparse index
+/// it does not have (noetl/ehdb#394).
+fn tail_prefix(dataset: &str) -> String {
+    format!("tail/{dataset}/")
+}
+
+/// One tail object's key. Zero-padded so a `list_prefix` returns them in
+/// sequence order, matching how part keys are built.
+fn tail_key(dataset: &str, shard: u32, from_seq: u64, to_seq: u64) -> String {
+    format!("tail/{dataset}/shard-{shard}/seq-{from_seq:020}-{to_seq:020}.eslog")
+}
+
+/// What one [`L0Engine::replicate_tail`] pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TailReplicationReport {
+    /// Objects written — one per shard that had new unsealed records.
+    pub batches: usize,
+    /// Records those objects carry.
+    pub records: usize,
+    /// Bytes those objects carry.
+    pub bytes: usize,
+    /// Shards whose tail advanced.
+    pub shards: Vec<u32>,
+    /// Shards where **every** replica write failed, so the cursor did not move
+    /// and the records are still local-only.
+    ///
+    /// ⚠ Reported separately rather than folded into `batches == 0`: "nothing
+    /// to do" and "could not do it" are opposite conditions and a caller that
+    /// cannot tell them apart will read a failing replicator as an idle one.
+    pub failed_shards: Vec<u32>,
+}
+
+impl TailReplicationReport {
+    /// Whether anything reached a replica.
+    pub fn replicated_anything(&self) -> bool {
+        self.batches > 0
+    }
 }
 
 fn manifest_latest_key(dataset: &str) -> String {

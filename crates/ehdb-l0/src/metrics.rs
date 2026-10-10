@@ -174,6 +174,31 @@ pub struct L0Metrics {
     pub backfill_uploads: AtomicU64,
     /// Bytes uploaded by a backfill.
     pub backfill_upload_bytes: AtomicU64,
+    /// **Tail batches replicated off-box** (B3). One per shard per driver tick
+    /// that had new unsealed records.
+    pub tail_batches: AtomicU64,
+    /// Records carried by those batches.
+    pub tail_records: AtomicU64,
+    /// Bytes carried by those batches.
+    pub tail_bytes: AtomicU64,
+    /// Tail batches where **every** replica write failed, so the records stayed
+    /// local-only and the cursor was not advanced.
+    ///
+    /// ⚠ Its own counter rather than silence: a tail replicator that is failing
+    /// every put looks exactly like one that has nothing to do, because both
+    /// leave `tail_batches` flat.
+    pub tail_replication_failed: AtomicU64,
+    /// Records recovered from tail objects on a cold load — the number that
+    /// would otherwise have been lost.
+    pub tail_recovered_records: AtomicU64,
+    /// Tail objects whose records were ALL already covered by the durable
+    /// manifest, so they contributed nothing.
+    ///
+    /// ⚠ Expected to be non-zero in steady state: a part that sealed after its
+    /// tail objects were written makes them redundant by design. A permanent
+    /// zero alongside non-zero `tail_batches` means the overlap dedup is not
+    /// being exercised, not that it is working.
+    pub tail_objects_superseded: AtomicU64,
     /// **Append → substrate-durable latency** (noetl/ehdb#328) — the D1
     /// durability window, end to end.
     ///
@@ -346,6 +371,21 @@ impl L0Metrics {
         self.backfill_upload_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
+    /// Record one tail batch that reached at least one replica.
+    pub(crate) fn record_tail_batch(&self, records: u64, bytes: u64) {
+        self.tail_batches.fetch_add(1, Ordering::Relaxed);
+        self.tail_records.fetch_add(records, Ordering::Relaxed);
+        self.tail_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn incr_tail_replication_failed(&self) {
+        self.tail_replication_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn add_tail_recovered(&self, n: u64) {
+        self.tail_recovered_records.fetch_add(n, Ordering::Relaxed);
+    }
+    pub(crate) fn add_tail_objects_superseded(&self, n: u64) {
+        self.tail_objects_superseded.fetch_add(n, Ordering::Relaxed);
+    }
     /// Record one **append → substrate-durable** latency.
     pub(crate) fn record_replicated_lag(&self, micros: u64) {
         self.replicated_lag.observe(micros);
@@ -398,6 +438,12 @@ impl L0Metrics {
             upload_lag_micros_total: self.upload_lag_micros_total.load(Ordering::Relaxed),
             backfill_uploads: self.backfill_uploads.load(Ordering::Relaxed),
             backfill_upload_bytes: self.backfill_upload_bytes.load(Ordering::Relaxed),
+            tail_batches: self.tail_batches.load(Ordering::Relaxed),
+            tail_records: self.tail_records.load(Ordering::Relaxed),
+            tail_bytes: self.tail_bytes.load(Ordering::Relaxed),
+            tail_replication_failed: self.tail_replication_failed.load(Ordering::Relaxed),
+            tail_recovered_records: self.tail_recovered_records.load(Ordering::Relaxed),
+            tail_objects_superseded: self.tail_objects_superseded.load(Ordering::Relaxed),
             merges: self.merges.load(Ordering::Relaxed),
             parts_merged: self.parts_merged.load(Ordering::Relaxed),
             merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
@@ -447,6 +493,12 @@ pub struct L0MetricsSnapshot {
     pub upload_lag_micros_total: u64,
     pub backfill_uploads: u64,
     pub backfill_upload_bytes: u64,
+    pub tail_batches: u64,
+    pub tail_records: u64,
+    pub tail_bytes: u64,
+    pub tail_replication_failed: u64,
+    pub tail_recovered_records: u64,
+    pub tail_objects_superseded: u64,
     pub merges: u64,
     pub parts_merged: u64,
     pub merged_bytes: u64,
@@ -623,6 +675,36 @@ const SERIES: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
+        "tail_batches",
+        "Unsealed-tail batches replicated off-box (B3). A permanent 0 with a non-zero tail_replication_failed means every put is failing; a permanent 0 with both at 0 means no driver is calling replicate_tail.",
+        "counter",
+    ),
+    (
+        "tail_records",
+        "Records carried by replicated tail batches — the loss that off-box tail replication is preventing.",
+        "counter",
+    ),
+    (
+        "tail_bytes",
+        "Bytes carried by replicated tail batches.",
+        "counter",
+    ),
+    (
+        "tail_replication_failed",
+        "Tail batches where every replica write failed, so the records stayed local-only and the cursor did not advance. Distinct from silence: a failing replicator and an idle one both leave tail_batches flat.",
+        "counter",
+    ),
+    (
+        "tail_recovered_records",
+        "Records recovered from tail objects on a cold load — what would otherwise have been lost with the primary gone.",
+        "counter",
+    ),
+    (
+        "tail_objects_superseded",
+        "Tail objects whose records were already covered by the durable manifest. Non-zero is expected in steady state; a permanent 0 alongside non-zero tail_batches means the overlap dedup is not being exercised.",
+        "counter",
+    ),
+    (
         "dedupe_window_records",
         "Records held in the append-time idempotency window, summed over shards.",
         "gauge",
@@ -671,6 +753,12 @@ impl L0MetricsSnapshot {
             "parts_under_replicated" => self.parts_under_replicated,
             "backfill_uploads" => self.backfill_uploads,
             "backfill_upload_bytes" => self.backfill_upload_bytes,
+            "tail_batches" => self.tail_batches,
+            "tail_records" => self.tail_records,
+            "tail_bytes" => self.tail_bytes,
+            "tail_replication_failed" => self.tail_replication_failed,
+            "tail_recovered_records" => self.tail_recovered_records,
+            "tail_objects_superseded" => self.tail_objects_superseded,
             "dedupe_window_records" => self.dedupe_window_records,
             "records_superseded" => self.records_superseded,
             other => unreachable!("SERIES names a metric with no accessor: {other}"),
