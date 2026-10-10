@@ -462,6 +462,25 @@ where
         self.group.lock().await.committed_cursor()
     }
 
+    /// **Records assigned to a member and not yet acked** — the `inflight` field
+    /// of this shard's [`ShardLag`](crate::scaler::ShardLag).
+    ///
+    /// ⚠ Not derivable from [`lag`](Self::lag), which is the whole backlog
+    /// (undelivered **plus** unacked). The pair separates two opposite
+    /// conditions that `lag` alone renders identically: high lag with **zero**
+    /// inflight is a consumer that is absent or stalled, high lag with inflight
+    /// at the cap is a healthy one under load.
+    ///
+    /// ⚠⚠ This accessor exists because a caller with no way to obtain the value
+    /// has only one option left, and it is the harmful one. `render_snapshot`
+    /// publishes `inflight` unconditionally, so a writer that fills the field
+    /// with a literal `0` does not report "unknown" — it reports *the stalled
+    /// consumer reading*, on every scrape, for a bus that is working
+    /// (noetl/ehdb#402).
+    pub async fn inflight(&self) -> u64 {
+        self.group.lock().await.inflight_len() as u64
+    }
+
     /// Persist the current committed cursor, if this coordinator was built with a
     /// [`CursorStore`]. Returns the cursor that is now durable (`None` when there
     /// is no store).
