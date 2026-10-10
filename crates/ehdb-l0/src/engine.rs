@@ -1323,23 +1323,42 @@ impl<D: Dataset> L0Engine<D> {
     /// between a tick and the next one is still a loss. It is not consensus and
     /// not a quorum.
     pub fn replicate_tail(&mut self) -> Result<TailReplicationReport> {
+        let batches = self.prepare_tail_batches()?;
+        let replicas = self.replicas.clone();
         let mut report = TailReplicationReport::default();
-        if !self.config.tail_replication {
-            return Ok(report);
+        for batch in &batches {
+            if upload_tail_batch(&replicas, batch, &self.metrics) {
+                self.commit_tail_batch(batch, &mut report);
+            } else {
+                self.fail_tail_batch(batch, &mut report);
+            }
         }
-        let shards: Vec<u32> = {
-            let mut v: Vec<u32> = self.writers.keys().copied().collect();
-            v.sort_unstable();
-            v
-        };
+        Ok(report)
+    }
+
+    /// **Prepare** the tail batches without touching any substrate — the
+    /// lock-held half.
+    ///
+    /// Cheap by construction: it clones and serializes records, which is CPU,
+    /// and performs **no I/O**. A caller holding the engine lock can do this
+    /// and release before [`upload_tail_batch`].
+    ///
+    /// Empty when `tail_replication` is false, so a driver can call it
+    /// unconditionally.
+    pub fn prepare_tail_batches(&self) -> Result<Vec<TailBatch>> {
+        if !self.config.tail_replication {
+            return Ok(Vec::new());
+        }
+        let mut shards: Vec<u32> = self.writers.keys().copied().collect();
+        shards.sort_unstable();
+        let mut out = Vec::new();
         for shard in shards {
             let cursor = self.tail_cursor.get(&shard).copied().unwrap_or(0);
-            let pending: Vec<D::Record> = match self.writers.get(&shard) {
+            let pending: Vec<&D::Record> = match self.writers.get(&shard) {
                 Some(w) => w
                     .pending_records()
                     .iter()
                     .filter(|r| D::sort_key(r) > cursor)
-                    .cloned()
                     .collect(),
                 None => continue,
             };
@@ -1357,23 +1376,40 @@ impl<D: Dataset> L0Engine<D> {
                 lo = lo.min(k);
                 hi = hi.max(k);
             }
-            let key = tail_key(&self.config.dataset, shard, lo, hi);
-            let locations = replicate_bytes(&self.replicas, &key, &bytes, &self.metrics);
-            if locations.is_empty() {
-                // Every replica refused. Leave the cursor; the next tick retries.
-                self.metrics.incr_tail_replication_failed();
-                report.failed_shards.push(shard);
-                continue;
-            }
-            self.tail_cursor.insert(shard, hi);
-            self.metrics
-                .record_tail_batch(pending.len() as u64, bytes.len() as u64);
-            report.batches += 1;
-            report.records += pending.len();
-            report.bytes += bytes.len();
-            report.shards.push(shard);
+            out.push(TailBatch {
+                key: tail_key(&self.config.dataset, shard, lo, hi),
+                bytes,
+                shard,
+                high_sort_key: hi,
+                records: pending.len(),
+            });
         }
-        Ok(report)
+        Ok(out)
+    }
+
+    /// The replica set, for a driver that uploads with the lock released.
+    /// Cloning is `Arc` clones.
+    pub fn replica_handles(&self) -> Vec<ReplicaTarget> {
+        self.replicas.clone()
+    }
+
+    /// **Commit** a batch that reached at least one replica — advance the
+    /// watermark. The other lock-held half, and it does no I/O.
+    pub fn commit_tail_batch(&mut self, batch: &TailBatch, report: &mut TailReplicationReport) {
+        self.tail_cursor.insert(batch.shard, batch.high_sort_key);
+        self.metrics
+            .record_tail_batch(batch.records as u64, batch.bytes.len() as u64);
+        report.batches += 1;
+        report.records += batch.records;
+        report.bytes += batch.bytes.len();
+        report.shards.push(batch.shard);
+    }
+
+    /// **Record a batch that reached no replica.** The watermark is left where
+    /// it was, so the next pass re-drives exactly these records.
+    pub fn fail_tail_batch(&mut self, batch: &TailBatch, report: &mut TailReplicationReport) {
+        self.metrics.incr_tail_replication_failed();
+        report.failed_shards.push(batch.shard);
     }
 
     /// The per-shard tail watermark — the highest sort key already copied
@@ -2277,6 +2313,35 @@ fn tail_key(dataset: &str, shard: u32, from_seq: u64, to_seq: u64) -> String {
     format!("tail/{dataset}/shard-{shard}/seq-{from_seq:020}-{to_seq:020}.eslog")
 }
 
+/// One prepared tail batch: the bytes to write and where.
+///
+/// ⚠⚠ This type exists so the **substrate write can happen with the engine
+/// lock released**. [`L0Engine::replicate_tail`] is a convenience that does
+/// prepare → upload → commit in one call, which means the upload runs while
+/// the caller holds the engine. For an embedded engine whose lock is also taken
+/// by the live append path, that injects the full remote-put latency into every
+/// append that collides with a tick — measured at p50 77 ms and p99 234 ms
+/// against GCS, once per tick. The uploader thread has always avoided this (see
+/// `start_uploader`: "the substrate writes happen OUTSIDE the lock so a slow
+/// store never blocks appends/reads") and the tail replicator must too.
+///
+/// So a latency-sensitive driver uses
+/// [`L0Engine::prepare_tail_batches`] → [`upload_tail_batch`] →
+/// [`L0Engine::commit_tail_batch`], locking only for the first and last.
+#[derive(Debug, Clone)]
+pub struct TailBatch {
+    /// Substrate key this batch is written to.
+    pub key: String,
+    /// Framed record bytes.
+    pub bytes: Vec<u8>,
+    /// The shard the records came from.
+    pub shard: u32,
+    /// Highest sort key in the batch — the watermark to commit on success.
+    pub high_sort_key: u64,
+    /// How many records the batch carries.
+    pub records: usize,
+}
+
 /// What one [`L0Engine::replicate_tail`] pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TailReplicationReport {
@@ -2317,6 +2382,20 @@ fn manifest_version_key(dataset: &str, version: u64) -> String {
 /// Parts are immutable so `put_if_absent` is idempotent — a replica that already
 /// holds the part still counts (it is durable there). Records a `replica_write`
 /// metric per successful copy.
+/// Write one prepared tail batch to the replica set. `true` when at least one
+/// replica took it.
+///
+/// ⚠ A free function on purpose: it borrows nothing from the engine, so a
+/// driver can call it **with the engine lock released**. That is the whole
+/// reason [`TailBatch`] exists.
+pub fn upload_tail_batch(
+    replicas: &[ReplicaTarget],
+    batch: &TailBatch,
+    metrics: &L0Metrics,
+) -> bool {
+    !replicate_bytes(replicas, &batch.key, &batch.bytes, metrics).is_empty()
+}
+
 fn replicate_bytes(
     replicas: &[ReplicaTarget],
     key: &str,

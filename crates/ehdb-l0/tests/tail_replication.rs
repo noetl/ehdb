@@ -483,3 +483,136 @@ fn recovery_ignores_tail_objects_under_another_datasets_prefix() {
          this would have failed to decode rather than returning the right set"
     );
 }
+
+/// ⚠⚠ **The lock-released path.** `replicate_tail` is a convenience that does
+/// prepare → upload → commit in one call, which means the remote put runs while
+/// the caller holds the engine. For the server's embedded engine that lock is
+/// also taken by the live append path, so a tick colliding with an append would
+/// add the full remote-put latency to it — p50 77 ms, p99 234 ms against GCS.
+///
+/// These pin the split that lets a driver avoid that: **prepare does no I/O**,
+/// so it is safe under the lock, and the upload is a free function that borrows
+/// nothing from the engine.
+#[test]
+fn preparing_a_tail_batch_touches_no_substrate() {
+    let local = unique_dir("split-local");
+    let remote = unique_dir("split-remote");
+    let facade = Arc::new(RefusesWrites::new(substrate(&remote)));
+    let refusing: Arc<dyn DurableSubstrate> = facade.clone();
+
+    let mut e = L0EventLogEngine::open_replicated(
+        cfg(&local, true),
+        vec![ReplicaTarget::new("replica-0", refusing)],
+    )
+    .unwrap();
+    for i in 0..4u64 {
+        e.append("1001", &format!("t{i}"), format!("p-{i}"))
+            .unwrap();
+    }
+
+    // Every write now fails. `prepare` must still succeed — if it performed any
+    // substrate I/O it could not.
+    facade.refuse();
+    let batches = e
+        .prepare_tail_batches()
+        .expect("prepare must not touch the substrate, so a refusing replica cannot fail it");
+    assert_eq!(batches.len(), 1, "one shard, one batch");
+    assert_eq!(batches[0].records, 4);
+    assert_eq!(batches[0].shard, 0);
+    assert!(!batches[0].bytes.is_empty());
+    assert!(
+        batches[0].key.starts_with("tail/d1_event_log/shard-0/"),
+        "key: {}",
+        batches[0].key
+    );
+
+    // And the upload — the part that does I/O — fails against the same replica,
+    // which is what proves the preceding success was not an accident of the
+    // façade being permissive.
+    let replicas = e.replica_handles();
+    let ok = ehdb_l0::engine::upload_tail_batch(&replicas, &batches[0], e.metrics().as_ref());
+    assert!(!ok, "the upload must fail where prepare succeeded");
+
+    // Nothing committed, so the watermark has not moved.
+    assert!(e.tail_watermarks().is_empty());
+}
+
+/// The driver's shape, end to end: prepare (lock), upload (lock RELEASED),
+/// commit (lock) — and the records recover from the replica alone.
+#[test]
+fn the_lock_released_driver_shape_replicates_and_recovers() {
+    let local = unique_dir("driver-local");
+    let remote = unique_dir("driver-remote");
+    let mut e = L0EventLogEngine::open_replicated(
+        cfg(&local, true),
+        vec![ReplicaTarget::new("replica-0", substrate(&remote))],
+    )
+    .unwrap();
+
+    let mut sealed = Vec::new();
+    for i in 0..8u64 {
+        e.append("1001", &format!("s{i}"), format!("sealed-{i}"))
+            .unwrap();
+        sealed.push(format!("sealed-{i}"));
+    }
+    e.flush_and_wait_uploads().unwrap();
+
+    let mut tail = Vec::new();
+    for i in 0..5u64 {
+        e.append("1001", &format!("u{i}"), format!("unsealed-{i}"))
+            .unwrap();
+        tail.push(format!("unsealed-{i}"));
+    }
+
+    // --- exactly what the server driver does ---
+    let (batches, replicas) = {
+        // lock held
+        (e.prepare_tail_batches().unwrap(), e.replica_handles())
+    };
+    // lock released here: the uploads below borrow nothing from the engine.
+    let metrics = e.metrics();
+    let results: Vec<(bool, &ehdb_l0::engine::TailBatch)> = batches
+        .iter()
+        .map(|b| (upload_tail_batch_helper(&replicas, b, metrics.as_ref()), b))
+        .collect();
+    // lock re-taken to commit
+    let mut report = Default::default();
+    for (ok, b) in results {
+        if ok {
+            e.commit_tail_batch(b, &mut report);
+        } else {
+            e.fail_tail_batch(b, &mut report);
+        }
+    }
+    assert_eq!(report.records, 5, "all five unsealed records committed");
+    assert!(report.failed_shards.is_empty());
+    drop(e);
+
+    std::fs::remove_dir_all(&local).unwrap();
+    let fresh = unique_dir("driver-recovered");
+    let revived = L0EventLogEngine::cold_load_replicated(
+        cfg(&fresh, false),
+        vec![ReplicaTarget::new("replica-0", substrate(&remote))],
+    )
+    .unwrap();
+    let got: Vec<String> = revived
+        .replay_all()
+        .unwrap()
+        .into_iter()
+        .map(|r: EventRecord| r.payload)
+        .collect();
+    let mut expected = sealed;
+    expected.extend(tail);
+    assert_eq!(
+        got, expected,
+        "13 records via the lock-released driver shape"
+    );
+}
+
+fn upload_tail_batch_helper(
+    replicas: &[ReplicaTarget],
+    batch: &ehdb_l0::engine::TailBatch,
+    metrics: &ehdb_l0::metrics::L0Metrics,
+) -> bool {
+    ehdb_l0::engine::upload_tail_batch(replicas, batch, metrics)
+}
