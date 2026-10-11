@@ -487,7 +487,10 @@ pub mod conformance {
         //    round-tripped. ⚠ `transitions` especially: the k8s mapping puts it
         //    in `spec.leaseTransitions`, and an adapter that drops it lets two
         //    nodes mint the same epoch.
-        let first = rec("node-a", 7, 1_000);
+        // ⚠ Deliberately NOT a whole second: the 234 ms remainder means an
+        // adapter that truncates `renewTime` to seconds fails the round-trip
+        // clause instead of passing by luck.
+        let first = rec("node-a", 7, 1_234_567_891_234);
         match store.create(&a, &first) {
             Ok(true) => {}
             Ok(false) => fail(&mut v, "create_absent_succeeds", "returned Ok(false)"),
@@ -530,6 +533,22 @@ pub mod conformance {
                     format!(
                         "duration_secs {} != {}",
                         r.duration_secs, first.duration_secs
+                    ),
+                );
+            }
+            // ⚠ Expiry is computed from this (`LeaseRecord::is_expired`), and the
+            // k8s mapping sends it through `spec.renewTime`, an RFC3339
+            // `MicroTime`. An adapter that truncates to whole seconds would make
+            // a lease look renewed up to 999 ms earlier than it was, silently
+            // shortening every liveness window. Checked here rather than left to
+            // the adapter's own tests.
+            if r.renewed_at_millis != first.renewed_at_millis {
+                fail(
+                    &mut v,
+                    "renewed_at_round_trip",
+                    format!(
+                        "renewed_at_millis {} != {} — a lossy timestamp shortens every expiry window",
+                        r.renewed_at_millis, first.renewed_at_millis
                     ),
                 );
             }
