@@ -11,9 +11,22 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{Field, Schema};
 use ehdb_catalog::{CommitSnapshot, CreateTable, GrantScan, InMemoryCatalog};
 use ehdb_core::{
-    ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, EhdbError, NamespaceName, Result,
-    SnapshotId, StreamName, TableName, TableSchema, TenantId, TransactionId,
+    ChunkId, ColumnSchema, ConsumerName, DataType, DocumentId, NamespaceName, SnapshotId,
+    StreamName, TableName, TableSchema, TenantId, TransactionId,
 };
+/// ⚠⚠ Re-exported because [`election::LeaseStore`] is a **public trait whose
+/// methods return `ehdb_core::Result`** — so without this it cannot be
+/// implemented outside this workspace, which defeats the seam's whole purpose.
+/// C2 puts the Kubernetes adapter in `noetl/worker` precisely so ehdb needs no
+/// HTTP stack; that adapter has to name this error type.
+///
+/// ⚠ And it must come from *here* rather than from a separate `ehdb-core`
+/// dependency in the consumer: two versions of `ehdb-core` in one graph would
+/// make `EhdbError` two distinct types and the `impl LeaseStore` would silently
+/// fail to apply — the same two-versions-in-one-graph shape that broke
+/// `noetl/worker`'s release twice on `async-nats`.
+pub use ehdb_core::{EhdbError, Result};
+
 use ehdb_retrieval::{
     InMemoryRetrievalCatalog, RegisterChunk, RegisterDocument, RegisterEmbedding, TextSearch,
     TextSearchHit,
