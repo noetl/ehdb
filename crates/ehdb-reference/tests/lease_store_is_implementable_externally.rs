@@ -46,13 +46,16 @@ fn an_external_crate_can_name_the_trait_and_its_error_type() {
     let s = ExternalStore;
     assert!(s.read("x").unwrap().is_none());
     assert!(matches!(
-        s.create("x", &LeaseRecord {
-            holder: "h".into(),
-            transitions: 0,
-            renewed_at_millis: 0,
-            duration_secs: 1,
-            version: 0,
-        }),
+        s.create(
+            "x",
+            &LeaseRecord {
+                holder: "h".into(),
+                transitions: 0,
+                renewed_at_millis: 0,
+                duration_secs: 1,
+                version: 0,
+            }
+        ),
         Err(EhdbError::InvalidState(_))
     ));
 }
