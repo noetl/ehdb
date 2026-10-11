@@ -396,3 +396,299 @@ impl LeaseStore for InMemoryLeaseStore {
         Ok(true)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conformance
+// ---------------------------------------------------------------------------
+
+pub mod conformance {
+    //! **The `LeaseStore` conformance suite.** An implementation is usable for
+    //! shard election only if [`run`] returns no violations.
+    //!
+    //! ## Why this is extracted rather than written per-implementation
+    //!
+    //! `docs/spec/lease-election-k8s-binding.md` requires, before promotion:
+    //!
+    //! > Adapter conformance: the same suite `InMemoryLeaseStore` passes, run
+    //! > against a real API server in kind.
+    //!
+    //! **"The same suite"** is the load-bearing phrase. Writing fresh tests for
+    //! a second implementation proves that implementation satisfies *those
+    //! tests*, not that it satisfies the contract the election depends on — and
+    //! the two diverge in exactly the way a conformance suite exists to prevent.
+    //! So the clauses live here, parameterised over the store.
+    //!
+    //! ## ⭐ The suite is only meaningful if it rejects something
+    //!
+    //! [`IgnoresVersionStore`] exists for that. It is a plausible-looking store
+    //! that ignores `expected_version` — precisely what the [`super::LeaseStore`]
+    //! doc warns about ("An implementation that ignores `expected_version`
+    //! silently permits two holders"). `the_suite_rejects_a_store_that_ignores_cas`
+    //! is the suite's positive control: a suite that has never rejected anything
+    //! is indistinguishable from a suite that cannot.
+    //!
+    //! ## ⚠ Names must be unique per run
+    //!
+    //! Against `InMemoryLeaseStore` a fresh instance is empty. Against a real API
+    //! server the objects **persist across runs**, so [`run`] takes a `prefix`
+    //! and every clause works on `{prefix}-...` names. A suite that hardcoded a
+    //! name would pass once and then fail on the `create`-on-absent clause
+    //! forever after, which reads like an adapter bug.
+
+    use super::{LeaseRecord, LeaseStore};
+
+    /// One contract clause that failed, named so an operator can see *which*
+    /// guarantee a candidate store does not provide.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Violation {
+        pub clause: &'static str,
+        pub detail: String,
+    }
+
+    fn rec(holder: &str, transitions: u64, now: u64) -> LeaseRecord {
+        LeaseRecord {
+            holder: holder.to_string(),
+            transitions,
+            renewed_at_millis: now,
+            duration_secs: 15,
+            version: 0,
+        }
+    }
+
+    fn fail(v: &mut Vec<Violation>, clause: &'static str, detail: impl Into<String>) {
+        v.push(Violation {
+            clause,
+            detail: detail.into(),
+        });
+    }
+
+    /// Run every clause against `store`, using lease names under `prefix`.
+    ///
+    /// `prefix` must be unique per invocation when the store is persistent.
+    /// Returns the violations; an empty vec means the store satisfies the
+    /// contract the election relies on.
+    pub fn run<S: LeaseStore + ?Sized>(store: &S, prefix: &str) -> Vec<Violation> {
+        let mut v = Vec::new();
+        let absent = format!("{prefix}-absent");
+        let a = format!("{prefix}-a");
+
+        // 1. read of an absent name is None, not an error.
+        match store.read(&absent) {
+            Ok(None) => {}
+            Ok(Some(r)) => fail(
+                &mut v,
+                "read_absent_is_none",
+                format!("expected None, got holder={}", r.holder),
+            ),
+            Err(e) => fail(&mut v, "read_absent_is_none", format!("errored: {e}")),
+        }
+
+        // 2. create on absent succeeds and is then readable, with the fields
+        //    round-tripped. ⚠ `transitions` especially: the k8s mapping puts it
+        //    in `spec.leaseTransitions`, and an adapter that drops it lets two
+        //    nodes mint the same epoch.
+        let first = rec("node-a", 7, 1_000);
+        match store.create(&a, &first) {
+            Ok(true) => {}
+            Ok(false) => fail(&mut v, "create_absent_succeeds", "returned Ok(false)"),
+            Err(e) => fail(&mut v, "create_absent_succeeds", format!("errored: {e}")),
+        }
+        let after_create = match store.read(&a) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => {
+                fail(&mut v, "create_is_durable", "read back None after create");
+                None
+            }
+            Err(e) => {
+                fail(&mut v, "create_is_durable", format!("errored: {e}"));
+                None
+            }
+        };
+        if let Some(r) = &after_create {
+            if r.holder != first.holder {
+                fail(
+                    &mut v,
+                    "fields_round_trip",
+                    format!("holder {} != {}", r.holder, first.holder),
+                );
+            }
+            if r.transitions != first.transitions {
+                fail(
+                    &mut v,
+                    "transitions_round_trip",
+                    format!(
+                        "transitions {} != {} — an adapter that loses this lets two nodes \
+                         mint the same epoch",
+                        r.transitions, first.transitions
+                    ),
+                );
+            }
+            if r.duration_secs != first.duration_secs {
+                fail(
+                    &mut v,
+                    "fields_round_trip",
+                    format!(
+                        "duration_secs {} != {}",
+                        r.duration_secs, first.duration_secs
+                    ),
+                );
+            }
+            if r.version == 0 {
+                fail(
+                    &mut v,
+                    "create_assigns_version",
+                    "version is 0 after create; there is no CAS token to swap on",
+                );
+            }
+        }
+
+        // 3. create on an existing name returns Ok(false) and must not modify it.
+        if let Some(before) = &after_create {
+            match store.create(&a, &rec("node-b", 99, 2_000)) {
+                Ok(false) => {}
+                Ok(true) => fail(
+                    &mut v,
+                    "create_existing_is_false",
+                    "returned Ok(true) — the create is not conditional",
+                ),
+                Err(e) => fail(&mut v, "create_existing_is_false", format!("errored: {e}")),
+            }
+            match store.read(&a) {
+                Ok(Some(now)) if now.holder != before.holder => fail(
+                    &mut v,
+                    "failed_create_does_not_mutate",
+                    format!("holder changed to {}", now.holder),
+                ),
+                Err(e) => fail(
+                    &mut v,
+                    "failed_create_does_not_mutate",
+                    format!("errored: {e}"),
+                ),
+                _ => {}
+            }
+        }
+
+        // 4. CAS on an absent name is an error, not Ok(false). Ok(false) means
+        //    "someone else wrote first", which is a different fact.
+        match store.compare_and_swap(&absent, 1, &rec("node-a", 1, 3_000)) {
+            Err(_) => {}
+            Ok(b) => fail(
+                &mut v,
+                "cas_absent_errors",
+                format!("returned Ok({b}) for a name that does not exist"),
+            ),
+        }
+
+        // 5 + 6. CAS with the current version succeeds and bumps the version;
+        //        CAS with a stale version is refused AND changes nothing.
+        //        ⭐ Clause 6 is the mutual exclusion.
+        if let Some(cur) = &after_create {
+            let stale = cur.version;
+            let swapped = rec("node-a", 8, 4_000);
+            match store.compare_and_swap(&a, cur.version, &swapped) {
+                Ok(true) => {}
+                Ok(false) => fail(
+                    &mut v,
+                    "cas_current_version_succeeds",
+                    format!("refused the current version {}", cur.version),
+                ),
+                Err(e) => fail(
+                    &mut v,
+                    "cas_current_version_succeeds",
+                    format!("errored: {e}"),
+                ),
+            }
+            let bumped = store.read(&a).ok().flatten();
+            match &bumped {
+                Some(r) if r.version <= stale => fail(
+                    &mut v,
+                    "cas_advances_version",
+                    format!(
+                        "version {} did not advance past {stale}; a stale token could be \
+                         replayed forever",
+                        r.version
+                    ),
+                ),
+                None => fail(&mut v, "cas_advances_version", "record vanished after CAS"),
+                _ => {}
+            }
+            if let Some(after) = &bumped {
+                let holder_before = after.holder.clone();
+                match store.compare_and_swap(&a, stale, &rec("node-b", 999, 5_000)) {
+                    Ok(false) => {}
+                    Ok(true) => fail(
+                        &mut v,
+                        "cas_stale_version_refused",
+                        format!(
+                            "accepted stale version {stale} (current {}) — THIS IS THE \
+                             MUTUAL EXCLUSION; two holders are possible",
+                            after.version
+                        ),
+                    ),
+                    Err(e) => fail(&mut v, "cas_stale_version_refused", format!("errored: {e}")),
+                }
+                match store.read(&a) {
+                    Ok(Some(now)) if now.holder != holder_before => fail(
+                        &mut v,
+                        "refused_cas_does_not_mutate",
+                        format!(
+                            "a refused CAS still changed the holder to {} — the refusal is \
+                             cosmetic",
+                            now.holder
+                        ),
+                    ),
+                    Err(e) => fail(
+                        &mut v,
+                        "refused_cas_does_not_mutate",
+                        format!("errored: {e}"),
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        v
+    }
+
+    /// A store that looks right and ignores `expected_version`.
+    ///
+    /// ⭐ Exists so the suite can be shown to **reject** something. It is not a
+    /// strawman: ignoring the expected version is the single most natural way to
+    /// implement this wrongly, and the resulting store passes every clause
+    /// except the two that matter.
+    #[derive(Default)]
+    pub struct IgnoresVersionStore {
+        inner: std::sync::Mutex<std::collections::HashMap<String, LeaseRecord>>,
+    }
+
+    impl LeaseStore for IgnoresVersionStore {
+        fn read(&self, name: &str) -> super::Result<Option<LeaseRecord>> {
+            Ok(self.inner.lock().unwrap().get(name).cloned())
+        }
+        fn create(&self, name: &str, record: &LeaseRecord) -> super::Result<bool> {
+            let mut g = self.inner.lock().unwrap();
+            if g.contains_key(name) {
+                return Ok(false);
+            }
+            let mut r = record.clone();
+            r.version = 1;
+            g.insert(name.to_string(), r);
+            Ok(true)
+        }
+        fn compare_and_swap(
+            &self,
+            name: &str,
+            _expected_version: u64,
+            record: &LeaseRecord,
+        ) -> super::Result<bool> {
+            let mut g = self.inner.lock().unwrap();
+            let Some(cur) = g.get(name) else {
+                return Err(super::EhdbError::NotFound(format!("lease {name}")));
+            };
+            let mut r = record.clone();
+            r.version = cur.version + 1;
+            g.insert(name.to_string(), r);
+            Ok(true)
+        }
+    }
+}
