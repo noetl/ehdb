@@ -199,3 +199,109 @@ fn an_unfenced_writer_counts_nothing_and_writes_no_ledger() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// ⭐⭐ Per-path coverage across **all twelve** `&mut self` methods — the gate,
+/// asserted per path rather than in aggregate.
+///
+/// Aggregate is the trap: `writes_checked` climbing could be appends alone while
+/// seal, retention and reclaim stay unfenced, and the total would look complete.
+/// So every path is exercised and its own counter checked.
+///
+/// ⚠ What this test adds to the type-system guarantee: the compiler already
+/// proves none of the twelve is *callable* without `write()`. This proves that
+/// `write()` for each path actually records that path — i.e. that the coverage
+/// is observable as well as enforced.
+#[test]
+fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
+    let dir = tmp("twelve");
+    let led = FenceLedger::new(dir.join(".fence")).unwrap();
+    let metrics = FenceMetrics::new();
+    let fence = EpochFence::new(FenceMode::Shadow, Some(led), Arc::clone(&metrics));
+    fence.set_epoch(1);
+    let w = Arc::new(FeedWriter::new_fenced(engine(&dir), Arc::clone(&fence), 0));
+    let eng = w.engine();
+
+    // The denominator, printed rather than assumed.
+    assert_eq!(
+        MutationPath::ALL.len(),
+        12,
+        "the population is twelve &mut self methods"
+    );
+
+    for path in MutationPath::ALL {
+        let before = metrics.checked_for(path);
+        // Exercise the real method behind each path. The guard is what the
+        // fence gates; what the method then does is the engine's business.
+        let mut g = eng
+            .write(path)
+            .unwrap_or_else(|e| panic!("{} refused unexpectedly: {e}", path.as_str()));
+        match path {
+            MutationPath::AppendRecord => {
+                g.append_record(record(900)).unwrap();
+            }
+            MutationPath::AppendRecordReporting => {
+                g.append_record_reporting(record(901)).unwrap();
+            }
+            MutationPath::AppendWriterAssigned => {
+                g.append_writer_assigned(record(902)).unwrap();
+            }
+            MutationPath::AppendWriterAssignedReporting => {
+                g.append_writer_assigned_reporting(record(903)).unwrap();
+            }
+            MutationPath::TakeSyncHandles => {
+                let _ = g.take_sync_handles().unwrap();
+            }
+            MutationPath::SetFlushPolicy => {
+                g.set_flush_policy(ehdb_l0::FlushPolicy::CallerDriven);
+            }
+            MutationPath::FlushAndWaitUploads => {
+                g.flush_and_wait_uploads().unwrap();
+            }
+            MutationPath::SealAgedParts => {
+                let _ = g.seal_aged_parts().unwrap();
+            }
+            MutationPath::RunPendingMerges => {
+                let _ = g.run_pending_merges().unwrap();
+            }
+            MutationPath::ReclaimOrphans => {
+                let _ = g.reclaim_orphans().unwrap();
+            }
+            MutationPath::ApplyRetention => {
+                let _ = g.apply_retention(0).unwrap();
+            }
+            MutationPath::ApplyRetentionKeepLast => {
+                let _ = g.apply_retention_keep_last(u64::MAX).unwrap();
+            }
+        }
+        drop(g);
+        let after = metrics.checked_for(path);
+        assert_eq!(
+            after,
+            before + 1,
+            "path {} did not record its own check ({before} -> {after})",
+            path.as_str()
+        );
+    }
+
+    // Every path recorded at least once, and the total is their sum — so no
+    // path is quietly being counted under another's label.
+    let per_path: u64 = MutationPath::ALL
+        .iter()
+        .map(|p| metrics.checked_for(*p))
+        .sum();
+    let total = metrics
+        .writes_checked
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        per_path, total,
+        "per-path checks ({per_path}) must account for the total ({total})"
+    );
+    for p in MutationPath::ALL {
+        assert!(
+            metrics.checked_for(p) >= 1,
+            "path {} was never checked — coverage is 11 of 12",
+            p.as_str()
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
