@@ -305,3 +305,52 @@ fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// ⚠ `try_write` must distinguish "superseded" from "busy". A caller that
+/// conflated them would retry the one it must not.
+#[test]
+fn try_write_reports_refusal_as_err_and_contention_as_none() {
+    let dir = tmp("trywrite");
+    let ledger_root = dir.join(".fence");
+    let hi = EpochFence::new(
+        FenceMode::Enforce,
+        Some(FenceLedger::new(&ledger_root).unwrap()),
+        FenceMetrics::new(),
+    );
+    hi.set_epoch(5);
+    let w = Arc::new(FeedWriter::new_fenced(engine(&dir), hi, 0));
+    let eng = w.engine();
+
+    // Uncontended and fresh: Some(guard).
+    assert!(eng
+        .try_write(MutationPath::SealAgedParts)
+        .unwrap()
+        .is_some());
+
+    // Contended but fresh: Ok(None) — not an error.
+    let held = eng.write(MutationPath::AppendRecord).unwrap();
+    assert!(
+        eng.try_write(MutationPath::SealAgedParts)
+            .unwrap()
+            .is_none(),
+        "a held lock must be Ok(None), not Err"
+    );
+    assert!(eng.try_read().is_none(), "try_read must not block either");
+    drop(held);
+
+    // Superseded: Err, even though the lock is free.
+    let stale_dir = tmp("trywrite-stale");
+    let lo = EpochFence::new(
+        FenceMode::Enforce,
+        Some(FenceLedger::new(&ledger_root).unwrap()),
+        FenceMetrics::new(),
+    );
+    lo.set_epoch(4);
+    let sw = Arc::new(FeedWriter::new_fenced(engine(&stale_dir), lo, 0));
+    assert!(
+        sw.engine().try_write(MutationPath::SealAgedParts).is_err(),
+        "a superseded writer must be Err regardless of contention"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&stale_dir).ok();
+}

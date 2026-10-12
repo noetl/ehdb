@@ -138,6 +138,42 @@ impl<D: Dataset> FencedEngine<D> {
         })
     }
 
+    /// Read the engine **without blocking**, or `None` if the lock is held.
+    ///
+    /// ⚠⚠ This exists because a metrics handler must never park on the append
+    /// lock. `Mutex::lock()` blocks, and a `/metrics` scrape that waits for an
+    /// in-flight append is the ehdb#345 shape: the endpoint that is supposed to
+    /// report the writer's health becomes unavailable exactly when the writer is
+    /// busiest. `None` means "contended", which is a reportable fact; a blocked
+    /// thread is not.
+    pub fn try_read(&self) -> Option<EngineRead<'_, D>> {
+        match self.inner.try_lock() {
+            Ok(guard) => Some(EngineRead { guard }),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(EngineRead {
+                guard: p.into_inner(),
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Mutate without blocking, after the fence agrees.
+    ///
+    /// ⚠ The fence is consulted **first**, so a refused write reports `Err`
+    /// rather than `None` — "you are superseded" and "the lock is busy" are
+    /// different answers and a caller that conflated them would retry the one it
+    /// must not.
+    pub fn try_write(&self, path: MutationPath) -> Result<Option<EngineWrite<'_, D>>> {
+        let decision = self.fence.check(self.shard, path)?;
+        Ok(match self.inner.try_lock() {
+            Ok(guard) => Some(EngineWrite { guard, decision }),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(EngineWrite {
+                guard: p.into_inner(),
+                decision,
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        })
+    }
+
     /// ⚠ Poison is recovered rather than propagated. A panic while holding the
     /// engine lock must not convert into every subsequent append failing — the
     /// engine's own invariants are restored on open, and refusing all writes
