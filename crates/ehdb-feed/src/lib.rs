@@ -28,6 +28,7 @@
 
 pub mod claim;
 pub mod cursor;
+pub mod fenced_engine;
 pub mod group;
 pub mod groups;
 pub mod kv;
@@ -54,7 +55,7 @@ pub use subject::{Subject, SubjectFilter, SubjectFn};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ehdb_l0::{ChangeFeed, Dataset, FlushPolicy, L0Engine};
@@ -264,7 +265,7 @@ pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result
 /// and signals followers on every append. Wrap in an [`Arc`] and share one clone
 /// with [`serve`] and one with the appending control plane.
 pub struct FeedWriter<D: Dataset> {
-    engine: Arc<Mutex<L0Engine<D>>>,
+    engine: Arc<crate::fenced_engine::FencedEngine<D>>,
     tip_tx: watch::Sender<u64>,
     /// Set by [`seal_and_close`](FeedWriter::seal_and_close): the log has been
     /// sealed for shutdown and no further append may be *acked*.
@@ -310,17 +311,43 @@ where
     /// is still durable), but a batch of records that arrive together shares one
     /// `fsync` instead of paying one each — the group-commit fix for the command
     /// bus's dispatch latency (noetl/ai-meta#205).
-    pub fn new(mut engine: L0Engine<D>) -> Self {
+    /// Wrap an engine behind a **fence**, for a writer that holds an election
+    /// token (noetl/ai-meta#460).
+    ///
+    /// ⚠ [`Self::new`] stays unfenced and byte-identical to the previous
+    /// behaviour, so nothing changes for a caller that has no token to offer.
+    /// A fence with no token would refuse everything or nothing depending on the
+    /// ledger, and defaulting to either would be worse than being explicit.
+    pub fn new_fenced(
+        mut engine: L0Engine<D>,
+        fence: Arc<ehdb_core::fence::EpochFence>,
+        shard: u32,
+    ) -> Self {
         let tip = engine.global_sequence();
+        // ⚠ `set_flush_policy` is itself one of the twelve durable-mutation
+        // paths, and it is called here **unfenced** — deliberately. Construction
+        // happens before the writer is in service: there is no token yet, no
+        // concurrent writer to be superseded by, and a fence check against an
+        // epoch of 0 at this point would either refuse the writer's own boot or
+        // advance a marker on behalf of a writer that has not been elected.
+        // Noting it rather than leaving an apparent hole in the twelve.
         engine.set_flush_policy(FlushPolicy::CallerDriven);
         let (tip_tx, _rx) = watch::channel(tip);
         let metrics = engine.metrics();
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(crate::fenced_engine::FencedEngine::new(
+                engine, fence, shard,
+            )),
             tip_tx,
             closed: Arc::new(AtomicBool::new(false)),
             metrics,
         }
+    }
+
+    pub fn new(engine: L0Engine<D>) -> Self {
+        // One construction path: an unfenced writer is a fenced writer whose
+        // fence is `Off` — no ledger, no checks, no counters.
+        Self::new_fenced(engine, ehdb_core::fence::EpochFence::off(), 0)
     }
 
     /// Seal the active part for shutdown, wait for its upload, and **close the
@@ -355,8 +382,8 @@ where
         self.closed.store(true, Ordering::SeqCst);
         let mut engine = self
             .engine
-            .lock()
-            .map_err(|_| io_err("L0 engine mutex poisoned before the shutdown seal"))?;
+            .write(ehdb_core::fence::MutationPath::FlushAndWaitUploads)
+            .map_err(io_err)?;
         engine.flush_and_wait_uploads().map_err(io_err)
         // Lock released here — deliberately. `closed` is what holds the line
         // from this point on, and it does so without owning a thread.
@@ -384,7 +411,10 @@ where
         // Cheap pre-check: a sealed writer never even contends for the lock.
         self.ensure_open()?;
         let (seq, handles) = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self
+                .engine
+                .write(ehdb_core::fence::MutationPath::AppendRecord)
+                .map_err(io_err)?;
             // Re-check under the lock: the seal may have completed while this
             // appender was blocked on it. Without this the pre-check is a plain
             // TOCTOU and a record could still be acked into a post-seal part.
@@ -437,7 +467,10 @@ where
         }
         self.ensure_open()?;
         let (seqs, handles) = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self
+                .engine
+                .write(ehdb_core::fence::MutationPath::AppendRecordReporting)
+                .map_err(io_err)?;
             self.ensure_open()?;
             let mut seqs = Vec::with_capacity(records.len());
             for record in records {
@@ -465,7 +498,10 @@ where
         // Cheap pre-check: a sealed writer never even contends for the lock.
         self.ensure_open()?;
         let (seqs, handles) = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self
+                .engine
+                .write(ehdb_core::fence::MutationPath::AppendRecord)
+                .map_err(io_err)?;
             // Re-check under the lock — see `append` for why the pre-check
             // alone is not enough.
             self.ensure_open()?;
@@ -497,7 +533,7 @@ where
 
     /// A shared handle to the underlying engine — for flush / inspection in
     /// harnesses and (later) the writer's own compaction ticks.
-    pub fn engine(&self) -> Arc<Mutex<L0Engine<D>>> {
+    pub fn engine(&self) -> Arc<crate::fenced_engine::FencedEngine<D>> {
         Arc::clone(&self.engine)
     }
 
@@ -518,7 +554,12 @@ where
         self.tip_tx.subscribe()
     }
 
-    pub(crate) fn subscriber_handle(&self) -> (Arc<Mutex<L0Engine<D>>>, watch::Receiver<u64>) {
+    pub(crate) fn subscriber_handle(
+        &self,
+    ) -> (
+        Arc<crate::fenced_engine::FencedEngine<D>>,
+        watch::Receiver<u64>,
+    ) {
         (Arc::clone(&self.engine), self.tip_tx.subscribe())
     }
 }
@@ -587,7 +628,7 @@ where
 }
 
 async fn push_loop<D>(
-    engine: Arc<Mutex<L0Engine<D>>>,
+    engine: Arc<crate::fenced_engine::FencedEngine<D>>,
     mut rx: watch::Receiver<u64>,
     mut sock: TcpStream,
     req: SubscribeReq,
@@ -611,7 +652,7 @@ where
     }
     loop {
         let batch = {
-            let engine = engine.lock().unwrap();
+            let engine = engine.read();
             feed.poll(&engine).map_err(io_err)?
         };
         if !batch.is_empty() {

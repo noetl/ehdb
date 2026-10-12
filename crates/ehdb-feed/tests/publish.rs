@@ -54,7 +54,7 @@ async fn publish_rpc_returns_the_assigned_sort_key() {
         );
     }
     // The publishes are durable in the writer's log.
-    assert_eq!(w.engine().lock().unwrap().global_sequence(), 5);
+    assert_eq!(w.engine().read().global_sequence(), 5);
 
     for d in [&obj, &local] {
         let _ = std::fs::remove_dir_all(d);
@@ -151,8 +151,7 @@ async fn router_publishes_to_the_owning_shard() {
     for (shard, w) in writers.iter().enumerate() {
         let n = w
             .engine()
-            .lock()
-            .unwrap()
+            .read()
             .read_partition_after(shard as u32, 0)
             .unwrap()
             .len() as u64;

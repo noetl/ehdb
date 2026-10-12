@@ -239,7 +239,7 @@ where
         // The shard's current tip: the writer assigns strictly increasing keys, so
         // the global sequence is a sound "after now" watermark for any shard (same
         // basis as `ChangeFeed::tail`).
-        let tip = writer.engine().lock().unwrap().global_sequence();
+        let tip = writer.engine().read().global_sequence();
         let stored = store.load()?;
         let (from_cursor, origin) = match stored {
             // Clamped to the tip on purpose. The engine resumes from its durable
@@ -386,7 +386,7 @@ where
                 // std guard is ever held across an await.
                 let mut group = self.group.lock().await;
                 let engine = self.writer.engine();
-                let e = engine.lock().unwrap();
+                let e = engine.read();
                 group.poll_assign(&e, &filter, member, self.now_ticks())
             };
             match assigned {
@@ -422,7 +422,7 @@ where
     pub async fn lag(&self) -> u64 {
         let group = self.group.lock().await;
         let engine = self.writer.engine();
-        let e = engine.lock().unwrap();
+        let e = engine.read();
         group.lag(&e).unwrap_or(0)
     }
 
@@ -433,7 +433,7 @@ where
     pub async fn subject_lags(&self) -> Vec<crate::scaler::SubjectLag> {
         let group = self.group.lock().await;
         let engine = self.writer.engine();
-        let e = engine.lock().unwrap();
+        let e = engine.read();
         group
             .subject_lags(&e)
             .unwrap_or_default()
@@ -450,7 +450,7 @@ where
     pub async fn seed_subjects(&self) {
         let mut group = self.group.lock().await;
         let engine = self.writer.engine();
-        let e = engine.lock().unwrap();
+        let e = engine.read();
         let _ = group.seed_subjects(&e);
     }
 

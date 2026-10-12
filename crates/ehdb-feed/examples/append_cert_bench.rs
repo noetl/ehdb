@@ -141,7 +141,7 @@ mod imp {
         let total = t_all.elapsed();
 
         let snap = w.metrics().snapshot();
-        let absorbed = w.engine().lock().unwrap().chain_absorbed();
+        let absorbed = w.engine().read().chain_absorbed();
         let out = Run {
             events_per_sec: (batches * batch_size) as f64 / total.as_secs_f64(),
             per_event_p99_us: us(pct(samples, 0.99)) / batch_size as f64,

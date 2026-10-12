@@ -85,9 +85,12 @@ fn writer_over(local: &Path, obj: &Path) -> Arc<FeedWriter<D1EventLog>> {
 /// cursor is clamped to the reopened tip so it degrades to a small redelivery
 /// instead of a dark bus (see `resume_cursor_is_clamped_to_a_truncated_log`).
 fn graceful_shutdown(writer: &Arc<FeedWriter<D1EventLog>>) {
+    // ⚠ `.read()` cannot compile here, and that is the point: `flush_and_wait_uploads`
+    // takes `&mut`, so it is reachable only through `write()`, which consults the
+    // fence. The compiler rejected the read guard — coverage is structural.
     writer
         .engine()
-        .lock()
+        .write(ehdb_core::fence::MutationPath::FlushAndWaitUploads)
         .unwrap()
         .flush_and_wait_uploads()
         .unwrap();

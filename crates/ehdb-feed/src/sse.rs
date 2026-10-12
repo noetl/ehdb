@@ -25,9 +25,9 @@
 //! param > `0` (from the beginning).
 
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use ehdb_l0::{ChangeFeed, Dataset, L0Engine};
+use ehdb_l0::{ChangeFeed, Dataset};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -123,7 +123,7 @@ where
 }
 
 async fn stream_events<D>(
-    engine: Arc<Mutex<L0Engine<D>>>,
+    engine: Arc<crate::fenced_engine::FencedEngine<D>>,
     mut rx: watch::Receiver<u64>,
     mut sock: tokio::net::TcpStream,
     shard: u32,
@@ -145,7 +145,7 @@ where
     let mut feed = ChangeFeed::new(shard, cursor);
     loop {
         let batch = {
-            let engine = engine.lock().unwrap();
+            let engine = engine.read();
             feed.poll(&engine).map_err(io_err)?
         };
         if !batch.is_empty() {

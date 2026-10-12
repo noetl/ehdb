@@ -228,7 +228,7 @@ where
     /// The shard's current tip, used to clamp a resumed cursor.
     fn tip(&self) -> u64 {
         let engine = self.writer.engine();
-        let e = engine.lock().unwrap();
+        let e = engine.read();
         e.global_sequence()
     }
 
@@ -275,7 +275,7 @@ where
             // Seed the reported subject set so per-subject lag has its full label
             // set from the first scrape rather than only after traffic arrives.
             let engine = self.writer.engine();
-            let e = engine.lock().unwrap();
+            let e = engine.read();
             let _ = g.seed_subjects(&e);
         }
         let handle = OpenGroup {
@@ -306,7 +306,7 @@ where
                 // std guard is ever held across an await.
                 let mut g = handle.group.lock().await;
                 let engine = self.writer.engine();
-                let e = engine.lock().unwrap();
+                let e = engine.read();
                 g.poll_assign(&e, &filter, member, self.now_ticks())
             };
             match assigned {
@@ -353,7 +353,7 @@ where
         let handle = self.handle(group).await;
         let g = handle.group.lock().await;
         let engine = self.writer.engine();
-        let e = engine.lock().unwrap();
+        let e = engine.read();
         g.lag(&e).unwrap_or(0)
     }
 
@@ -378,7 +378,7 @@ where
         for (name, handle) in groups {
             let g = handle.group.lock().await;
             let engine = self.writer.engine();
-            let e = engine.lock().unwrap();
+            let e = engine.read();
             out.push((name, g.committed_cursor(), g.lag(&e).unwrap_or(0)));
         }
         out

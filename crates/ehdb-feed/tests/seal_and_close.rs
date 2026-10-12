@@ -131,7 +131,7 @@ async fn an_append_after_the_seal_is_refused_not_lost() {
     for id in 1..=8 {
         writer.append(ev(id)).unwrap();
     }
-    let sealed_at = writer.engine().lock().unwrap().global_sequence();
+    let sealed_at = writer.engine().read().global_sequence();
 
     writer.seal_and_close().unwrap();
     assert!(writer.is_closed());
@@ -190,7 +190,7 @@ fn a_sealed_writer_does_not_starve_the_runtime() {
     );
 
     // The log must reopen at exactly what was acked: nothing below the tip.
-    let sealed_at = writer.engine().lock().unwrap().global_sequence();
+    let sealed_at = writer.engine().read().global_sequence();
     drop(writer);
     rt.shutdown_timeout(Duration::from_secs(5));
     assert_eq!(
@@ -227,7 +227,9 @@ fn negative_control_the_leaked_guard_starves_the_runtime() {
     // THE ONE LINE. The pre-#226 seal: take the engine lock and hold it forever.
     let engine = writer.engine();
     std::thread::spawn(move || {
-        let mut guard = engine.lock().unwrap();
+        let mut guard = engine
+            .write(ehdb_core::fence::MutationPath::FlushAndWaitUploads)
+            .unwrap();
         guard.flush_and_wait_uploads().unwrap();
         std::mem::forget(guard);
     })
