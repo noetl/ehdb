@@ -119,7 +119,7 @@ async fn a_resumed_coordinator_reports_its_own_restart() {
             .append(EventRecord::new(seq, format!("e{seq}"), "t", "cmd"))
             .unwrap();
     }
-    let tip = writer.engine().lock().unwrap().global_sequence();
+    let tip = writer.engine().read().global_sequence();
 
     // Nothing persisted yet → tail fallback, and nothing replays.
     let store = CursorStore::open(&local, 0).unwrap();
@@ -168,7 +168,7 @@ async fn a_replaying_restart_is_reported_as_a_replay() {
             .append(EventRecord::new(seq, format!("e{seq}"), "t", "cmd"))
             .unwrap();
     }
-    let tip = writer.engine().lock().unwrap().global_sequence();
+    let tip = writer.engine().read().global_sequence();
 
     let coord = ClaimCoordinator::resume(
         writer.clone(),

@@ -38,7 +38,7 @@ async fn tip_receiver_wakes_an_in_process_consumer() {
         let mut got: Vec<u64> = Vec::new();
         while got.len() < 5 {
             let batch = {
-                let e = engine_arc.lock().unwrap();
+                let e = engine_arc.read();
                 feed.poll(&e).unwrap()
             };
             if batch.is_empty() {

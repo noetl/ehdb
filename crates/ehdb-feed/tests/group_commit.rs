@@ -72,7 +72,7 @@ async fn append_batch_keys_ascending_and_matches_one_at_a_time() {
         "assigned keys strictly ascend across a batch: {keys:?}"
     );
     assert_eq!(
-        w.engine().lock().unwrap().global_sequence(),
+        w.engine().read().global_sequence(),
         5,
         "the shard tip advanced by exactly the batch size"
     );
@@ -99,7 +99,7 @@ async fn batched_records_are_on_disk_when_the_keys_return() {
     // keys come back — group commit `fsync`s *before* returning, it does not
     // defer the sync past the acknowledgement.
     let engine = w.engine();
-    let records = engine.lock().unwrap().read_partition_after(0, 0).unwrap();
+    let records = engine.read().read_partition_after(0, 0).unwrap();
     assert_eq!(
         records.len(),
         200,
@@ -163,7 +163,7 @@ async fn pipelined_publish_returns_each_callers_own_key() {
 
     // And the log itself holds all N, ascending.
     let engine = w.engine();
-    let stored = engine.lock().unwrap().read_partition_after(0, 0).unwrap();
+    let stored = engine.read().read_partition_after(0, 0).unwrap();
     assert_eq!(
         stored.len() as u64,
         N,
@@ -174,12 +174,7 @@ async fn pipelined_publish_returns_each_callers_own_key() {
     // its shard's tail, which is the loss class #203 fixed and the one a batched
     // or pipelined write path could plausibly reintroduce.
     assert_eq!(
-        engine
-            .lock()
-            .unwrap()
-            .metrics()
-            .snapshot()
-            .out_of_order_appends,
+        engine.read().metrics().snapshot().out_of_order_appends,
         0,
         "no out-of-order append under concurrent pipelined publish"
     );

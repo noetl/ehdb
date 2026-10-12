@@ -52,7 +52,7 @@ fn appending_through_the_feed_writer_produces_a_certificate() {
     w.append_batch(batch).expect("append_batch");
 
     let engine = w.engine();
-    let guard = engine.lock().unwrap();
+    let guard = engine.read();
     assert_eq!(
         guard.chain_absorbed(),
         24,
@@ -79,7 +79,7 @@ fn the_flag_off_leaves_the_path_completely_inert() {
     w.append_batch(batch).expect("append_batch");
 
     let engine = w.engine();
-    let guard = engine.lock().unwrap();
+    let guard = engine.read();
     assert_eq!(
         guard.chain_absorbed(),
         0,
@@ -153,7 +153,7 @@ fn separate_executions_get_separate_chains_through_the_writer() {
     w.append_batch(batch).expect("append_batch");
 
     let engine = w.engine();
-    let guard = engine.lock().unwrap();
+    let guard = engine.read();
     let a = guard.chain_certificate("exec-a").expect("exec-a sealed");
     let b = guard.chain_certificate("exec-b").expect("exec-b sealed");
     assert_eq!(a.chain_len, 16);

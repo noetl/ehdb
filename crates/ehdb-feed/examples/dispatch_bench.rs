@@ -198,7 +198,7 @@ async fn run_cell(cell: &Cell, records: usize, root: &std::path::Path) {
         writer.clone(),
         0,
         Duration::from_secs(15),
-        writer.engine().lock().unwrap().global_sequence(),
+        writer.engine().read().global_sequence(),
         ehdb_feed::d1_command_subject(1),
     ));
     let claim = TcpListener::bind("127.0.0.1:0").await.unwrap();
