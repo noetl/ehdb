@@ -222,13 +222,33 @@ fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
     let eng = w.engine();
 
     // The denominator, printed rather than assumed.
+    // Two populations, both printed. ENGINE is what this gate can exercise;
+    // ALL is everything the fence labels. The difference must be exactly the
+    // paths that are deliberately covered elsewhere — today just PersistCursor,
+    // whose gate is `cursor::fence_tests`. A new path lands in neither set by
+    // accident: this fails until it is classified.
+    assert_eq!(
+        MutationPath::ENGINE.len(),
+        12,
+        "the engine population is twelve &mut self methods"
+    );
     assert_eq!(
         MutationPath::ALL.len(),
-        12,
-        "the population is twelve &mut self methods"
+        MutationPath::ENGINE.len() + 1,
+        "ALL minus ENGINE must be the one non-engine path"
+    );
+    let non_engine: Vec<_> = MutationPath::ALL
+        .iter()
+        .filter(|p| !MutationPath::ENGINE.contains(p))
+        .map(|p| p.as_str())
+        .collect();
+    assert_eq!(
+        non_engine,
+        vec!["persist_cursor"],
+        "a non-engine path must be covered by its own gate, not skipped here"
     );
 
-    for path in MutationPath::ALL {
+    for path in MutationPath::ENGINE {
         let before = metrics.checked_for(path);
         // Exercise the real method behind each path. The guard is what the
         // fence gates; what the method then does is the engine's business.
@@ -272,6 +292,12 @@ fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
             MutationPath::ApplyRetentionKeepLast => {
                 let _ = g.apply_retention_keep_last(u64::MAX).unwrap();
             }
+            // Not an engine method; its fence gate lives in
+            // `ehdb-feed/src/cursor.rs::fence_tests`. Reaching it here would
+            // mean the ENGINE/ALL split above is wrong.
+            MutationPath::PersistCursor => {
+                unreachable!("persist_cursor is not an L0Engine path")
+            }
         }
         drop(g);
         let after = metrics.checked_for(path);
@@ -285,7 +311,7 @@ fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
 
     // Every path recorded at least once, and the total is their sum — so no
     // path is quietly being counted under another's label.
-    let per_path: u64 = MutationPath::ALL
+    let per_path: u64 = MutationPath::ENGINE
         .iter()
         .map(|p| metrics.checked_for(*p))
         .sum();
@@ -296,13 +322,26 @@ fn all_twelve_mutation_paths_are_fenced_and_counted_individually() {
         per_path, total,
         "per-path checks ({per_path}) must account for the total ({total})"
     );
-    for p in MutationPath::ALL {
+    for p in MutationPath::ENGINE {
         assert!(
             metrics.checked_for(p) >= 1,
-            "path {} was never checked — coverage is 11 of 12",
-            p.as_str()
+            "engine path {} was never checked — coverage is {} of {}",
+            p.as_str(),
+            MutationPath::ENGINE
+                .iter()
+                .filter(|q| metrics.checked_for(**q) >= 1)
+                .count(),
+            MutationPath::ENGINE.len()
         );
     }
+    // ⚠ And the non-engine path must NOT have been touched by this gate — if it
+    // were, this test would be silently claiming credit for coverage it does not
+    // provide.
+    assert_eq!(
+        metrics.checked_for(MutationPath::PersistCursor),
+        0,
+        "persist_cursor is not driven here; its gate is cursor::fence_tests"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

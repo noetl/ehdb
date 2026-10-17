@@ -78,7 +78,8 @@ impl FenceMode {
     }
 }
 
-/// The durable-mutation paths, one per `&mut self` method on `L0Engine`.
+/// The durable-mutation paths: one per `&mut self` method on `L0Engine`, plus
+/// `PersistCursor`, which is durable writer state that is not on the engine.
 ///
 /// ⚠ This list is a **label set**, not the coverage guarantee. Coverage comes
 /// from `&mut` being unobtainable without a fence check. What this buys is a
@@ -100,13 +101,53 @@ pub enum MutationPath {
     ReclaimOrphans,
     ApplyRetention,
     ApplyRetentionKeepLast,
+    /// Persisting a claim group's committed cursor (`CursorStore::store`).
+    ///
+    /// ⚠ Not an L0-engine path — the only one here that is not. It is included
+    /// because the cursor file is durable state on the writer's own volume, in
+    /// the same durability domain as the log, and a superseded writer can rewind
+    /// it. `CursorStore` guards `store` with a per-process `AtomicU64`
+    /// high-water mark that starts at 0 and is never seeded from the file, so its
+    /// documented invariant — "a late/duplicate call can never rewind durable
+    /// progress" — holds only within one process's lifetime. A second instance
+    /// begins at 0 and will happily write a lower cursor over a higher one.
+    ///
+    /// Rewinding a committed cursor re-delivers commands that were already
+    /// acked, which is the failure the fence exists to prevent.
+    PersistCursor,
 }
 
 impl MutationPath {
     /// Every path, in a fixed order. ⭐ The denominator the kind validation
     /// prints: a coverage claim without the population it measured is not a
     /// finding.
-    pub const ALL: [MutationPath; 12] = [
+    pub const ALL: [MutationPath; 13] = [
+        Self::AppendRecord,
+        Self::AppendRecordReporting,
+        Self::AppendWriterAssigned,
+        Self::AppendWriterAssignedReporting,
+        Self::TakeSyncHandles,
+        Self::SetFlushPolicy,
+        Self::FlushAndWaitUploads,
+        Self::SealAgedParts,
+        Self::RunPendingMerges,
+        Self::ReclaimOrphans,
+        Self::ApplyRetention,
+        Self::ApplyRetentionKeepLast,
+        Self::PersistCursor,
+    ];
+
+    /// The subset that is an `L0Engine` `&mut self` method.
+    ///
+    /// ⚠ Kept separate from [`ALL`](Self::ALL) because the engine-coverage gate
+    /// exercises each path through `FencedEngine::write`, and a path that is not
+    /// an engine method cannot be reached that way. Splitting the population is
+    /// the honest fix; widening the gate to "iterate ALL and skip what does not
+    /// fit" would make it pass for a path nothing covers.
+    ///
+    /// `ALL.len() == ENGINE.len() + 1` is asserted in the coverage test, so
+    /// adding a path forces an explicit decision about which set it joins.
+    pub const ENGINE: [MutationPath; 12] = [
         Self::AppendRecord,
         Self::AppendRecordReporting,
         Self::AppendWriterAssigned,
@@ -139,6 +180,7 @@ impl MutationPath {
             Self::ReclaimOrphans => "reclaim_orphans",
             Self::ApplyRetention => "apply_retention",
             Self::ApplyRetentionKeepLast => "apply_retention_keep_last",
+            Self::PersistCursor => "persist_cursor",
         }
     }
 }
@@ -159,8 +201,8 @@ pub struct FenceMetrics {
     pub stale_observed: AtomicU64,
     pub stale_refused: AtomicU64,
     pub epoch_advances: AtomicU64,
-    checked_by_path: [AtomicU64; 12],
-    refused_by_path: [AtomicU64; 12],
+    checked_by_path: [AtomicU64; 13],
+    refused_by_path: [AtomicU64; 13],
 }
 
 impl FenceMetrics {
@@ -582,7 +624,15 @@ mod tests {
 
         // Every label pinned, so absence never masquerades as zero.
         let text = f.metrics().render_prometheus(FenceMode::Shadow);
-        assert_eq!(MutationPath::ALL.len(), 12, "the denominator is 12 paths");
+        // The denominator is printed, and the ENGINE/ALL split is asserted here
+        // too so a new path cannot land in neither set: 12 engine paths plus the
+        // non-engine `persist_cursor`.
+        assert_eq!(MutationPath::ENGINE.len(), 12, "engine paths");
+        assert_eq!(
+            MutationPath::ALL.len(),
+            MutationPath::ENGINE.len() + 1,
+            "the denominator is every labelled path, engine or not"
+        );
         for p in MutationPath::ALL {
             assert!(
                 text.contains(&format!(
@@ -618,10 +668,13 @@ mod tests {
         );
         let mut idx: Vec<usize> = MutationPath::ALL.iter().map(|p| p.index()).collect();
         idx.sort_unstable();
+        // Derived from the population rather than restated as a literal: a
+        // hardcoded bound makes this fail on every new path for the wrong
+        // reason, which trains the next reader to just bump the number.
         assert_eq!(
             idx,
-            (0..12).collect::<Vec<_>>(),
-            "indices must be a bijection"
+            (0..MutationPath::ALL.len()).collect::<Vec<_>>(),
+            "indices must be a bijection over ALL"
         );
     }
 }
