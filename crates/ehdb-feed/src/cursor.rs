@@ -35,6 +35,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use ehdb_core::fence::{EpochFence, MutationPath};
 
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +77,21 @@ pub struct CursorStore {
     /// (noetl/ai-meta#216). Serialising here is cheap — the critical section is
     /// already `fsync`-bound and a lost cursor write only costs replay.
     write_lock: std::sync::Mutex<()>,
+    /// The stale-writer fence, when one is installed.
+    ///
+    /// `None` by default, so an un-fenced `CursorStore` behaves exactly as it did
+    /// before this existed — the whole point, since the bus runs this path on
+    /// every ack and a fence that is wrong here costs replay on every restart.
+    ///
+    /// ⚠ Why this path needs a fence at all: the monotonic guard above is
+    /// `written`, a per-process `AtomicU64` that starts at 0 and is never seeded
+    /// from the file. So "a late/duplicate call can never rewind durable
+    /// progress" is true only within one process's lifetime. A second instance —
+    /// another writer that still has the volume — starts at 0 and will write a
+    /// lower cursor over a higher one, re-delivering commands that were already
+    /// acked. `tests::a_second_store_rewinds_the_file_without_a_fence` pins that
+    /// behaviour so the gap cannot be closed by accident and go unnoticed.
+    fence: Option<Arc<EpochFence>>,
 }
 
 impl CursorStore {
@@ -88,6 +106,7 @@ impl CursorStore {
             shard,
             written: AtomicU64::new(0),
             write_lock: std::sync::Mutex::new(()),
+            fence: None,
         })
     }
 
@@ -119,7 +138,22 @@ impl CursorStore {
             shard,
             written: AtomicU64::new(0),
             write_lock: std::sync::Mutex::new(()),
+            fence: None,
         })
+    }
+
+    /// Install the stale-writer fence this store checks before each persist.
+    ///
+    /// Off unless called, and the fence itself has its own off/shadow/enforce
+    /// mode, so arming is two deliberate steps rather than one.
+    pub fn with_fence(mut self, fence: Arc<EpochFence>) -> Self {
+        self.fence = Some(fence);
+        self
+    }
+
+    /// The fence installed on this store, if any.
+    pub fn fence(&self) -> Option<&Arc<EpochFence>> {
+        self.fence.as_ref()
     }
 
     /// The file this store persists to.
@@ -154,6 +188,21 @@ impl CursorStore {
     /// advance, so a late/duplicate call can never rewind durable progress).
     /// Returns `true` when the file was rewritten.
     pub fn store(&self, cursor: u64) -> io::Result<bool> {
+        // ⚠ The fence runs FIRST, before `fetch_max`, and the order is
+        // load-bearing rather than stylistic. `fetch_max` mutates the in-memory
+        // high-water mark whether or not the write goes on to happen, so
+        // checking after it would leave a REFUSED call having raised `written`
+        // to `cursor` — and the next call from the legitimate writer, carrying
+        // that same value, would then take the `>= cursor` early return and
+        // persist nothing. A refusal would silently suppress the write that
+        // should have replaced it. `tests::a_refusal_does_not_poison_the_high_water_mark`
+        // pins this; moving the check below `fetch_max` fails it.
+        if let Some(fence) = self.fence.as_ref() {
+            fence
+                .check(self.shard, MutationPath::PersistCursor)
+                .map_err(crate::io_err)?;
+        }
+
         // `fetch_max` returns the previous value; skip the write when it was
         // already at or past `cursor`.
         if self.written.fetch_max(cursor, Ordering::Relaxed) >= cursor {
@@ -446,5 +495,182 @@ mod t216_concurrency_tests {
             "per-group temp paths must not collide"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use ehdb_core::fence::{FenceLedger, FenceMetrics, FenceMode};
+
+    fn dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "ehdb-cursor-fence-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn fence(root: &Path, mode: FenceMode, epoch: u64) -> Arc<EpochFence> {
+        let f = EpochFence::new(
+            mode,
+            Some(FenceLedger::new(root).unwrap()),
+            FenceMetrics::new(),
+        );
+        f.set_epoch(epoch);
+        f
+    }
+
+    /// Default is OFF: no fence installed, behaviour unchanged.
+    #[test]
+    fn an_unfenced_store_is_unchanged() {
+        let d = dir("off");
+        let store = CursorStore::open(&d, 0).unwrap();
+        assert!(store.fence().is_none(), "no fence unless installed");
+        assert!(store.store(10).unwrap());
+        assert_eq!(store.load().unwrap(), Some(10));
+    }
+
+    /// ⭐ THE GAP, characterised. `store_is_monotonic` proves one store cannot
+    /// rewind itself. This proves a SECOND store can rewind the file — which is
+    /// the superseded-writer case, and the reason this path needs the fence.
+    ///
+    /// The monotonic guard is `written`, a per-process `AtomicU64` that starts at
+    /// 0 and is never seeded from the file, so the second instance does not know
+    /// 1000 was ever written.
+    #[test]
+    fn a_second_store_rewinds_the_file_without_a_fence() {
+        let d = dir("rewind");
+        let first = CursorStore::open(&d, 0).unwrap();
+        assert!(first.store(1_000).unwrap());
+        assert_eq!(first.load().unwrap(), Some(1_000));
+
+        // A second instance on the same volume — another writer process.
+        let second = CursorStore::open(&d, 0).unwrap();
+        assert!(
+            second.store(500).unwrap(),
+            "the second store writes, because its own high-water mark is 0"
+        );
+        assert_eq!(
+            second.load().unwrap(),
+            Some(500),
+            "durable progress REWOUND from 1000 to 500 — acked commands will be re-delivered"
+        );
+    }
+
+    /// With the fence enforcing, the superseded writer is refused and the file
+    /// keeps the fresher value.
+    #[test]
+    fn an_enforcing_fence_refuses_a_superseded_writer() {
+        let d = dir("enforce");
+        let led = d.join("ledger");
+        let f_old = fence(&led, FenceMode::Enforce, 1);
+        let f_new = fence(&led, FenceMode::Enforce, 2);
+
+        let old = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_old));
+        let new = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_new));
+
+        assert!(old.store(100).unwrap(), "epoch 1 is fresh at this point");
+        assert!(new.store(1_000).unwrap(), "epoch 2 supersedes it");
+
+        let err = old
+            .store(500)
+            .expect_err("the superseded writer must be refused");
+        assert!(
+            err.to_string().contains("stale epoch") && err.to_string().contains("persist_cursor"),
+            "the refusal must name the path: {err}"
+        );
+        assert_eq!(
+            new.load().unwrap(),
+            Some(1_000),
+            "and the rewind must not have happened"
+        );
+        assert_eq!(f_old.metrics().refused_for(MutationPath::PersistCursor), 1);
+    }
+
+    /// ⭐ The check runs BEFORE `fetch_max`, and this is what proves it.
+    ///
+    /// A writer that loses the token and then WINS IT BACK is ordinary — prod's
+    /// lease shows `leaseTransitions` moving more than once. If the fence check
+    /// sat after `fetch_max`, the refused call would have raised `written` to
+    /// 2000, and the re-elected writer's retry of that same cursor would take the
+    /// `>= cursor` early return and persist NOTHING: a silent hole where the
+    /// refusal suppressed the write that should have replaced it.
+    #[test]
+    fn a_refusal_does_not_poison_the_high_water_mark() {
+        let d = dir("poison");
+        let led = d.join("ledger");
+        let mine = fence(&led, FenceMode::Enforce, 1);
+        let other = fence(&led, FenceMode::Enforce, 2);
+
+        let store = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&mine));
+        let theirs = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&other));
+
+        assert!(theirs.store(1_000).unwrap());
+        store
+            .store(2_000)
+            .expect_err("superseded at epoch 1, so refused");
+
+        // Re-elected at a higher epoch, and retrying the SAME cursor.
+        mine.set_epoch(3);
+        assert!(
+            store.store(2_000).unwrap(),
+            "the refused attempt must not have consumed this cursor"
+        );
+        assert_eq!(store.load().unwrap(), Some(2_000));
+    }
+
+    /// Shadow counts the check and refuses nothing — so arming is observable
+    /// before it is enforcing.
+    #[test]
+    fn shadow_counts_without_refusing() {
+        let d = dir("shadow");
+        let led = d.join("ledger");
+        let f_old = fence(&led, FenceMode::Shadow, 1);
+        let f_new = fence(&led, FenceMode::Shadow, 2);
+        let old = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_old));
+        let new = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_new));
+
+        assert!(new.store(1_000).unwrap());
+        assert!(
+            old.store(500).is_ok(),
+            "shadow observes and reports; it does not refuse"
+        );
+        assert_eq!(f_old.metrics().checked_for(MutationPath::PersistCursor), 1);
+        assert_eq!(f_old.metrics().refused_for(MutationPath::PersistCursor), 0);
+        assert!(f_old.metrics().stale_observed.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// The label must be pinned, or `path="persist_cursor"` is absent from a
+    /// scrape until the first refusal — indistinguishable from a build that does
+    /// not fence this path at all.
+    #[test]
+    fn persist_cursor_is_pinned_in_the_label_set() {
+        assert_eq!(
+            MutationPath::ALL.len(),
+            13,
+            "the denominator this coverage claim is measured against"
+        );
+        assert!(MutationPath::ALL.contains(&MutationPath::PersistCursor));
+        let rendered = FenceMetrics::new().render_prometheus(FenceMode::Enforce);
+        assert!(
+            rendered.contains("path=\"persist_cursor\""),
+            "absent is not zero: {rendered}"
+        );
     }
 }
