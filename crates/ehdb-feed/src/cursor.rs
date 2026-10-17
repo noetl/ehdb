@@ -198,7 +198,8 @@ impl CursorStore {
         // should have replaced it. `tests::a_refusal_does_not_poison_the_high_water_mark`
         // pins this; moving the check below `fetch_max` fails it.
         if let Some(fence) = self.fence.as_ref() {
-            fence.check(self.shard, MutationPath::PersistCursor)
+            fence
+                .check(self.shard, MutationPath::PersistCursor)
                 .map_err(crate::io_err)?;
         }
 
@@ -569,8 +570,12 @@ mod fence_tests {
         let f_old = fence(&led, FenceMode::Enforce, 1);
         let f_new = fence(&led, FenceMode::Enforce, 2);
 
-        let old = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&f_old));
-        let new = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&f_new));
+        let old = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_old));
+        let new = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_new));
 
         assert!(old.store(100).unwrap(), "epoch 1 is fresh at this point");
         assert!(new.store(1_000).unwrap(), "epoch 2 supersedes it");
@@ -579,8 +584,7 @@ mod fence_tests {
             .store(500)
             .expect_err("the superseded writer must be refused");
         assert!(
-            err.to_string().contains("stale epoch")
-                && err.to_string().contains("persist_cursor"),
+            err.to_string().contains("stale epoch") && err.to_string().contains("persist_cursor"),
             "the refusal must name the path: {err}"
         );
         assert_eq!(
@@ -606,8 +610,12 @@ mod fence_tests {
         let mine = fence(&led, FenceMode::Enforce, 1);
         let other = fence(&led, FenceMode::Enforce, 2);
 
-        let store = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&mine));
-        let theirs = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&other));
+        let store = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&mine));
+        let theirs = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&other));
 
         assert!(theirs.store(1_000).unwrap());
         store
@@ -631,8 +639,12 @@ mod fence_tests {
         let led = d.join("ledger");
         let f_old = fence(&led, FenceMode::Shadow, 1);
         let f_new = fence(&led, FenceMode::Shadow, 2);
-        let old = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&f_old));
-        let new = CursorStore::open(&d, 0).unwrap().with_fence(Arc::clone(&f_new));
+        let old = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_old));
+        let new = CursorStore::open(&d, 0)
+            .unwrap()
+            .with_fence(Arc::clone(&f_new));
 
         assert!(new.store(1_000).unwrap());
         assert!(
@@ -662,4 +674,3 @@ mod fence_tests {
         );
     }
 }
-
