@@ -82,6 +82,23 @@ pub trait DurableSubstrate: Send + Sync {
     /// cold-load).
     fn get_all(&self, key: &str) -> Result<Vec<u8>>;
 
+    /// The byte length of the object at `key`, WITHOUT fetching its bytes.
+    ///
+    /// ⚠ The default implementation does fetch them, so every existing
+    /// implementation keeps compiling unchanged — including the out-of-tree
+    /// `GcsSubstrate` in noetl/server. That default is a fallback, not the
+    /// intent: a substrate whose backing store can answer a size cheaply should
+    /// override it, and the two in this file do.
+    ///
+    /// Added for noetl/ehdb#395: `reclaim_orphans` read every orphan IN FULL
+    /// purely to populate a byte counter, immediately before deleting it. On a
+    /// local substrate that is a wasted file read; on a remote one it is a full
+    /// download per orphan (measured GCS get p50 77 ms, p95 139 ms) of an object
+    /// that is about to be thrown away.
+    fn object_size(&self, key: &str) -> Result<u64> {
+        Ok(self.get_all(key)?.len() as u64)
+    }
+
     /// Whether an object exists at `key`.
     fn exists(&self, key: &str) -> Result<bool>;
 
@@ -191,6 +208,13 @@ impl DurableSubstrate for LocalFsSubstrate {
         fs::read(&target).map_err(|err| EhdbError::Storage(err.to_string()))
     }
 
+    fn object_size(&self, key: &str) -> Result<u64> {
+        let target = self.resolve(key)?;
+        fs::metadata(&target)
+            .map(|m| m.len())
+            .map_err(|err| EhdbError::Storage(err.to_string()))
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.resolve(key)?.exists())
     }
@@ -273,6 +297,13 @@ pub struct SubstrateCounters {
     /// precisely that blind spot. A counter that cannot see an operation makes
     /// every claim about that operation vacuous.
     pub list_prefix_calls: AtomicU64,
+    /// Number of `object_size` calls (sizing an object without fetching it).
+    ///
+    /// ⚠ Counted for the same reason `list_prefix_calls` is: an operation this
+    /// instrument cannot see makes every claim about it vacuous. Without it, "the
+    /// reclaim issues no downloads" would be provable while the reclaim issued a
+    /// different unmeasured storage call instead.
+    pub object_size_calls: AtomicU64,
 }
 
 /// A transparent [`DurableSubstrate`] wrapper that records per-key I/O and can
@@ -376,6 +407,15 @@ impl<S: DurableSubstrate> DurableSubstrate for CountingSubstrate<S> {
         Ok(bytes)
     }
 
+    fn object_size(&self, key: &str) -> Result<u64> {
+        self.counters
+            .object_size_calls
+            .fetch_add(1, Ordering::Relaxed);
+        // Forwarded, NOT defaulted: the default would call `get_all` on the inner
+        // substrate and the whole point is that no bytes move.
+        self.inner.object_size(key)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         self.inner.exists(key)
     }
@@ -424,6 +464,10 @@ impl DurableSubstrate for Arc<dyn DurableSubstrate> {
     fn get_all(&self, key: &str) -> Result<Vec<u8>> {
         (**self).get_all(key)
     }
+    fn object_size(&self, key: &str) -> Result<u64> {
+        (**self).object_size(key)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         (**self).exists(key)
     }
@@ -588,6 +632,15 @@ impl DurableSubstrate for InMemorySubstrate {
             .unwrap()
             .get(key)
             .cloned()
+            .ok_or_else(|| EhdbError::NotFound(format!("substrate object {key}")))
+    }
+
+    fn object_size(&self, key: &str) -> Result<u64> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|b| b.len() as u64)
             .ok_or_else(|| EhdbError::NotFound(format!("substrate object {key}")))
     }
 

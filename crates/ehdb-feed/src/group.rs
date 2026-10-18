@@ -58,6 +58,19 @@ pub struct ShardConsumerGroup<D: Dataset> {
     pending: VecDeque<D::Record>,
     /// Delivered-but-unacked, keyed by sort key (ascending).
     inflight: BTreeMap<u64, InFlight<D::Record>>,
+    /// Lower bound on the earliest `deadline` in [`Self::inflight`] — the O(1)
+    /// reject that keeps redelivery off the per-poll hot path.
+    ///
+    /// ⚠ The invariant is deliberately one-sided: this may be LOWER than the true
+    /// minimum, never higher. Too low only costs an unnecessary scan; too high
+    /// would skip a record that is genuinely due and break at-least-once. So it is
+    /// lowered on insert and on `expire_now`, and never raised except by a scan
+    /// that walked every entry and found nothing expired — which has, by then,
+    /// computed the true minimum for free. Forgetting to update it cannot make it
+    /// unsafe, which is why this is a cached bound rather than a second
+    /// deadline-ordered index that a missed call site could desynchronise
+    /// (noetl/ehdb#388).
+    earliest_deadline: u64,
     /// Highest sort key ever pulled from the feed.
     delivered_frontier: u64,
 }
@@ -77,6 +90,7 @@ where
             feed: ChangeFeed::new(shard, from_cursor),
             pending: VecDeque::new(),
             inflight: BTreeMap::new(),
+            earliest_deadline: u64::MAX,
             delivered_frontier: from_cursor,
         }
     }
@@ -111,11 +125,37 @@ where
         self.refill(engine)?;
 
         // 1. Redelivery: the lowest-sort-key in-flight record past its deadline.
-        let expired = self
-            .inflight
-            .iter()
-            .find(|(_, f)| f.deadline <= now)
-            .map(|(&sk, _)| sk);
+        //
+        // ⚠ Still the LOWEST SORT KEY among expired, not the earliest deadline.
+        // A deadline-ordered index would be cheaper but would change which record
+        // redelivers when several are due, and delivery order is observable.
+        // `earliest_deadline` only decides whether the scan can be SKIPPED; when
+        // it cannot, the scan below is byte-for-byte the original one.
+        let expired = if self.earliest_deadline > now {
+            // Nothing can be due, so the common case costs one comparison rather
+            // than a walk of every in-flight entry (noetl/ehdb#388: a consumer
+            // holding k records paid O(k) per delivery, making a lazily-acking
+            // drain O(n^2) — measured at 2.86x SLOWER for doing strictly less
+            // work).
+            None
+        } else {
+            let mut found = None;
+            let mut min_deadline = u64::MAX;
+            for (&sk, f) in &self.inflight {
+                if f.deadline <= now {
+                    found = Some(sk);
+                    break;
+                }
+                min_deadline = min_deadline.min(f.deadline);
+            }
+            if found.is_none() {
+                // This scan visited every entry without short-circuiting, so
+                // `min_deadline` is the true minimum: safe to raise the bound,
+                // and it restores the fast path for subsequent polls.
+                self.earliest_deadline = min_deadline;
+            }
+            found
+        };
         if let Some(sk) = expired {
             let f = self.inflight.get_mut(&sk).unwrap();
             f.member = member;
@@ -132,12 +172,15 @@ where
         // 2. Fresh: the next never-delivered record.
         if let Some(record) = self.pending.pop_front() {
             let sort_key = D::sort_key(&record);
+            let deadline = now.saturating_add(self.ack_wait_ticks);
+            // Lower the bound; never raise it here.
+            self.earliest_deadline = self.earliest_deadline.min(deadline);
             self.inflight.insert(
                 sort_key,
                 InFlight {
                     record: record.clone(),
                     member,
-                    deadline: now.saturating_add(self.ack_wait_ticks),
+                    deadline,
                     redelivered: false,
                 },
             );
@@ -180,6 +223,8 @@ where
         match self.inflight.get_mut(&sort_key) {
             Some(f) => {
                 f.deadline = 0;
+                // The record is due NOW, so the bound must admit it.
+                self.earliest_deadline = 0;
                 true
             }
             None => false,
@@ -260,6 +305,9 @@ pub struct SubjectConsumerGroup<D: Dataset> {
     pending: VecDeque<(Subject, D::Record)>,
     /// Delivered-but-unacked, keyed by sort key (ascending).
     inflight: BTreeMap<u64, SubjectInFlight<D::Record>>,
+    /// Lower bound on the earliest in-flight `deadline`; see the identically
+    /// named field on [`ShardConsumerGroup`] for the one-sided invariant.
+    earliest_deadline: u64,
     /// Every subject this group has ever routed a record to — the label set
     /// [`subject_lags`](Self::subject_lags) reports, so a drained subject keeps
     /// publishing `0` instead of its series vanishing (noetl/ai-meta#194: a KEDA
@@ -291,6 +339,7 @@ where
             subject_of,
             pending: VecDeque::new(),
             inflight: BTreeMap::new(),
+            earliest_deadline: u64::MAX,
             seen_subjects: BTreeSet::new(),
         }
     }
@@ -394,11 +443,35 @@ where
 
         // 1. Redelivery: the lowest-sort-key matching in-flight record past its
         //    deadline.
-        let expired = self
-            .inflight
-            .iter()
-            .find(|(_, f)| f.deadline <= now && filter.matches(&f.subject))
-            .map(|(&sk, _)| sk);
+        let expired = if self.earliest_deadline > now {
+            None
+        } else {
+            // ⚠ The filter makes the refresh conditional in a way the shard
+            // group's is not: an entry can be EXPIRED but not match this
+            // subscriber's filter, leaving `found` empty while a record really is
+            // due. Raising the bound from a minimum that skipped those entries
+            // would push it ABOVE the true minimum and a later poll with a
+            // different filter would never see them. So the bound is only
+            // refreshed when nothing at all was expired.
+            let mut found = None;
+            let mut min_deadline = u64::MAX;
+            let mut any_expired = false;
+            for (&sk, f) in &self.inflight {
+                if f.deadline <= now {
+                    any_expired = true;
+                    if filter.matches(&f.subject) {
+                        found = Some(sk);
+                        break;
+                    }
+                } else {
+                    min_deadline = min_deadline.min(f.deadline);
+                }
+            }
+            if !any_expired {
+                self.earliest_deadline = min_deadline;
+            }
+            found
+        };
         if let Some(sk) = expired {
             let f = self.inflight.get_mut(&sk).unwrap();
             f.member = member;
@@ -420,13 +493,16 @@ where
         {
             let (subject, record) = self.pending.remove(pos).expect("position in bounds");
             let sort_key = D::sort_key(&record);
+            let deadline = now.saturating_add(self.ack_wait_ticks);
+            // Lower the bound; never raise it here.
+            self.earliest_deadline = self.earliest_deadline.min(deadline);
             self.inflight.insert(
                 sort_key,
                 SubjectInFlight {
                     record: record.clone(),
                     subject,
                     member,
-                    deadline: now.saturating_add(self.ack_wait_ticks),
+                    deadline,
                     redelivered: false,
                 },
             );
@@ -469,6 +545,8 @@ where
         match self.inflight.get_mut(&sort_key) {
             Some(f) => {
                 f.deadline = 0;
+                // The record is due NOW, so the bound must admit it.
+                self.earliest_deadline = 0;
                 true
             }
             None => false,

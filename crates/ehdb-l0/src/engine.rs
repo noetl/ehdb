@@ -1763,11 +1763,11 @@ impl<D: Dataset> L0Engine<D> {
         for target in &self.replicas {
             for key in target.substrate.list_prefix(&prefix)? {
                 if !referenced_objects.contains(&key) {
-                    let bytes = target
-                        .substrate
-                        .get_all(&key)
-                        .map(|b| b.len() as u64)
-                        .unwrap_or(0);
+                    // Size it WITHOUT fetching it (noetl/ehdb#395). This used
+                    // to be `get_all`, i.e. a full read of an object that is
+                    // deleted on the very next line — free-ish on a local
+                    // substrate, a full download per orphan on a remote one.
+                    let bytes = target.substrate.object_size(&key).unwrap_or(0);
                     target.substrate.delete(&key)?;
                     self.metrics.record_orphan_reclaim(bytes);
                     reclaimed += 1;
