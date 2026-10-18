@@ -372,10 +372,39 @@ where
     /// partition read at startup and never moves the feed cursor, so it cannot
     /// affect delivery.
     pub fn seed_subjects(&mut self, engine: &L0Engine<D>) -> Result<()> {
-        for rec in engine.read_partition_after(self.shard, 0)? {
-            self.seen_subjects.insert((self.subject_of)(&rec).as_str());
-        }
+        self.seed_subjects_from(Self::scan_subjects(self.shard, &self.subject_of, engine)?);
         Ok(())
+    }
+
+    /// The subject set of the shard's retained log, as a standalone scan.
+    ///
+    /// Separated from [`seed_subjects`] so a caller that opens SEVERAL groups on
+    /// the same shard can pay for the scan once. Every group on a shard derives
+    /// the same set — same records, same `subject_of` — so repeating the scan per
+    /// group is redundant work, and on a large log it is not cheap: on the prod
+    /// event bus this read takes **~123 s**, and it ran three times in series
+    /// before the claim listener bound, which is ~376 s of the ~456 s an event-bus
+    /// rebind cost after a writer restart (noetl/ai-meta#482).
+    pub fn scan_subjects(
+        shard: u32,
+        subject_of: &SubjectFn<D::Record>,
+        engine: &L0Engine<D>,
+    ) -> Result<BTreeSet<String>> {
+        let mut out = BTreeSet::new();
+        for rec in engine.read_partition_after(shard, 0)? {
+            out.insert((subject_of)(&rec).as_str().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Seed the reported subject set from an already-computed scan.
+    ///
+    /// Union rather than replace: a group constructed after traffic has arrived
+    /// may already have observed subjects the scan did not cover, and dropping
+    /// them would shrink the reported label set — the opposite of what seeding is
+    /// for.
+    pub fn seed_subjects_from(&mut self, subjects: BTreeSet<String>) {
+        self.seen_subjects.extend(subjects);
     }
 
     /// Every subject this group reports a lag for — the seeded/seen label set.

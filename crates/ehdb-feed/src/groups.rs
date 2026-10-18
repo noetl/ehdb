@@ -37,7 +37,7 @@
 //! `serve_claims`, and their wire frames are byte-identical. The events feed
 //! runs its own coordinator on its own port.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +129,25 @@ pub struct GroupCoordinator<D: Dataset> {
     poll_interval: Duration,
     clock: Instant,
     groups: Mutex<BTreeMap<String, OpenGroup<D>>>,
+    /// The shard's subject set, scanned once and shared by every group.
+    ///
+    /// ⚠ Every group on a shard derives the SAME set — same records, same
+    /// `subject_of` — so scanning per group is redundant. It is also expensive:
+    /// the scan reads the retained partition from sequence 0, which on the prod
+    /// event bus takes **~123 s**. Three groups opened in series therefore cost
+    /// ~376 s of the ~456 s an event-bus rebind took after a writer restart,
+    /// during which the claim listener had not yet bound
+    /// (noetl/ai-meta#482). Guarded by the same `groups` lock that serialises
+    /// opens, so the scan happens at most once per coordinator.
+    seeded_subjects: Mutex<Option<BTreeSet<String>>>,
+    /// How many times the shard's subject set has been scanned.
+    ///
+    /// Exposed because the scan is the dominant cost of opening a group on a
+    /// large log (~123 s on the prod event bus) and an operator reading a slow
+    /// startup should be able to tell "scanned once, as designed" from "scanned
+    /// per group". It is also what makes the once-only property testable without
+    /// timing.
+    subject_scans: AtomicU64,
     /// Directory the per-group cursor files live in (the writer's volume).
     /// `None` disables persistence — every group then starts at `fallback`.
     cursor_dir: Option<PathBuf>,
@@ -183,6 +202,8 @@ where
             poll_interval,
             clock: Instant::now(),
             groups: Mutex::new(BTreeMap::new()),
+            seeded_subjects: Mutex::new(None),
+            subject_scans: AtomicU64::new(0),
             cursor_dir,
             fallback,
             cursor_errors: AtomicU64::new(0),
@@ -201,6 +222,25 @@ where
     /// How many cursor persists have failed. Non-zero means group progress is
     /// not durable — a restart will replay from an older cursor. Records are
     /// never lost by this, only re-delivered.
+    /// Every subject `group` reports a lag for — its seeded + observed label set.
+    ///
+    /// Seeding exists so per-subject lag carries its full label set from the
+    /// first scrape rather than only after traffic arrives; a host that pins
+    /// those labels needs to be able to read them. Opens the group if it is not
+    /// already open, which is the same lazy path a first claim takes.
+    pub async fn seen_subjects(&self, group: &str) -> Vec<String> {
+        let handle = self.handle(group).await;
+        let g = handle.group.lock().await;
+        g.seen_subjects().map(str::to_string).collect()
+    }
+
+    /// How many times the shard's subject set has been scanned — see
+    /// [`subject_scans`](Self::subject_scans). Expected to be **1** for the life
+    /// of a coordinator, however many groups are opened (noetl/ai-meta#482).
+    pub fn subject_scans(&self) -> u64 {
+        self.subject_scans.load(Ordering::Relaxed)
+    }
+
     pub fn cursor_errors(&self) -> u64 {
         self.cursor_errors.load(Ordering::Relaxed)
     }
@@ -274,9 +314,25 @@ where
         {
             // Seed the reported subject set so per-subject lag has its full label
             // set from the first scrape rather than only after traffic arrives.
-            let engine = self.writer.engine();
-            let e = engine.read();
-            let _ = g.seed_subjects(&e);
+            //
+            // ⚠ Scanned ONCE per coordinator and shared (noetl/ai-meta#482). The
+            // scan reads the retained partition from sequence 0; every group on
+            // the shard derives the same set from it, so doing it per group was
+            // pure repetition — and on the prod event bus each pass costs ~123 s,
+            // with the claim listener unbound until all groups are open.
+            let mut cache = self.seeded_subjects.lock().await;
+            if cache.is_none() {
+                let engine = self.writer.engine();
+                let e = engine.read();
+                self.subject_scans.fetch_add(1, Ordering::Relaxed);
+                *cache = Some(
+                    SubjectConsumerGroup::<D>::scan_subjects(self.shard, &self.subject_of, &e)
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(set) = cache.as_ref() {
+                g.seed_subjects_from(set.clone());
+            }
         }
         let handle = OpenGroup {
             group: Arc::new(Mutex::new(g)),

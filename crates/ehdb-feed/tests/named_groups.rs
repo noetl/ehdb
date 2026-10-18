@@ -303,3 +303,139 @@ async fn a_cursor_past_the_tip_is_clamped_not_trusted() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#482 — the subject scan is shared, not repeated per group.
+// ---------------------------------------------------------------------------
+
+/// ⭐ The headline fix: opening N groups costs **one** subject scan, not N.
+///
+/// Each group on a shard derives the same subject set — same records, same
+/// `subject_of` — so scanning per group was pure repetition. It is also the
+/// dominant startup cost on a large log: on the prod event bus each pass reads
+/// the retained partition from sequence 0 and takes **~123 s**, and three groups
+/// opened in series accounted for ~376 s of the ~456 s an event-bus rebind took
+/// after a writer restart, with the claim listener unbound throughout.
+#[tokio::test]
+async fn opening_many_groups_scans_subjects_once() {
+    let dir = tmpdir("scan-once");
+    let w = writer(&dir);
+    for i in 1..=6 {
+        w.append(event(
+            i,
+            &format!("exec-{i}"),
+            if i % 2 == 0 {
+                "action_started"
+            } else {
+                "action_completed"
+            },
+        ))
+        .unwrap();
+    }
+    let c = coordinator(&w, &dir);
+
+    assert_eq!(c.subject_scans(), 0, "no scan before any group is opened");
+    c.open_group(MATERIALIZER).await;
+    assert_eq!(c.subject_scans(), 1, "the first group pays for the scan");
+
+    for g in [RESULT_MATERIALIZER, STATE_MATERIALIZER] {
+        c.open_group(g).await;
+    }
+    assert_eq!(
+        c.subject_scans(),
+        1,
+        "every later group must reuse the first scan, not repeat it"
+    );
+
+    // Re-opening an already-open group must not scan either.
+    c.open_group(MATERIALIZER).await;
+    assert_eq!(c.subject_scans(), 1);
+}
+
+/// The scan must still be *correct* — sharing it is only safe because every
+/// group derives the identical set. Pinned so a future change that makes the set
+/// group-dependent cannot silently keep sharing it.
+#[tokio::test]
+async fn the_shared_scan_sees_every_subject_in_the_log() {
+    let dir = tmpdir("scan-correct");
+    let w = writer(&dir);
+    for (i, ty) in ["action_started", "action_completed", "execution_start"]
+        .iter()
+        .enumerate()
+    {
+        w.append(event(i as u64 + 1, "exec-1", ty)).unwrap();
+    }
+    let store = std::sync::Arc::new(ehdb_l0::LocalFsSubstrate::new(&dir).unwrap());
+    let engine = ehdb_l0::L0Engine::<D1EventLog>::open(
+        ehdb_l0::L0Config::d1(&dir).with_shard_count(1),
+        store,
+    )
+    .unwrap();
+    let found = ehdb_feed::SubjectConsumerGroup::<D1EventLog>::scan_subjects(
+        0,
+        &event_feed_subject(),
+        &engine,
+    )
+    .unwrap();
+    let names: Vec<_> = found.iter().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        vec![
+            "events.action_completed",
+            "events.action_started",
+            "events.execution_start"
+        ],
+        "the scan must report every subject the shard carries"
+    );
+}
+
+/// ⚠ Seeding must UNION, not replace. A group constructed after traffic has
+/// arrived may already have observed subjects the shared scan did not cover;
+/// overwriting would shrink the reported label set, which is the opposite of
+/// what seeding is for.
+#[tokio::test]
+async fn seeding_unions_with_already_observed_subjects() {
+    use std::collections::BTreeSet;
+    let mut g = ehdb_feed::SubjectConsumerGroup::<D1EventLog>::new(0, 10, 0, event_feed_subject());
+    let mut first = BTreeSet::new();
+    first.insert("events.a".to_string());
+    g.seed_subjects_from(first);
+    let mut second = BTreeSet::new();
+    second.insert("events.b".to_string());
+    g.seed_subjects_from(second);
+    let seen: Vec<_> = g.seen_subjects().collect();
+    assert!(
+        seen.contains(&"events.a"),
+        "earlier subjects must survive: {seen:?}"
+    );
+    assert!(
+        seen.contains(&"events.b"),
+        "later subjects must be added: {seen:?}"
+    );
+}
+
+/// ⚠ Closes a mutation gap: nothing asserted that a group opened THROUGH the
+/// coordinator actually receives the shared seed, so dropping the seeding call
+/// entirely survived the suite. Seeding is the whole reason the scan exists.
+#[tokio::test]
+async fn a_coordinator_opened_group_carries_the_seeded_subjects() {
+    let dir = tmpdir("scan-seeded");
+    let w = writer(&dir);
+    w.append(event(1, "exec-1", "action_started")).unwrap();
+    w.append(event(2, "exec-2", "execution_start")).unwrap();
+    let c = coordinator(&w, &dir);
+
+    for g in [MATERIALIZER, RESULT_MATERIALIZER, STATE_MATERIALIZER] {
+        let mut seen = c.seen_subjects(g).await;
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "events.action_started".to_string(),
+                "events.execution_start".to_string()
+            ],
+            "group {g} must carry the seeded label set before any delivery"
+        );
+    }
+    assert_eq!(c.subject_scans(), 1, "and all three shared one scan");
+}
