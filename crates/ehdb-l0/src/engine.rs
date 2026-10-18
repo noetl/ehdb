@@ -35,7 +35,16 @@ use ehdb_core::{EhdbError, Result};
 
 use crate::catalog::{Manifest, PartMeta, ReplicaLocation};
 use crate::dataset::{D1EventLog, Dataset, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
-use crate::frame::iter_frames_from;
+use crate::frame::{iter_frames_from, FRAME_HEADER_LEN};
+
+/// Floor on an incremental feed read (noetl/ehdb#389).
+///
+/// The chunk is normally sized from the batch and the part's mean frame size;
+/// a floor keeps a degenerate estimate (tiny records, or a `limit` of 1) from
+/// issuing reads so small that syscall overhead dominates the bytes. Small
+/// enough that a one-record poll still reads ~one record's worth rather than
+/// the whole tail — which is the entire point.
+const MIN_INCREMENTAL_READ: u64 = 256;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
@@ -2067,27 +2076,78 @@ impl<D: Dataset> L0Engine<D> {
             if out.len() >= limit {
                 break;
             }
-            // Sparse-index start offset for the cursor; read from there to the
-            // part end (the feed wants the shard's whole tail, no index narrowing).
+            // Sparse-index start offset for the cursor, as before.
             let start_offset = part.sparse_index.locate(after_seq + 1);
-            let len = part.byte_size.saturating_sub(start_offset);
-            if len == 0 {
+            let part_end = part.byte_size;
+            if part_end <= start_offset {
                 continue;
             }
-            let block = if let Some(local_path) = &part.local_path {
-                read_local_range(local_path, start_offset, len)?
-            } else {
-                self.read_across_replicas(part, |substrate, key| {
-                    substrate.get_range(key, start_offset, len)
-                })?
-            };
-            for frame in iter_frames_from(&block, 0)? {
-                let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
-                    EhdbError::Storage(format!("decode l0 record in part {}: {err}", part.part_id))
-                })?;
-                if D::sort_key(&rec) > after_seq {
-                    out.push(rec);
+
+            // ⭐ Read and decode INCREMENTALLY from there, stopping once `limit`
+            // records are in hand (noetl/ehdb#389).
+            //
+            // This used to be one read of `byte_size - start_offset` — the whole
+            // remaining tail — whose frames were all decoded regardless of
+            // `limit`. A poll therefore cost the SPAN it touched rather than the
+            // batch it returned, so draining n records one at a time re-read the
+            // tail once per record: measured 66.5x the single-batch bytes at a
+            // 128 backlog and 131.0x at 256, i.e. quadratic.
+            //
+            // The chunk is sized from what the batch should need —
+            // `record_count` and `byte_size` are both already in `PartMeta`, so
+            // the mean frame size is known without touching the on-disk format —
+            // and doubles only if a chunk yields no complete frame (a record
+            // larger than the estimate). Cost is now the batch plus at most one
+            // granule of index backfill, independent of how deep the backlog is.
+            let est_frame = part.byte_size / part.record_count.max(1);
+            let mut chunk = (limit as u64)
+                .saturating_mul(est_frame.max(1))
+                .saturating_mul(2)
+                .saturating_add(2 * FRAME_HEADER_LEN as u64)
+                .max(MIN_INCREMENTAL_READ);
+            let mut offset = start_offset;
+            while out.len() < limit && offset < part_end {
+                let len = chunk.min(part_end - offset);
+                let block = if let Some(local_path) = &part.local_path {
+                    read_local_range(local_path, offset, len)?
+                } else {
+                    let (o, l) = (offset, len);
+                    self.read_across_replicas(part, move |substrate, key| {
+                        substrate.get_range(key, o, l)
+                    })?
+                };
+                let frames = iter_frames_from(&block, 0)?;
+                if frames.is_empty() {
+                    // Either this chunk lands mid-frame on a record bigger than
+                    // the estimate, or the part ends mid-frame (a torn tail,
+                    // which `read_frame_at` reports by stopping). Grow and retry
+                    // unless there is nothing left to grow into — without that
+                    // guard a too-small chunk would spin forever.
+                    if offset + len >= part_end {
+                        break;
+                    }
+                    chunk = chunk.saturating_mul(2);
+                    continue;
                 }
+                let mut consumed = 0u64;
+                for frame in &frames {
+                    let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
+                        EhdbError::Storage(format!(
+                            "decode l0 record in part {}: {err}",
+                            part.part_id
+                        ))
+                    })?;
+                    consumed = frame.offset + frame.frame_len;
+                    // Frames below the cursor are the sparse index's granule
+                    // backfill: they are skipped and do NOT count toward `limit`.
+                    if D::sort_key(&rec) > after_seq {
+                        out.push(rec);
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                offset += consumed;
             }
         }
 
