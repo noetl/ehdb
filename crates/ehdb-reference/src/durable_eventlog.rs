@@ -268,6 +268,15 @@ pub struct DurableSegmentStore {
     /// its own tail on its own writable open).  See the execution-affinity
     /// single-writer routing slice ([noetl/ai-meta#166]).
     read_only: bool,
+    /// Records dropped because a segment ended mid-frame, as found by the last
+    /// [`replay`](Self::replay).
+    ///
+    /// ⚠ Counted whether or not the tail is repaired. A read-only cold-load view
+    /// never truncates (truncation is a write, and only the shard's owner repairs
+    /// its own tail), but it still serves a PREFIX — and a prefix served as if it
+    /// were the whole log is the quiet wrong answer noetl/ehdb#262 added this
+    /// field to prevent.
+    torn_tail_skipped: usize,
     /// Total events durably appended (the highest global sequence). Tracked
     /// explicitly so the append hot path stays O(1) even when the offset index
     /// is not materialized — a checkpoint-trust open ([noetl/ehdb#267]) leaves
@@ -354,6 +363,7 @@ impl DurableSegmentStore {
             index_loaded: false,
             reclaimed_through: 0,
             reclaimed_segment: 0,
+            torn_tail_skipped: 0,
         };
         if read_only {
             // A cold-load of a never-written shard is an empty log; do not
@@ -641,6 +651,11 @@ impl DurableSegmentStore {
     /// Rebuild the in-memory index from the segment files.  Torn-tail frames
     /// (truncated by a crash mid-append, before `fsync` returned) are discarded;
     /// a complete-but-corrupt frame is a hard error.
+    /// Records dropped because a segment ended mid-frame, from the last replay.
+    pub fn torn_tail_skipped(&self) -> usize {
+        self.torn_tail_skipped
+    }
+
     fn replay(&mut self) -> Result<()> {
         self.events.clear();
         self.by_execution.clear();
@@ -649,6 +664,8 @@ impl DurableSegmentStore {
         self.active_segment_id = 0;
         self.active_len = 0;
         self.reclaimed_through = 0;
+        // Replay-derived: a re-replay must recount, never accumulate.
+        self.torn_tail_skipped = 0;
 
         // Honor a committed reclaim manifest (segment GC): segments at/below
         // `reclaimed_through_segment` are reclaimed. A writable owner re-deletes
@@ -681,8 +698,17 @@ impl DurableSegmentStore {
             // its own writable open.  The in-memory index already stops at the
             // last intact frame, so the read view still serves the exact
             // recovered prefix.
-            if good_len < bytes.len() as u64 && !self.read_only {
-                truncate_segment(&path, good_len)?;
+            // ⚠ The COUNT is deliberately outside the `!read_only` guard that
+            // the repair sits behind. Detection and repair are different
+            // questions: a read-only view cannot truncate, but it is exactly the
+            // view a scan reads, so it is the one that most needs to report that
+            // what it served was a prefix. Folding the count into the repair
+            // branch is how this stayed invisible.
+            if good_len < bytes.len() as u64 {
+                self.torn_tail_skipped += 1;
+                if !self.read_only {
+                    truncate_segment(&path, good_len)?;
+                }
             }
             self.active_segment_id = *id;
             self.active_len = good_len;
@@ -996,12 +1022,11 @@ impl DurableSegmentStore {
                 record_count: 0,
                 returned: 0,
                 records: Vec::new(),
-                // 0, and that is a statement rather than a placeholder: this is the
-                // segment store, not the JSONL log, so it has no partial-final-line
-                // case (noetl/ehdb#262). Segment recovery is its own mechanism; if
-                // that ever changes this must report it rather than keep asserting
-                // a clean read.
-                torn_tail_skipped: 0,
+                // Reported, not asserted. This comment used to say the 0 was a
+                // statement rather than a placeholder — that the segment store has no
+                // torn-tail case. The same file implements torn-tail recovery, so it
+                // never held (noetl/ehdb#362).
+                torn_tail_skipped: self.torn_tail_skipped,
             });
         }
         // Never scan below the reclaimed base — those sequences are gone from
@@ -1024,11 +1049,11 @@ impl DurableSegmentStore {
             record_count,
             returned: records.len(),
             records,
-            // 0 — a statement, not a placeholder: this is the segment store,
-            // not the JSONL log, so it has no partial-final-line case
-            // (noetl/ehdb#262). Segment recovery is its own mechanism; if that
-            // changes, this must report it rather than keep asserting a clean read.
-            torn_tail_skipped: 0,
+            // Reported, not asserted. This comment used to say the 0 was a
+            // statement rather than a placeholder — that the segment store has no
+            // torn-tail case. The same file implements torn-tail recovery, so it
+            // never held (noetl/ehdb#362).
+            torn_tail_skipped: self.torn_tail_skipped,
         })
     }
 
@@ -1050,12 +1075,11 @@ impl DurableSegmentStore {
                 record_count: 0,
                 returned: 0,
                 records: Vec::new(),
-                // 0, and that is a statement rather than a placeholder: this is the
-                // segment store, not the JSONL log, so it has no partial-final-line
-                // case (noetl/ehdb#262). Segment recovery is its own mechanism; if
-                // that ever changes this must report it rather than keep asserting
-                // a clean read.
-                torn_tail_skipped: 0,
+                // Reported, not asserted. This comment used to say the 0 was a
+                // statement rather than a placeholder — that the segment store has no
+                // torn-tail case. The same file implements torn-tail recovery, so it
+                // never held (noetl/ehdb#362).
+                torn_tail_skipped: self.torn_tail_skipped,
             });
         }
         let after = request.after.unwrap_or(0);
@@ -1079,11 +1103,11 @@ impl DurableSegmentStore {
             record_count,
             returned: records.len(),
             records,
-            // 0 — a statement, not a placeholder: this is the segment store,
-            // not the JSONL log, so it has no partial-final-line case
-            // (noetl/ehdb#262). Segment recovery is its own mechanism; if that
-            // changes, this must report it rather than keep asserting a clean read.
-            torn_tail_skipped: 0,
+            // Reported, not asserted. This comment used to say the 0 was a
+            // statement rather than a placeholder — that the segment store has no
+            // torn-tail case. The same file implements torn-tail recovery, so it
+            // never held (noetl/ehdb#362).
+            torn_tail_skipped: self.torn_tail_skipped,
         })
     }
 
@@ -3657,6 +3681,271 @@ mod tests {
             "min-retained floor honored"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- noetl/ehdb#362: a torn tail must be REPORTED, not just repaired ----
+
+    /// Positive control. Without this, the zero in the next test is consistent
+    /// with a counter that can never move.
+    #[test]
+    fn an_intact_store_reports_zero_torn_tail() {
+        let root = tmp_root("torn-report-clean");
+        let mut store = DurableSegmentStore::open(&root).unwrap();
+        append(&mut store, "100", 1, "a");
+        append(&mut store, "100", 2, "b");
+        let scan = store
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(
+            scan.torn_tail_skipped, 0,
+            "an intact read must report 0 — and this proves 0 is a reading"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⭐ The defect: the scan served a PREFIX and said the read was clean.
+    #[test]
+    fn a_torn_tail_is_reported_by_the_scan() {
+        let root = tmp_root("torn-report");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "100", 2, "b");
+        }
+        append_torn_frame(&root);
+
+        let mut reopened = DurableSegmentStore::open(&root).unwrap();
+        let scan = reopened
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(scan.records.len(), 2, "the intact prefix still serves");
+        assert_eq!(
+            scan.torn_tail_skipped, 1,
+            "and the skip is now visible from outside the process"
+        );
+        assert_eq!(reopened.torn_tail_skipped(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⭐⭐ The half that mattered most. The detection test lived INSIDE the
+    /// `!read_only` guard that the repair sits behind, so the read-only
+    /// cold-load view — the one a scan actually reads — never evaluated it.
+    /// It cannot truncate, but it is precisely the view that must admit it
+    /// served a prefix.
+    #[test]
+    fn a_read_only_view_reports_the_torn_tail_it_cannot_repair() {
+        let root = tmp_root("torn-report-ro");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "100", 2, "b");
+        }
+        append_torn_frame(&root);
+        let seg = segment_path_in(&root);
+        let len_with_torn = fs::metadata(&seg).unwrap().len();
+
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+        let scan = view
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(
+            scan.torn_tail_skipped, 1,
+            "the read-only view must report the skip it is unable to repair"
+        );
+        assert_eq!(
+            fs::metadata(&seg).unwrap().len(),
+            len_with_torn,
+            "and it must still not truncate another owner's tail"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The counter is replay-derived, so a second replay must recount rather
+    /// than accumulate.
+    #[test]
+    fn a_reopen_recounts_rather_than_accumulating() {
+        let root = tmp_root("torn-report-recount");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+        }
+        append_torn_frame(&root);
+        // First writable open repairs the tail, so a later open sees a clean file.
+        assert_eq!(
+            DurableSegmentStore::open(&root)
+                .unwrap()
+                .torn_tail_skipped(),
+            1
+        );
+        assert_eq!(
+            DurableSegmentStore::open(&root)
+                .unwrap()
+                .torn_tail_skipped(),
+            0,
+            "the tail was truncated by the first open, so the second read is clean"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⚠ `scan_global` builds its outcome at TWO sites — the populated return and
+    /// the absent/empty one — and `read_execution` at two more. A mutation test
+    /// found that reverting the FIRST of the four to a hard-coded 0 broke
+    /// nothing, because every test above drives only the populated scan branch.
+    /// Four sites with partial coverage is the shape that let the original zero
+    /// survive, so each is now pinned.
+    ///
+    /// This one: every record is lost, so the read finds NOTHING and must still
+    /// say a record was dropped — the worst version of the quiet wrong answer.
+    #[test]
+    fn a_torn_tail_is_reported_even_when_the_scan_finds_nothing() {
+        let root = tmp_root("torn-report-empty");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+        }
+        // Truncate mid-frame of the ONLY frame: no intact record survives.
+        let seg = segment_path_in(&root);
+        let len = fs::metadata(&seg).unwrap().len();
+        let bytes = fs::read(&seg).unwrap();
+        fs::write(&seg, &bytes[..(len as usize) - 3]).unwrap();
+
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+        let scan = view
+            .scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert!(scan.records.is_empty(), "nothing intact survived");
+        assert_eq!(
+            scan.torn_tail_skipped, 1,
+            "a read that found nothing must still report the drop"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `read_execution`'s two outcome sites — uncovered until a mutation test
+    /// showed reverting one of them changed no result.
+    #[test]
+    fn read_execution_reports_the_torn_tail() {
+        let root = tmp_root("torn-report-exec");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+            append(&mut store, "100", 2, "b");
+        }
+        append_torn_frame(&root);
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+
+        let found = view
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "100".to_string(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(found.records.len(), 2);
+        assert_eq!(
+            found.torn_tail_skipped, 1,
+            "the populated read_execution branch must propagate it"
+        );
+
+        // And the absent branch: an execution this store never held.
+        let missing = view
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "999".to_string(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        // ⚠ `exists` is about the STREAM, not this execution: "the stream exists
+        // (some event appended) even if this execution has none". My first
+        // version of this test asserted `!exists` and failed — the code was
+        // right and the assumption was not.
+        assert!(missing.exists);
+        assert!(
+            missing.records.is_empty(),
+            "no records for an unknown execution"
+        );
+        assert_eq!(
+            missing.torn_tail_skipped, 1,
+            "and it still reports the prefix — this is the populated-stream branch"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Site 4 of 4: `read_execution`'s `events.is_empty()` early return.
+    ///
+    /// ⚠ Found by mutation, not by reading. With all four sites pinned I reverted
+    /// each to a hard-coded 0 in turn; three broke a test and THIS ONE DID NOT.
+    /// The test above drives `read_execution` against a store with intact events,
+    /// so it never reaches the empty branch. 3-of-4 coverage reported as 4 is the
+    /// same partial-coverage shape that let the original zero survive.
+    #[test]
+    fn read_execution_reports_the_torn_tail_when_nothing_survived() {
+        let root = tmp_root("torn-report-exec-empty");
+        {
+            let mut store = DurableSegmentStore::open(&root).unwrap();
+            append(&mut store, "100", 1, "a");
+        }
+        // Truncate mid-frame of the only frame: the index ends up empty.
+        let seg = segment_path_in(&root);
+        let bytes = fs::read(&seg).unwrap();
+        fs::write(&seg, &bytes[..bytes.len() - 3]).unwrap();
+
+        let mut view = DurableSegmentStore::open_read_only(&root).unwrap();
+        let out = view
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "100".to_string(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert!(!out.exists, "no event survived, so the stream reads absent");
+        assert_eq!(
+            out.torn_tail_skipped, 1,
+            "and the empty branch must still report the record it dropped"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn segment_path_in(root: &std::path::Path) -> PathBuf {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(SEGMENT_PREFIX)
+            })
+            .unwrap()
+    }
+
+    /// A header claiming a 100-byte body with only 3 bytes present — a crash
+    /// mid-append, the same shape the existing torn-tail tests build.
+    fn append_torn_frame(root: &std::path::Path) {
+        let seg = segment_path_in(root);
+        let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
+        let mut torn = [0u8; FRAME_HEADER_LEN];
+        torn[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        torn[4..8].copy_from_slice(&100u32.to_le_bytes());
+        torn[8..12].copy_from_slice(&0u32.to_le_bytes());
+        f.write_all(&torn).unwrap();
+        f.write_all(b"xyz").unwrap();
+        f.sync_data().unwrap();
     }
 }
 
