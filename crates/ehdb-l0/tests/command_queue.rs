@@ -149,3 +149,90 @@ fn queue_survives_a_dead_replica() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#454 — the fold counter.
+// ---------------------------------------------------------------------------
+
+/// ⭐ Existence is not reachability: a counter that no path increments reads
+/// exactly like a path that never ran. This pins that both fold call sites
+/// actually record, and that the cost dimension sums op records rather than
+/// counting folds twice.
+#[test]
+fn folds_are_counted_at_both_call_sites() {
+    let obj = unique_dir("fold-obj");
+    let local = unique_dir("fold-local");
+    let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&obj).unwrap());
+    let mut q = CommandQueue::open(CommandQueue::config(&local), store).unwrap();
+
+    let m = q.engine().metrics();
+    assert_eq!(m.snapshot().folds, 0, "fresh queue has folded nothing");
+
+    // 3 commands, 2 ops each (enqueue + claim) on two of them.
+    for id in 1..=3u64 {
+        q.enqueue(&id.to_string(), format!("p-{id}")).unwrap();
+    }
+    for id in 1..=2u64 {
+        q.claim(&id.to_string(), "worker-a").unwrap();
+    }
+    assert_eq!(
+        m.snapshot().folds,
+        0,
+        "writes must not fold — only the read paths do"
+    );
+
+    // Call site 1: command_state folds exactly one command.
+    let before = m.snapshot();
+    let st = q.command_state("1").unwrap();
+    assert!(
+        matches!(st, Some(CommandState::Claimed { ref claimer }) if claimer == "worker-a"),
+        "fixture must have folded to Claimed, got {st:?}"
+    );
+    let after = m.snapshot();
+    assert_eq!(after.folds, before.folds + 1, "command_state folds once");
+    assert_eq!(
+        after.ops_folded,
+        before.ops_folded + 2,
+        "and consumed that command's 2 ops (enqueue + claim)"
+    );
+
+    // Call site 2: unclaimed_scan folds EVERY command, one fold each.
+    let before = m.snapshot();
+    let unclaimed = q.unclaimed_scan().unwrap();
+    assert_eq!(unclaimed, vec!["3".to_string()]);
+    let after = m.snapshot();
+    assert_eq!(
+        after.folds,
+        before.folds + 3,
+        "a scan over 3 commands records 3 folds, not 1"
+    );
+    assert_eq!(
+        after.ops_folded,
+        before.ops_folded + 5,
+        "summing their ops: 2 + 2 + 1"
+    );
+
+    // ⭐ The ratio the pair exists for.
+    let s = m.snapshot();
+    assert!(
+        s.ops_folded > s.folds,
+        "ops_folded/folds is the mean ops per fold and must be derivable: {} / {}",
+        s.ops_folded,
+        s.folds
+    );
+}
+
+/// A command that was never enqueued still folds — the fold is what *decides*
+/// it is absent, so not counting it would understate the read cost of a miss.
+#[test]
+fn a_miss_still_counts_as_a_fold() {
+    let obj = unique_dir("fold-miss-obj");
+    let local = unique_dir("fold-miss-local");
+    let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&obj).unwrap());
+    let q = CommandQueue::open(CommandQueue::config(&local), store).unwrap();
+    let m = q.engine().metrics();
+
+    assert_eq!(q.command_state("nope").unwrap(), None);
+    assert_eq!(m.snapshot().folds, 1, "a miss is still a fold");
+    assert_eq!(m.snapshot().ops_folded, 0, "over zero ops");
+}
