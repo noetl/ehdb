@@ -243,7 +243,7 @@ fn read_index_vs_parts(c: &mut Criterion) {
             e.flush_and_wait_uploads().expect("flush");
             if arm == "merged" {
                 let merged = e.run_pending_merges().expect("merge");
-                if len >= 4 * 1024 + 1 {
+                if len > 4 * 1024 {
                     assert!(merged > 0, "merged arm at {len} merged nothing");
                 }
             }
