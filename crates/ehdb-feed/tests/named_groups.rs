@@ -303,3 +303,59 @@ async fn a_cursor_past_the_tip_is_clamped_not_trusted() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// ⭐ Opening a group does not scan the retained log (noetl/ai-meta#482).
+///
+/// The subject seed read every retained record — ~123 s per group on the prod
+/// event log — to fill a label set nothing on this coordinator exposes. The
+/// subject function is called once per record it reads, so counting its calls
+/// counts what an open read: it must be zero, while the records are still
+/// delivered afterwards (the open did not lose anything by not reading them).
+#[tokio::test]
+async fn opening_a_group_does_not_scan_the_retained_log() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tmpdir("noseed");
+    let w = writer(&dir);
+    for i in 1..=200 {
+        w.append(event(i, "exec-a", "action_started")).unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inner = event_feed_subject();
+    let counted: ehdb_feed::SubjectFn<EventRecord> = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |r: &EventRecord| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            inner(r)
+        })
+    };
+    let c = GroupCoordinator::new(
+        Arc::clone(&w),
+        0,
+        Duration::from_millis(200),
+        counted,
+        Some(dir.clone()),
+        CursorFallback::Beginning,
+    );
+    for g in [MATERIALIZER, RESULT_MATERIALIZER, STATE_MATERIALIZER] {
+        c.open_group(g).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "opening the groups read the retained log"
+    );
+
+    // Not reading at open loses nothing: the records still arrive — and the
+    // counter moves once they do, so it is wired into the path it measures.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        c.claim_next(MATERIALIZER, ALL_EVENTS, 1),
+    )
+    .await
+    .expect("no delivery after an unseeded open");
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "the counting subject fn is not on the delivery path; the zero above proves nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
