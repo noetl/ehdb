@@ -47,10 +47,34 @@ impl Dataset for TD {
     }
 }
 
+/// ⚠⚠ Under `CARGO_TARGET_TMPDIR` (inside `target/`), NOT `std::env::temp_dir()`.
+///
+/// Posture A's whole cost is the `fsync`, so this measurement needs a filesystem where an
+/// `fsync` reaches a device. On ubuntu-26.04 runners `/tmp` is **tmpfs**: `fdatasync` has
+/// nothing to flush, posture A costs what a plain write costs (1.5 us vs 256 us on the
+/// 24.04 runner's ext4), and the ratio below cannot hold (noetl/ai-meta#493). `target/`
+/// lives on the checkout's real disk on every runner image.
 fn dir(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ehdb-tail-{tag}-{}-{n}", std::process::id()))
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ehdb-tail-{tag}-{}-{n}", std::process::id()))
+}
+
+/// The filesystem type `path` lives on, from the longest matching mount point (Linux).
+/// `None` where that cannot be read, which is not evidence of anything.
+fn fs_type(path: &Path) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let path = path.canonicalize().ok()?;
+    mounts
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (_, mnt, ty) = (f.next()?, f.next()?, f.next()?);
+            path.starts_with(mnt).then(|| (mnt.len(), ty.to_string()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, ty)| ty)
 }
 
 fn engine(root: &Path) -> L0Engine<TD> {
@@ -132,6 +156,12 @@ fn measure_append_and_read_tail_latency() {
     }
     let a = summarize(appends);
     show("append posture A (fsync/append)", &a);
+    let fs = fs_type(&d1);
+    println!(
+        "    measured on {} ({})",
+        d1.display(),
+        fs.as_deref().unwrap_or("fs type unknown")
+    );
 
     // --- append, group committed ---
     let d2 = dir("appG");
@@ -197,12 +227,21 @@ fn measure_append_and_read_tail_latency() {
         "    => group commit p50 is {:.0}x cheaper than posture A p50",
         a.p50 as f64 / g.p50.max(1) as f64
     );
+    // A tmpfs makes the fsync free, and then the ratio says nothing about the posture —
+    // name THAT, rather than blaming the flush policy (noetl/ai-meta#493).
+    assert!(
+        fs.as_deref() != Some("tmpfs"),
+        "the measurement directory {} is on tmpfs, where fsync costs nothing; posture A \
+         cannot be measured there (posture A p50 {:.1} us)",
+        d1.display(),
+        a.p50 as f64 / 1000.0
+    );
     assert!(
         g.p50 * 10 < a.p50,
         "group-committed append must be far cheaper at p50 than fsync-per-append, or the \
-         flush posture did not take: {} vs {}",
-        g.p50,
-        a.p50
+         flush posture did not take: group-commit p50 {:.1} us vs posture A p50 {:.1} us",
+        g.p50 as f64 / 1000.0,
+        a.p50 as f64 / 1000.0
     );
 
     // ---- RESOLUTION CONTROL ----
