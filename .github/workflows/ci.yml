@@ -35,6 +35,43 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo bench --workspace --no-run
 
+  # ⚠ DIAGNOSTIC ONLY -- DO NOT MERGE (noetl/ai-meta#493).
+  #
+  # On ubuntu-26.04 the group-committed append (FlushPolicy::CallerDriven: a
+  # write_all and no fsync) measured p50 5330 us, about the same as fsync-per-append
+  # (5691 us). An append that skips the fsync should not cost 5 ms, so before
+  # re-baselining we need to know WHAT it pays. Same test on both images, side by
+  # side, with the temp filesystem identified, a /dev/shm control (tmpfs, where
+  # fsync is free), and strace syscall totals.
+  diag-tail-latency:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: environment
+        run: |
+          uname -a; head -2 /etc/os-release; nproc
+          echo "TMPDIR=${TMPDIR:-unset}"
+          findmnt -T /tmp || true
+          df -T /tmp /dev/shm . || true
+          cat /sys/block/*/queue/scheduler 2>/dev/null | head -5 || true
+      - run: cargo test -p ehdb-l0 --test tail_latency --release --no-run
+      - name: tail_latency on the default temp dir
+        run: cargo test -p ehdb-l0 --test tail_latency --release -- --nocapture 2>&1 | grep -E 'append|read_index|cheaper|CONTROL|test result|panicked' || true
+      - name: tail_latency on /dev/shm (tmpfs control)
+        run: TMPDIR=/dev/shm cargo test -p ehdb-l0 --test tail_latency --release -- --nocapture 2>&1 | grep -E 'append|read_index|cheaper|test result|panicked' || true
+      - name: syscall totals (strace -c)
+        run: |
+          sudo apt-get install -y strace >/dev/null 2>&1 || true
+          BIN=$(ls -t target/release/deps/tail_latency-* | grep -v '\.d$' | head -1)
+          strace -f -c -o strace.txt "$BIN" --nocapture >/dev/null 2>&1 || true
+          head -30 strace.txt || true
+
   # D5 of docs/measures/complete-and-measured.md: benchmarks RUN in CI, with the
   # result shape enforced and the numbers recorded.
   #
