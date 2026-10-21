@@ -265,19 +265,22 @@ where
             origin,
         };
 
-        let mut g = SubjectConsumerGroup::new(
+        // ⚠⚠ NOT seeded (noetl/ai-meta#482). `seed_subjects` reads the shard's
+        // entire retained log to pre-populate the per-subject lag LABEL set —
+        // which matters to the command bus, where KEDA scrapes `subject_lags` and
+        // an absent label is a scaler error (noetl/ai-meta#194). Nothing reads it
+        // here: this coordinator exposes no per-subject lag, and no ScaledObject
+        // scrapes the events feed. On the prod event log the scan cost ~123 s per
+        // group, three groups in series, under the engine read lock, on the path
+        // to the claim listener binding — 376 s of a 456 s event-bus rebind.
+        // If a per-subject lag accessor is ever added here, seed lazily on its
+        // first call, never on the open path.
+        let g = SubjectConsumerGroup::new(
             self.shard,
             self.ack_wait_ticks,
             from_cursor,
             Arc::clone(&self.subject_of),
         );
-        {
-            // Seed the reported subject set so per-subject lag has its full label
-            // set from the first scrape rather than only after traffic arrives.
-            let engine = self.writer.engine();
-            let e = engine.read();
-            let _ = g.seed_subjects(&e);
-        }
         let handle = OpenGroup {
             group: Arc::new(Mutex::new(g)),
             cursor,
