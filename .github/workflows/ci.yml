@@ -8,7 +8,14 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # ⚠ PINNED, not `ubuntu-latest` (noetl/ai-meta#493). `ubuntu-latest` moved
+    # from 24.04 to 26.04 between 2026-10-19 and 2026-10-20, and the ehdb-l0
+    # measurement tests asserting ratios (tail_latency: group-commit p50 far
+    # below fsync-per-append; lifecycle_measures) began failing on main with no
+    # code change: 5330 vs 5691 us on 26.04, where 24.04 passed. Those ratios are
+    # a property of the runner's disk. Unpin once they are re-baselined on 26.04
+    # -- deliberately, not by the image moving underneath.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -181,7 +181,7 @@ fn a_zero_limit_reads_nothing() {
 fn the_per_poll_cost_is_flat_across_backlogs() {
     let mut ratios = Vec::new();
     let mut keep = Vec::new();
-    for n in [128u64, 256, 512] {
+    for n in [128u64, 256, 512, 1024, 2048] {
         let (engine, counters, dirs) = seeded_cold(&format!("flat{n}"), n);
         let whole = drain_bytes(&engine, &counters, 8_192, n);
         assert!(whole > 0, "the cold engine must read through the substrate");
@@ -196,10 +196,16 @@ fn the_per_poll_cost_is_flat_across_backlogs() {
         ratios.iter().cloned().fold(0.0, f64::max),
     );
     // Flat means the spread does not grow with n. A doubling-per-step bug would
-    // put 4x between the ends of this sweep.
+    // put 16x between the ends of this 16x sweep (noetl/ehdb#389 measured 66.5x
+    // at 128 records and 131.0x at 256 before noetl/ehdb#416 bounded the read).
+    //
+    // ⚠ The sweep spans 16x rather than 4x deliberately. A 4x sweep is short
+    // enough that a sub-linear-but-still-growing term can hide inside the 1.5x
+    // tolerance; widening it is what turns "did not grow much" into "did not
+    // grow".
     assert!(
         hi / lo < 1.5,
-        "the ratio must be flat across a 4x backlog sweep, got {ratios:?} \
+        "the ratio must be flat across a 16x backlog sweep, got {ratios:?} \
          (spread {:.2}x) — a ratio that still grows means the span is still \
          being re-read",
         hi / lo

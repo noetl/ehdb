@@ -182,6 +182,8 @@ fn a_fresh_engine_emits_every_series_pinned_at_zero() {
         tail_reclaim_bytes: 0,
         tail_reclaim_failed: 0,
         tail_objects_retained: 0,
+        folds: 0,
+        ops_folded: 0,
         merges: 0,
         parts_merged: 0,
         merged_bytes: 0,

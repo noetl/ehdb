@@ -183,6 +183,7 @@ impl CommandQueue {
     /// `None` if the command was never enqueued.
     pub fn command_state(&self, command_id: &str) -> Result<Option<CommandState>> {
         let ops = self.engine.read_index_after(command_id, 0)?;
+        self.engine.metrics().record_fold(ops.len() as u64);
         Ok(fold_command(&ops))
     }
 
@@ -196,9 +197,17 @@ impl CommandQueue {
         }
         let mut unclaimed: Vec<String> = by_cmd
             .into_iter()
-            .filter_map(|(cmd, ops)| match fold_command(&ops) {
-                Some(CommandState::Unclaimed) => Some(cmd),
-                _ => None,
+            .filter_map(|(cmd, ops)| {
+                // Recorded per command, not per scan (noetl/ai-meta#454): each
+                // command is its own fold, so `ops_folded / folds` stays "mean
+                // ops per command" rather than "per scan", which is the ratio
+                // that shows ops accumulating faster than they retire.
+                let m = self.engine.metrics();
+                m.record_fold(ops.len() as u64);
+                match fold_command(&ops) {
+                    Some(CommandState::Unclaimed) => Some(cmd),
+                    _ => None,
+                }
             })
             .collect();
         unclaimed.sort();
