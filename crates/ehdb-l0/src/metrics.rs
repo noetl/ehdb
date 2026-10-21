@@ -224,6 +224,21 @@ pub struct L0Metrics {
     /// "how much would we lose".
     pub replicated_lag: LagHistogram,
     /// Merge/compaction operations performed (L0.3).
+    /// Fold operations performed — a command's op records reduced to its current
+    /// state (noetl/ai-meta#454).
+    ///
+    /// Folding is a first-class read path here: `command_state` folds one
+    /// command's index-pruned ops, and `unclaimed_scan` folds every command in the
+    /// log. It had no counter at all, so the cost of the read side was invisible
+    /// while seal, merge and reclaim were all instrumented.
+    pub folds: AtomicU64,
+    /// Op records consumed by folds (their count summed).
+    ///
+    /// The cost dimension, the analogue of `parts_merged`. `ops_folded / folds` is
+    /// the mean ops per fold: a rising mean on a flat `folds` means commands are
+    /// accumulating ops faster than they retire, which is what makes a fold
+    /// expensive. A fold count alone cannot show that.
+    pub ops_folded: AtomicU64,
     pub merges: AtomicU64,
     /// Source parts consumed by merges (their count summed).
     pub parts_merged: AtomicU64,
@@ -424,6 +439,15 @@ impl L0Metrics {
     pub(crate) fn record_read_fallback(&self) {
         self.read_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
+    /// Record one fold over `ops` op records.
+    ///
+    /// Called per fold, not per batch: `unclaimed_scan` folds each command
+    /// separately, so N commands record N folds. That keeps `ops_folded / folds`
+    /// meaningful as "mean ops per command" rather than "per scan".
+    pub(crate) fn record_fold(&self, ops: u64) {
+        self.folds.fetch_add(1, Ordering::Relaxed);
+        self.ops_folded.fetch_add(ops, Ordering::Relaxed);
+    }
     pub(crate) fn record_merge(&self, source_parts: u64, merged_bytes: u64) {
         self.merges.fetch_add(1, Ordering::Relaxed);
         self.parts_merged.fetch_add(source_parts, Ordering::Relaxed);
@@ -473,6 +497,8 @@ impl L0Metrics {
             tail_reclaim_bytes: self.tail_reclaim_bytes.load(Ordering::Relaxed),
             tail_reclaim_failed: self.tail_reclaim_failed.load(Ordering::Relaxed),
             tail_objects_retained: self.tail_objects_retained.load(Ordering::Relaxed),
+            folds: self.folds.load(Ordering::Relaxed),
+            ops_folded: self.ops_folded.load(Ordering::Relaxed),
             merges: self.merges.load(Ordering::Relaxed),
             parts_merged: self.parts_merged.load(Ordering::Relaxed),
             merged_bytes: self.merged_bytes.load(Ordering::Relaxed),
@@ -532,6 +558,8 @@ pub struct L0MetricsSnapshot {
     pub tail_reclaim_bytes: u64,
     pub tail_reclaim_failed: u64,
     pub tail_objects_retained: u64,
+    pub folds: u64,
+    pub ops_folded: u64,
     pub merges: u64,
     pub parts_merged: u64,
     pub merged_bytes: u64,
@@ -643,6 +671,16 @@ const SERIES: &[(&str, &str, &str)] = &[
     (
         "upload_lag_micros_total",
         "Summed upload lag in microseconds; divide by uploads for the mean.",
+        "counter",
+    ),
+    (
+        "folds",
+        "Fold operations performed — a command's op records reduced to its current state.",
+        "counter",
+    ),
+    (
+        "ops_folded",
+        "Op records consumed by folds. ops_folded/folds is the mean ops per fold; a rising mean on flat folds means commands accumulate ops faster than they retire.",
         "counter",
     ),
     ("merges", "Merge operations performed.", "counter"),
@@ -788,6 +826,8 @@ impl L0MetricsSnapshot {
             "uploads" => self.uploads,
             "upload_bytes" => self.upload_bytes,
             "upload_lag_micros_total" => self.upload_lag_micros_total,
+            "folds" => self.folds,
+            "ops_folded" => self.ops_folded,
             "merges" => self.merges,
             "parts_merged" => self.parts_merged,
             "merged_bytes" => self.merged_bytes,
