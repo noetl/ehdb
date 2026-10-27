@@ -113,6 +113,12 @@ pub(crate) const LAG_SCAN_CHUNK: usize = 4_096;
 /// ([`SubjectConsumerGroup::expire_now`]) — the same treatment
 /// [`ClaimCoordinator::release_conn`] gives a vanished connection's records —
 /// instead of sitting out a whole `ack_wait`.
+///
+/// ⚠ That covers a future dropped BEFORE the poll sends. One dropped AFTER the
+/// send but before it was polled again (the poll finished while the claim face
+/// was mid-heartbeat-write, and the write then failed) holds the delivery in
+/// the channel unreceived; the `Drop` of [`PendingPoll`] releases that one. The
+/// receiver is closed first, so exactly one side sees the orphan.
 pub(crate) async fn poll_assign_off_runtime<D>(
     group: &Arc<Mutex<SubjectConsumerGroup<D>>>,
     engine: Arc<FencedEngine<D>>,
@@ -141,11 +147,51 @@ where
             g.expire_now(orphan.sort_key);
         }
     });
-    rx.await.unwrap_or_else(|_| {
+    let mut pending = PendingPoll {
+        rx: Some(rx),
+        group: Arc::clone(group),
+    };
+    let received = pending.rx.as_mut().expect("set above").await;
+    // Received: nothing left for `Drop` to release.
+    pending.rx = None;
+    received.unwrap_or_else(|_| {
         Err(ehdb_core::EhdbError::InvalidState(
             "claim poll did not complete".into(),
         ))
     })
+}
+
+type PollResult<R> = ehdb_core::Result<Option<Delivery<R>>>;
+
+/// The receiving end of an off-runtime claim poll. Dropped with a delivery
+/// already sent but never received, it makes that record due again at once
+/// (see [`poll_assign_off_runtime`]).
+struct PendingPoll<D: Dataset> {
+    rx: Option<tokio::sync::oneshot::Receiver<PollResult<D::Record>>>,
+    group: Arc<Mutex<SubjectConsumerGroup<D>>>,
+}
+
+impl<D: Dataset> Drop for PendingPoll<D> {
+    fn drop(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+        // Closed first: a poll that has not sent yet now fails its send and
+        // releases the record itself; one that already sent is read here.
+        rx.close();
+        let Ok(Ok(Some(orphan))) = rx.try_recv() else {
+            return;
+        };
+        if let Ok(mut g) = self.group.try_lock() {
+            g.expire_now(orphan.sort_key);
+        } else if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let group = Arc::clone(&self.group);
+            rt.spawn(async move {
+                group.lock().await.expire_now(orphan.sort_key);
+            });
+        }
+        // Neither (no runtime left): the record redelivers after `ack_wait`.
+    }
 }
 
 // The heartbeat primitives moved to the crate root in noetl/ai-meta#225, when

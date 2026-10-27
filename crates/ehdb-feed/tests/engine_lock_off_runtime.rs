@@ -510,3 +510,53 @@ async fn an_abandoned_claim_gives_its_record_straight_back() {
         "it is a redelivery of the orphaned assignment"
     );
 }
+
+/// The other half of the abandoned-claim window: the blocking poll FINISHES
+/// (its result is already sitting in the channel) and only THEN is the claim
+/// future dropped, without being polled again. That is what the claim face does
+/// when the poll completes while a heartbeat write is pending and the write then
+/// fails. The receiver was still alive at send time, so the poll itself cannot
+/// see that nobody will take the record; dropping the future must release it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_dropped_after_its_poll_completed_gives_its_record_straight_back() {
+    let w = writer_with("orphan-late", 2);
+    let c = coordinator(&w);
+    let holder = hold_engine(&w, Duration::from_millis(500));
+    let mut abandoned = Box::pin({
+        let c = Arc::clone(&c);
+        async move { c.claim_next("commands.p.>", 1).await }
+    });
+    // Poll it into the contended path: the poll is now on the blocking pool.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut abandoned)
+            .await
+            .is_err(),
+        "the claim must still be waiting on the held engine lock"
+    );
+    holder.join().unwrap();
+    // Wait until the blocking poll has assigned record 1 (and sent it).
+    let t = Instant::now();
+    while c.inflight().await == 0 {
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the poll never assigned"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Abandon it with the delivery in hand but never received.
+    drop(abandoned);
+
+    let next = tokio::time::timeout(Duration::from_secs(5), c.claim_next("commands.p.>", 2))
+        .await
+        .expect("the next claim is served promptly");
+    assert_eq!(
+        next.sort_key, 1,
+        "record 1 was assigned, sent to a claim that was then dropped unpolled, and \
+         left in flight for the whole ack_wait; the next claimer got {} instead",
+        next.sort_key
+    );
+    assert!(
+        next.redelivered,
+        "it is a redelivery of the orphaned assignment"
+    );
+}
