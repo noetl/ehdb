@@ -220,6 +220,46 @@ fn read_index_vs_chain_length(c: &mut Criterion) {
     g.finish();
 }
 
+/// **Does driving merges change the post-seal read cost?** (noetl/ai-meta#453)
+///
+/// Past `seal_max_records` (1024) a key's records leave the in-memory active part
+/// for sealed parts on disk, and the per-record read cost steps ~15x. The merge
+/// policy only plans once a partition has `trigger_run_len` (4) consecutive small
+/// DURABLE parts, so a long chain can sit in many small parts before any merge.
+/// Each length is measured twice on its own engine: `unmerged` (sealed + uploaded,
+/// no merge driven) and `merged` (`run_pending_merges` driven to completion).
+///
+/// Positive control: the merged arm must report at least one merge at lengths
+/// that cross 4 sealed parts — a merge arm that merged nothing measures nothing.
+fn read_index_vs_parts(c: &mut Criterion) {
+    let mut g = c.benchmark_group("l0_read_index_vs_parts");
+    for len in [1100u64, 4400, 8800, 17600] {
+        for arm in ["unmerged", "merged"] {
+            let dir = unique_dir(&format!("parts{len}{arm}"));
+            let mut e = engine(&dir);
+            for i in 1..=len {
+                e.append_record(rec(i, "hot", 64)).expect("append");
+            }
+            e.flush_and_wait_uploads().expect("flush");
+            if arm == "merged" {
+                let merged = e.run_pending_merges().expect("merge");
+                if len > 4 * 1024 {
+                    assert!(merged > 0, "merged arm at {len} merged nothing");
+                }
+            }
+            g.throughput(Throughput::Elements(len));
+            g.bench_with_input(BenchmarkId::new(arm, len), &len, |b, _| {
+                b.iter(|| {
+                    let got = e.read_index_after("hot", 0).expect("read");
+                    assert_eq!(got.len() as u64, len);
+                    std::hint::black_box(got.len())
+                });
+            });
+        }
+    }
+    g.finish();
+}
+
 /// **Partition scan**, the follower/catch-up path, as a rate over records scanned.
 fn partition_scan(c: &mut Criterion) {
     let mut g = c.benchmark_group("l0_partition_scan");
@@ -255,6 +295,7 @@ criterion_group!(
     append_throughput,
     group_commit,
     read_index_vs_chain_length,
+    read_index_vs_parts,
     partition_scan
 );
 criterion_main!(benches);
