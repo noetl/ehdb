@@ -157,7 +157,24 @@ where
                     }
                 }
                 let batch_len = batch.len();
-                let seqs = match writer.append_batch(std::mem::take(&mut batch)) {
+                // ⚠ On the blocking pool (noetl/ai-meta#501): the append waits
+                // for the engine lock behind any other holder and then fsyncs,
+                // and neither may park a runtime worker. Every publisher
+                // connection has its own committer, so inline this was one
+                // parked worker per connection whenever the lock was held.
+                let appended = {
+                    let w = Arc::clone(&writer);
+                    let records = std::mem::take(&mut batch);
+                    tokio::task::spawn_blocking(move || w.append_batch(records))
+                        .await
+                        .unwrap_or_else(|e| {
+                            if e.is_panic() {
+                                std::panic::resume_unwind(e.into_panic());
+                            }
+                            Err(io_err(e))
+                        })
+                };
+                let seqs = match appended {
                     Ok(s) => s,
                     Err(e) => {
                         // noetl/ehdb#345 — this used to discard `e` and `return`.
