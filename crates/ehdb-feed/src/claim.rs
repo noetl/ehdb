@@ -49,8 +49,9 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
 
 use crate::cursor::{CursorFallback, CursorOrigin, CursorStore, ResumeReport};
-use crate::group::{MemberId, SubjectConsumerGroup};
-use crate::subject::{Subject, SubjectFn};
+use crate::fenced_engine::FencedEngine;
+use crate::group::{Delivery, MemberId, SubjectConsumerGroup};
+use crate::subject::{Subject, SubjectFilter, SubjectFn};
 use crate::{io_err, read_frame, write_frame, FeedWriter};
 
 /// The default pool token — matches the server's default `execution_pool`
@@ -88,6 +89,65 @@ pub fn d1_command_subject(shard_count: u32) -> SubjectFn<EventRecord> {
 /// `ack_wait` redelivery surfaces even with no new appends.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 
+/// Records read per engine-lock hold by the lag samplers
+/// ([`ClaimCoordinator::lag`], [`ClaimCoordinator::subject_lags`], the events
+/// groups' lags). Each used to be ONE unbounded `read_partition_after` of the
+/// whole backlog under the lock, on a runtime worker, every 2 s
+/// (noetl/ai-meta#501).
+pub(crate) const LAG_SCAN_CHUNK: usize = 4_096;
+
+/// One [`SubjectConsumerGroup::poll_assign`] on a shared group, **without ever
+/// parking a Tokio worker on the engine lock** (noetl/ai-meta#501).
+///
+/// The group's async lock is taken first (an await, never a park). Then:
+///
+/// - engine lock free (the common case) → assign right here, as before;
+/// - engine lock held (a startup scan chunk, a seal, an append) → wait for it
+///   on the blocking pool, carrying the group guard along, so the runtime worker
+///   is released for every other face while this claim waits.
+///
+/// ⚠ Cancellation. A claim future dropped while its blocking poll is in flight
+/// (the claimer's connection went away) cannot stop that poll, which may then
+/// assign a record to nobody. The result travels back over a oneshot, and a
+/// record whose receiver is gone is made due again on the spot
+/// ([`SubjectConsumerGroup::expire_now`]) — the same treatment
+/// [`ClaimCoordinator::release_conn`] gives a vanished connection's records —
+/// instead of sitting out a whole `ack_wait`.
+pub(crate) async fn poll_assign_off_runtime<D>(
+    group: &Arc<Mutex<SubjectConsumerGroup<D>>>,
+    engine: Arc<FencedEngine<D>>,
+    filter: &SubjectFilter,
+    member: MemberId,
+    clock: Instant,
+) -> ehdb_core::Result<Option<Delivery<D::Record>>>
+where
+    D: Dataset,
+    D::Record: Clone + Send + 'static,
+{
+    let mut g = Arc::clone(group).lock_owned().await;
+    if let Some(e) = engine.try_read() {
+        return g.poll_assign(&e, filter, member, clock.elapsed().as_millis() as u64);
+    }
+    let filter = filter.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let assigned = {
+            let e = engine.read();
+            // Clock read AFTER the wait, so the ack_wait deadline starts when
+            // the record is actually handed out.
+            g.poll_assign(&e, &filter, member, clock.elapsed().as_millis() as u64)
+        };
+        if let Err(Ok(Some(orphan))) = tx.send(assigned) {
+            g.expire_now(orphan.sort_key);
+        }
+    });
+    rx.await.unwrap_or_else(|_| {
+        Err(ehdb_core::EhdbError::InvalidState(
+            "claim poll did not complete".into(),
+        ))
+    })
+}
+
 // The heartbeat primitives moved to the crate root in noetl/ai-meta#225, when
 // the events group-claim (:9104) and WAL fan-out (:9108) faces adopted the same
 // mechanism this face got in #208. Re-exported here so `claim::DEFAULT_HEARTBEAT`
@@ -100,7 +160,9 @@ pub use crate::{DEFAULT_HEARTBEAT, HEARTBEAT_MISS_FACTOR};
 /// through it, so a command is delivered to exactly one member.
 pub struct ClaimCoordinator<D: Dataset> {
     writer: Arc<FeedWriter<D>>,
-    group: Mutex<SubjectConsumerGroup<D>>,
+    /// `Arc` so a poll waiting on a contended engine lock can carry the group
+    /// guard to the blocking pool ([`poll_assign_off_runtime`]).
+    group: Arc<Mutex<SubjectConsumerGroup<D>>>,
     clock: Instant,
     poll_interval: Duration,
     /// Where this coordinator's committed cursor is persisted, when the host
@@ -290,12 +352,12 @@ where
         let poll_interval =
             Duration::from_millis(DEFAULT_POLL_INTERVAL_MS.min(ack_wait_ticks.max(1)));
         Self {
-            group: Mutex::new(SubjectConsumerGroup::new(
+            group: Arc::new(Mutex::new(SubjectConsumerGroup::new(
                 shard,
                 ack_wait_ticks,
                 from_cursor,
                 subject_of,
-            )),
+            ))),
             writer,
             clock: Instant::now(),
             poll_interval,
@@ -320,10 +382,6 @@ where
     /// mistake "no durable progress configured" for "resumed at 0".
     pub fn resume_report(&self) -> Option<ResumeReport> {
         self.resume_report
-    }
-
-    fn now_ticks(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64
     }
 
     /// Claim the next command **matching `filter`** for `member`, **blocking**
@@ -381,14 +439,17 @@ where
         let filter = crate::subject::SubjectFilter::parse(filter);
         let mut tip_rx = self.writer.tip_receiver();
         loop {
-            let assigned = {
-                // Async lock FIRST (may await), then the engine's sync lock — no
-                // std guard is ever held across an await.
-                let mut group = self.group.lock().await;
-                let engine = self.writer.engine();
-                let e = engine.read();
-                group.poll_assign(&e, &filter, member, self.now_ticks())
-            };
+            // Async group lock first, then the engine lock — taken on the
+            // blocking pool whenever it is contended, never parked on here
+            // (noetl/ai-meta#501).
+            let assigned = poll_assign_off_runtime(
+                &self.group,
+                self.writer.engine(),
+                &filter,
+                member,
+                self.clock,
+            )
+            .await;
             match assigned {
                 Ok(Some(delivery)) => return delivery,
                 Ok(None) => {
@@ -419,27 +480,60 @@ where
 
     /// The shard's current backlog (undelivered + in-flight-unacked) — the KEDA
     /// lag value for this shard (see [`crate::scaler`]).
+    ///
+    /// ⚠ Counted off the runtime in [`LAG_SCAN_CHUNK`]-record holds, from the
+    /// committed cursor read under the group lock (noetl/ai-meta#501). Records
+    /// appended or acked while it counts may or may not be in this sample; the
+    /// next tick has them.
     pub async fn lag(&self) -> u64 {
-        let group = self.group.lock().await;
-        let engine = self.writer.engine();
-        let e = engine.read();
-        group.lag(&e).unwrap_or(0)
+        let (shard, cursor) = {
+            let group = self.group.lock().await;
+            (group.shard(), group.committed_cursor())
+        };
+        self.writer
+            .engine()
+            .fold_after_off_runtime(shard, cursor, LAG_SCAN_CHUNK, 0u64, |n, _| *n += 1)
+            .await
+            .unwrap_or(0)
     }
 
     /// This shard's backlog split by routing subject — the **per-pool** KEDA lag
     /// value (see [`SubjectConsumerGroup::subject_lags`]). `lag()` is whole-shard
     /// and so mixes the pools that share the shard; a pool's ScaledObject wants
     /// only its own subject (noetl/ai-meta#194 T2).
+    ///
+    /// ⚠ The group's own `pending` + `inflight` and the frontier are snapshotted
+    /// together under the group lock; the not-yet-pulled tail past that frontier
+    /// is then counted off the runtime in bounded holds (noetl/ai-meta#501). It
+    /// used to be one unbounded read of the whole tail under BOTH locks, on a
+    /// runtime worker, every sampler tick.
     pub async fn subject_lags(&self) -> Vec<crate::scaler::SubjectLag> {
-        let group = self.group.lock().await;
-        let engine = self.writer.engine();
-        let e = engine.read();
-        group
-            .subject_lags(&e)
+        let (shard, frontier, in_hand, subject_of) = {
+            let group = self.group.lock().await;
+            (
+                group.shard(),
+                group.delivered_frontier(),
+                group.subject_counts_in_hand(),
+                group.subject_fn(),
+            )
+        };
+        self.writer
+            .engine()
+            .fold_after_off_runtime(
+                shard,
+                frontier,
+                LAG_SCAN_CHUNK,
+                in_hand,
+                move |counts, rec| *counts.entry(subject_of(rec).as_str()).or_insert(0) += 1,
+            )
+            .await
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|(subject, lag)| crate::scaler::SubjectLag { subject, lag })
+                    .collect()
+            })
             .unwrap_or_default()
-            .into_iter()
-            .map(|(subject, lag)| crate::scaler::SubjectLag { subject, lag })
-            .collect()
     }
 
     /// Seed the reported subject label set from the shard's existing log, so a
@@ -447,11 +541,31 @@ where
     /// carried rather than an empty label set
     /// ([`SubjectConsumerGroup::seed_subjects`]). Best-effort: a read error
     /// leaves the set to fill in from live traffic.
+    ///
+    /// ⚠ The log is read off the runtime in bounded holds and the group lock is
+    /// taken only to merge the result (noetl/ai-meta#501): this used to read the
+    /// whole retained log in one call under both locks, on a runtime worker —
+    /// the prod 2026-10-24 freeze.
     pub async fn seed_subjects(&self) {
-        let mut group = self.group.lock().await;
-        let engine = self.writer.engine();
-        let e = engine.read();
-        let _ = group.seed_subjects(&e);
+        let (shard, subject_of) = {
+            let group = self.group.lock().await;
+            (group.shard(), group.subject_fn())
+        };
+        let seen = self
+            .writer
+            .engine()
+            .fold_after_off_runtime(
+                shard,
+                0,
+                LAG_SCAN_CHUNK,
+                std::collections::BTreeSet::new(),
+                move |set, rec| {
+                    set.insert(subject_of(rec).as_str());
+                },
+            )
+            .await
+            .unwrap_or_default();
+        self.group.lock().await.note_subjects(seen);
     }
 
     /// The group's contiguous acked-through cursor — everything at or below it is

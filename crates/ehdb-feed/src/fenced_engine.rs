@@ -174,6 +174,88 @@ impl<D: Dataset> FencedEngine<D> {
         })
     }
 
+    /// Run `f` against the engine **without ever parking a Tokio worker on the
+    /// engine lock** (noetl/ai-meta#501).
+    ///
+    /// The lock is a `std::sync::Mutex`, so `read()` on an async path blocks the
+    /// runtime worker it runs on for as long as *any* other holder keeps it. The
+    /// command-bus writer runs a handful of workers on a 2-CPU quota, and a few
+    /// such waits behind one long holder (a startup scan chunk, a seal) stopped
+    /// it answering even faces that never touch this engine.
+    ///
+    /// Uncontended — the common case — `f` runs right here, so the hot path pays
+    /// nothing extra. Contended, the wait moves to the blocking pool, where a
+    /// parked thread costs no runtime capacity. `f` should be bounded work
+    /// (a `ChangeFeed::poll`, a `global_sequence`): the fast path runs it on the
+    /// runtime with the lock held.
+    ///
+    /// A panic in `f` is resumed on the caller, as it would have been inline.
+    pub async fn read_off_runtime<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        F: FnOnce(&L0Engine<D>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(e) = self.try_read() {
+            return Ok(f(&e));
+        }
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || f(&me.read()))
+            .await
+            .map_err(join_error)
+    }
+
+    /// Fold `visit` over every record of `shard` with sort key `> after` — on the
+    /// blocking pool, holding the engine lock for at most `chunk` records at a
+    /// time (noetl/ai-meta#501).
+    ///
+    /// For the periodic lag counts, which were one unbounded
+    /// `read_partition_after` under the lock: O(backlog) per hold, on a runtime
+    /// worker, every sampler tick. Bounding each hold lets appends and claims
+    /// interleave between chunks.
+    ///
+    /// A read error ends the scan and is returned; what was folded so far is
+    /// discarded with it, so a caller can never mistake a partial count for a
+    /// whole one.
+    pub async fn fold_after_off_runtime<S, F>(
+        self: &Arc<Self>,
+        shard: u32,
+        after: u64,
+        chunk: usize,
+        init: S,
+        mut visit: F,
+    ) -> Result<S>
+    where
+        S: Send + 'static,
+        F: FnMut(&mut S, &D::Record) + Send + 'static,
+    {
+        let me = Arc::clone(self);
+        let chunk = chunk.max(1);
+        tokio::task::spawn_blocking(move || -> Result<S> {
+            let mut acc = init;
+            let mut cursor = after;
+            loop {
+                // ONE bounded hold, released before the visit and the next read.
+                let batch = {
+                    let e = me.read();
+                    e.read_partition_after_limited(shard, cursor, chunk)?
+                };
+                let Some(last) = batch.last() else { break };
+                cursor = D::sort_key(last);
+                for rec in &batch {
+                    visit(&mut acc, rec);
+                }
+                // A short batch was the tail at that instant: stop there, so a
+                // log appended to while it is counted cannot keep the scan alive.
+                if batch.len() < chunk {
+                    break;
+                }
+            }
+            Ok(acc)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     /// ⚠ Poison is recovered rather than propagated. A panic while holding the
     /// engine lock must not convert into every subsequent append failing — the
     /// engine's own invariants are restored on open, and refusing all writes
@@ -185,5 +267,15 @@ impl<D: Dataset> FencedEngine<D> {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+/// A blocking-pool task that panicked re-panics on the caller (exactly what the
+/// inline call would have done); one cancelled by a runtime shutting down is an
+/// ordinary error.
+pub(crate) fn join_error(e: tokio::task::JoinError) -> ehdb_core::EhdbError {
+    match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(e) => ehdb_core::EhdbError::InvalidState(format!("engine task cancelled: {e}")),
     }
 }

@@ -21,6 +21,7 @@
 //! it resumes exactly where the group left off (the durable-progress seam).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use ehdb_core::Result;
 use ehdb_l0::{ChangeFeed, Dataset, L0Engine};
@@ -378,6 +379,12 @@ where
         Ok(())
     }
 
+    /// Add `subjects` to the reported label set without delivering anything —
+    /// the merge half of an off-runtime seed (noetl/ai-meta#501).
+    pub(crate) fn note_subjects(&mut self, subjects: impl IntoIterator<Item = String>) {
+        self.seen_subjects.extend(subjects);
+    }
+
     /// Every subject this group reports a lag for — the seeded/seen label set.
     pub fn seen_subjects(&self) -> impl Iterator<Item = &str> {
         self.seen_subjects.iter().map(String::as_str)
@@ -408,6 +415,20 @@ where
     /// nothing above the cursor has been acked; otherwise they sum to less, which
     /// is the honest number.
     pub fn subject_lags(&self, engine: &L0Engine<D>) -> Result<Vec<(String, u64)>> {
+        let mut counts = self.subject_counts_in_hand();
+        // The tail the group has not pulled yet — real backlog, not yet tagged.
+        for rec in engine.read_partition_after(self.shard, self.delivered_frontier)? {
+            *counts.entry((self.subject_of)(&rec).as_str()).or_insert(0) += 1;
+        }
+        Ok(counts.into_iter().collect())
+    }
+
+    /// The half of [`subject_lags`](Self::subject_lags) that needs no engine:
+    /// every seen subject at 0, plus what the group holds (`pending` +
+    /// `inflight`). The other half is the tail past
+    /// [`delivered_frontier`](Self::delivered_frontier), which the async
+    /// coordinator counts off the runtime in bounded chunks (noetl/ai-meta#501).
+    pub(crate) fn subject_counts_in_hand(&self) -> BTreeMap<String, u64> {
         let mut counts: BTreeMap<String, u64> = self
             .seen_subjects
             .iter()
@@ -420,11 +441,18 @@ where
         for f in self.inflight.values() {
             bump(f.subject.as_str());
         }
-        // The tail the group has not pulled yet — real backlog, not yet tagged.
-        for rec in engine.read_partition_after(self.shard, self.delivered_frontier)? {
-            bump((self.subject_of)(&rec).as_str());
-        }
-        Ok(counts.into_iter().collect())
+        counts
+    }
+
+    /// Highest sort key ever pulled from the feed; everything above it is the
+    /// not-yet-pulled tail.
+    pub(crate) fn delivered_frontier(&self) -> u64 {
+        self.delivered_frontier
+    }
+
+    /// The routing function this group tags records with.
+    pub(crate) fn subject_fn(&self) -> SubjectFn<D::Record> {
+        Arc::clone(&self.subject_of)
     }
 
     /// Assign the next record **matching `filter`** to `member` at logical time

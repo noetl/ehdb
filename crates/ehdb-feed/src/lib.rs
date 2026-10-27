@@ -651,9 +651,19 @@ where
         write_frame(&mut sock, HEARTBEAT_FRAME).await?;
     }
     loop {
+        // ⚠ Never parked on the engine lock here (noetl/ai-meta#501): this is the
+        // WAL fan-out every system pool resumes from, and a runtime worker
+        // waiting out another holder's lock is a worker no other face gets.
         let batch = {
-            let engine = engine.read();
-            feed.poll(&engine).map_err(io_err)?
+            let (polled, result) = engine
+                .read_off_runtime(move |e| {
+                    let r = feed.poll(e);
+                    (feed, r)
+                })
+                .await
+                .map_err(io_err)?;
+            feed = polled;
+            result.map_err(io_err)?
         };
         if !batch.is_empty() {
             let body = serde_json::to_vec(&batch).map_err(io_err)?;
