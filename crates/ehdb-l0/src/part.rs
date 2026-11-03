@@ -19,7 +19,7 @@
 //! the hot buffer regardless of flush posture — read-your-writes for the tail.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -299,56 +299,88 @@ impl<D: Dataset> PartWriter<D> {
             .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
         let frame = encode_frame(&body)?;
 
+        let mark_offset = self.byte_len;
+
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EhdbError::InvalidState("l0 part writer has no active file".into()))?;
+
+        // ⚠ Write and (policy-dependent) sync as one fallible unit, and undo it
+        // on failure (noetl/ehdb#426). A failed `write_all` can leave a partial
+        // frame on disk, and a failed `sync` leaves a whole one, while the
+        // in-memory state below never counted it. The next append then lands
+        // after those bytes but is indexed at `byte_len`, which no longer
+        // matches the file — marks point at the wrong frame, and on restart the
+        // recovered part contains a record the caller was told had failed.
+        let mut synced = false;
+        let write_frame = |file: &mut File| -> std::io::Result<()> {
+            if crate::fault::should_fail_write_partway() {
+                file.write_all(&frame[..frame.len() / 2])?;
+                return Err(std::io::Error::other(
+                    "injected partial write (ehdb-l0 fault seam)",
+                ));
+            }
+            file.write_all(&frame)
+        };
+        let sync = |file: &mut File| -> std::io::Result<()> {
+            if crate::fault::should_fail_sync() {
+                return Err(std::io::Error::other(
+                    "injected sync failure (ehdb-l0 fault seam)",
+                ));
+            }
+            file.sync_data()
+        };
+        let written = write_frame(file).and_then(|()| match self.flush {
+            FlushPolicy::EveryAppend => {
+                synced = true;
+                sync(file)
+            }
+            FlushPolicy::Buffered { fsync_every } => {
+                if self.unflushed_since_fsync + 1 >= fsync_every.max(1) {
+                    synced = true;
+                    sync(file)
+                } else {
+                    Ok(())
+                }
+            }
+            // The caller closes the durability window (group commit) — see
+            // `sync`.
+            FlushPolicy::CallerDriven => Ok(()),
+        });
+        if let Err(err) = written {
+            return Err(self.roll_back_to(mark_offset, err));
+        }
+        if synced {
+            self.unflushed_since_fsync = 0;
+        } else {
+            // Track the debt so `sync` can skip a no-op fsync.
+            self.unflushed_since_fsync += 1;
+        }
+
         // Chain certificate (noetl/ai-meta#366). `body` IS the bytes this
-        // append writes, so the digest costs only SHA-256 block processing.
+        // append wrote, so the digest costs only SHA-256 block processing.
         // Keyed by the dataset's index dimension (`execution_id` for D1)
         // because the certificate is a per-execution quantity while a
         // PartWriter carries many executions.
         //
-        // ⚠ Placed BEFORE the write, so a record that fails to write is not in
-        // a chain that claims to cover it. The chain must describe what is
-        // durable, and the write below is the thing that can fail.
+        // ⚠ AFTER the write succeeds (noetl/ehdb#426). It used to run before
+        // the write on the reasoning that a failed record must not be in the
+        // chain — but absorbing first is exactly what puts it there. The chain
+        // must describe what is on disk.
         #[cfg(feature = "chain-cert")]
         if self.chain_cert_enabled {
             self.chain_certs.absorb(D::index_key(&record), &body);
         }
 
-        let mark_offset = self.byte_len;
-
-        // Start-of-granule mark: first record of each granule.
+        // Start-of-granule mark: first record of each granule. Pushed only
+        // once the frame is on disk, so a failed append leaves no mark behind.
         if self.record_count % self.granule_size as u64 == 0 {
             self.marks.push(GranuleMark {
                 first_sequence: sort_key,
                 byte_offset: mark_offset,
                 record_count: 0,
             });
-        }
-
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| EhdbError::InvalidState("l0 part writer has no active file".into()))?;
-        file.write_all(&frame)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
-
-        match self.flush {
-            FlushPolicy::EveryAppend => {
-                file.sync_data()
-                    .map_err(|err| EhdbError::Storage(err.to_string()))?;
-            }
-            FlushPolicy::Buffered { fsync_every } => {
-                self.unflushed_since_fsync += 1;
-                if self.unflushed_since_fsync >= fsync_every.max(1) {
-                    file.sync_data()
-                        .map_err(|err| EhdbError::Storage(err.to_string()))?;
-                    self.unflushed_since_fsync = 0;
-                }
-            }
-            // The caller closes the durability window (group commit) — see
-            // `sync`. Track the debt so `sync` can skip a no-op fsync.
-            FlushPolicy::CallerDriven => {
-                self.unflushed_since_fsync += 1;
-            }
         }
 
         if self.record_count == 0 {
@@ -366,6 +398,36 @@ impl<D: Dataset> PartWriter<D> {
         }
         self.records.push(record);
         Ok(mark_offset)
+    }
+
+    /// Undo a failed append: cut the active file back to `offset` (the end of
+    /// the last frame the in-memory state counts) and return the error to
+    /// report. Nothing in memory was advanced before the failure, so only the
+    /// file needs repairing.
+    ///
+    /// If the truncate itself fails the file and the state can no longer be
+    /// reconciled, so the writer drops its file handle: every later append
+    /// errors with "no active file" instead of writing at a wrong offset, and a
+    /// restart replays whatever intact frames are on disk.
+    fn roll_back_to(&mut self, offset: u64, cause: std::io::Error) -> EhdbError {
+        let repaired = self
+            .file
+            .as_mut()
+            .map(|f| {
+                f.set_len(offset)
+                    .and_then(|()| f.seek(SeekFrom::Start(offset)).map(|_| ()))
+            })
+            .unwrap_or(Ok(()));
+        match repaired {
+            Ok(()) => EhdbError::Storage(cause.to_string()),
+            Err(trunc) => {
+                self.file = None;
+                EhdbError::Storage(format!(
+                    "{cause}; rolling the active part back to {offset} also failed ({trunc}), \
+                     writer disabled until reopen"
+                ))
+            }
+        }
     }
 
     /// Turn chain certification on or off for this writer
@@ -541,8 +603,28 @@ impl<D: Dataset> PartWriter<D> {
         );
         let final_name = format!("{part_id}.eslog");
         let final_path = self.part_dir.join(&final_name);
-        fs::rename(&self.active_path, &final_path)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        if let Err(err) = fs::rename(&self.active_path, &final_path) {
+            // ⚠ Reopen before reporting (noetl/ehdb#426). The handle was closed
+            // above, so returning here used to leave the writer with no active
+            // file: every later append failed until a restart. Nothing has been
+            // taken out of `self` yet, so the part is intact and the next seal
+            // attempt retries it.
+            self.file = Some(
+                OpenOptions::new()
+                    .append(true)
+                    .open(&self.active_path)
+                    .map_err(|reopen| {
+                        EhdbError::Storage(format!(
+                            "seal rename failed ({err}); reopening the active part also failed \
+                             ({reopen})"
+                        ))
+                    })?,
+            );
+            return Err(EhdbError::Storage(format!("seal rename: {err}")));
+        }
+        // The rename is only durable once the directory entry is: without this
+        // a power loss can bring back `part-N.active` *and* lose the `.eslog`.
+        sync_dir(&self.part_dir)?;
 
         let marks = std::mem::take(&mut self.marks);
         let records = std::mem::take(&mut self.records);

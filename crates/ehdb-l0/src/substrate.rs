@@ -141,27 +141,74 @@ impl LocalFsSubstrate {
         Ok(self.root.join(key))
     }
 
-    fn write_atomic(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let target = self.resolve(key)?;
+    /// Write `bytes` to a fresh temp file beside `target` and `sync_data` it.
+    /// Returns the temp path; the caller publishes it (rename or link) and is
+    /// responsible for removing it on its own failure paths.
+    fn write_tmp(&self, target: &Path, bytes: &[u8]) -> Result<PathBuf> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
-        let tmp = target.with_extension("tmp");
-        {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(|err| EhdbError::Storage(err.to_string()))?;
-            f.write_all(bytes)
-                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        let tmp = unique_tmp_path(target);
+        let written = (|| -> std::io::Result<()> {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(bytes)?;
             f.sync_data()
-                .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        })();
+        if let Err(err) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(EhdbError::Storage(err.to_string()));
         }
-        fs::rename(&tmp, &target).map_err(|err| EhdbError::Storage(err.to_string()))?;
-        Ok(())
+        Ok(tmp)
     }
+
+    /// Write-temp, rename over `key`, then fsync the parent directory.
+    ///
+    /// ⚠ The temp name is unique per call (noetl/ehdb#426). It used to be
+    /// `target.with_extension("tmp")`, which two writers share whenever their
+    /// keys differ only in extension (`x.eslog` / `x.idx` → `x.tmp`) or are the
+    /// same key written concurrently (`LATEST` from the uploader thread and the
+    /// merge path). Both then open-truncate-write one file and the loser's
+    /// rename publishes the winner's bytes, or a mix of both.
+    ///
+    /// ⚠ The directory fsync is what makes the *rename* durable. Without it a
+    /// power loss can roll the directory entry back to the old object even
+    /// though the new bytes were synced.
+    fn write_atomic(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let target = self.resolve(key)?;
+        let tmp = self.write_tmp(&target, bytes)?;
+        if let Err(err) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(EhdbError::Storage(err.to_string()));
+        }
+        sync_parent_dir(&target)
+    }
+}
+
+/// A temp path next to `target` that no other writer, in this process or any
+/// other, will choose: `.<file name>.<pid>.<per-process counter>.tmp`. Keeps
+/// the `tmp` extension, so [`walk_keys`] still never lists it.
+fn unique_tmp_path(target: &Path) -> PathBuf {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// `fsync` the directory holding `path`, so a rename or link into it survives a
+/// power loss. A no-op where directories cannot be opened for sync (non-unix).
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|err| EhdbError::Storage(format!("fsync dir {}: {err}", parent.display())))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 impl LocalFsSubstrate {
@@ -181,11 +228,26 @@ impl DurableSubstrate for LocalFsSubstrate {
 
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         let target = self.resolve(key)?;
+        // Fast path only — it skips the write for the common re-upload, but it
+        // is NOT the guarantee. The link below is.
         if target.exists() {
             return Ok(false);
         }
-        self.write_atomic(key, bytes)?;
-        Ok(true)
+        let tmp = self.write_tmp(&target, bytes)?;
+        // ⚠ `hard_link` fails with `AlreadyExists` if anything is at `target`,
+        // atomically, so exactly one of N concurrent writers can win
+        // (noetl/ehdb#426). The old `exists()` + rename let every racer pass
+        // the check and each rename over the last, all returning `true`.
+        let linked = fs::hard_link(&tmp, &target);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                sync_parent_dir(&target)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(EhdbError::Storage(err.to_string())),
+        }
     }
 
     fn put_overwrite(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -507,6 +569,127 @@ mod tests {
         let mid = store.get_range("parts/a.eslog", 4, 6).unwrap();
         assert_eq!(mid, b"456789");
         assert_eq!(store.get_all("parts/a.eslog").unwrap(), data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// noetl/ehdb#426: keys that differ only in extension used to share one
+    /// temp file (`x.tmp`), and so did two writes of the same key.
+    #[test]
+    fn temp_names_are_unique_per_write() {
+        let a = unique_tmp_path(Path::new("/r/parts/x.eslog"));
+        let b = unique_tmp_path(Path::new("/r/parts/x.idx"));
+        let c = unique_tmp_path(Path::new("/r/parts/x.eslog"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        for p in [&a, &b, &c] {
+            assert_eq!(
+                p.extension().unwrap(),
+                "tmp",
+                "walk_keys must keep skipping it"
+            );
+            assert_eq!(
+                p.parent().unwrap(),
+                Path::new("/r/parts"),
+                "rename must stay in-dir"
+            );
+        }
+    }
+
+    /// Concurrent writers of keys that differ only in extension each publish
+    /// their own bytes, and no temp file is left behind or listed.
+    #[test]
+    fn concurrent_sibling_keys_do_not_cross_publish() {
+        let dir = tmp();
+        let store = Arc::new(LocalFsSubstrate::new(&dir).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["eslog", "idx"]
+            .into_iter()
+            .map(|ext| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..200u32 {
+                        let body = format!("{ext}-{i}-").repeat(64);
+                        store
+                            .put_overwrite(&format!("p/x.{ext}"), body.as_bytes())
+                            .unwrap();
+                        let got = store.get_all(&format!("p/x.{ext}")).unwrap();
+                        assert!(
+                            got.starts_with(ext.as_bytes()),
+                            "{ext} read back another key's bytes"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut keys = store.list_prefix("p/").unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["p/x.eslog".to_string(), "p/x.idx".to_string()]);
+        let leftovers: Vec<_> = fs::read_dir(dir.join("p"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "tmp").unwrap_or(false))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// noetl/ehdb#426: `put_if_absent` must have exactly one winner under
+    /// contention, and the stored bytes must be that winner's.
+    #[test]
+    fn put_if_absent_has_exactly_one_winner() {
+        for round in 0..20 {
+            let dir = tmp();
+            let store = Arc::new(LocalFsSubstrate::new(&dir).unwrap());
+            let n = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(n));
+            let handles: Vec<_> = (0..n)
+                .map(|i| {
+                    let store = Arc::clone(&store);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let body = format!("writer-{i}-").repeat(4096);
+                        barrier.wait();
+                        let won = store
+                            .put_if_absent("parts/k.eslog", body.as_bytes())
+                            .unwrap();
+                        (won, body)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners: Vec<_> = results.iter().filter(|(w, _)| *w).collect();
+            assert_eq!(
+                winners.len(),
+                1,
+                "round {round}: {} writers claimed the key",
+                winners.len()
+            );
+            assert_eq!(
+                store.get_all("parts/k.eslog").unwrap(),
+                winners[0].1.as_bytes(),
+                "round {round}: stored bytes are not the winner's"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An existing object is never replaced by `put_if_absent`, even when the
+    /// fast-path `exists()` check is bypassed by a concurrent create.
+    #[test]
+    fn put_if_absent_never_replaces() {
+        let dir = tmp();
+        let store = LocalFsSubstrate::new(&dir).unwrap();
+        assert!(store.put_if_absent("a/b", b"first").unwrap());
+        assert!(!store.put_if_absent("a/b", b"second").unwrap());
+        assert_eq!(store.get_all("a/b").unwrap(), b"first");
         let _ = fs::remove_dir_all(&dir);
     }
 
