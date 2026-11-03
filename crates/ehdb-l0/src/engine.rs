@@ -35,7 +35,7 @@ use ehdb_core::{EhdbError, Result};
 
 use crate::catalog::{Manifest, PartMeta, ReplicaLocation};
 use crate::dataset::{D1EventLog, Dataset, EventRecord, DATASET_D1_EVENT_LOG, DEFAULT_SHARD_COUNT};
-use crate::frame::{iter_frames_from, FRAME_HEADER_LEN};
+use crate::frame::{iter_frames_exact, iter_frames_from, FRAME_HEADER_LEN};
 
 /// Floor on an incremental feed read (noetl/ehdb#389).
 ///
@@ -1584,7 +1584,7 @@ impl<D: Dataset> L0Engine<D> {
         let mut records: Vec<D::Record> = Vec::new();
         for src in &sources {
             let bytes = self.read_whole_part(src)?;
-            for frame in iter_frames_from(&bytes, 0)? {
+            for frame in iter_frames_exact(&bytes, 0)? {
                 let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
                     EhdbError::Storage(format!("decode l0 record on merge: {err}"))
                 })?;
@@ -1982,7 +1982,7 @@ impl<D: Dataset> L0Engine<D> {
                     substrate.get_range(key, block_start, len)
                 })?
             };
-            for frame in iter_frames_from(&block, 0)? {
+            for frame in iter_frames_exact(&block, 0)? {
                 let rec: D::Record = serde_json::from_slice(frame.body).map_err(|err| {
                     EhdbError::Storage(format!("decode l0 record in part {}: {err}", part.part_id))
                 })?;
@@ -2201,7 +2201,7 @@ impl<D: Dataset> L0Engine<D> {
         };
         for part in &parts {
             let bytes = self.read_whole_part(part)?;
-            for frame in iter_frames_from(&bytes, 0)? {
+            for frame in iter_frames_exact(&bytes, 0)? {
                 let rec: D::Record = serde_json::from_slice(frame.body)
                     .map_err(|err| EhdbError::Storage(format!("decode l0 record: {err}")))?;
                 out.push(rec);
