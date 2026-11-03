@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -296,17 +296,17 @@ impl LocalJsonlSystemLibraryCatalog {
         let path = path.into();
         let mut inner = InMemorySystemLibraryCatalog::default();
 
-        if path.exists() {
-            let file = File::open(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-            for (index, line) in BufReader::new(file).lines().enumerate() {
-                let line = line.map_err(|err| EhdbError::Storage(err.to_string()))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let entry: SystemLibraryJournalEntry = serde_json::from_str(&line)
-                    .map_err(|err| map_system_library_journal_decode_error(index + 1, err))?;
-                apply_journal_entry(&mut inner, entry)?;
-            }
+        // A torn final line (a crash mid-append) is skipped and cut off, and a
+        // final record missing its newline is terminated, so one crash cannot
+        // make the journal unopenable — the #262 rule the transaction log
+        // already had, applied here too (noetl/ehdb#426). See
+        // `ehdb_core::journal::read_jsonl` for what is and is not tolerated.
+        let read = ehdb_core::journal::read_jsonl::<SystemLibraryJournalEntry>(
+            &path,
+            map_system_library_journal_decode_error,
+        )?;
+        for (_, entry) in read.entries {
+            apply_journal_entry(&mut inner, entry)?;
         }
 
         Ok(Self { path, inner })
@@ -818,6 +818,34 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_string(), serde_json::json!("field"));
         assert!(serde_json::from_value::<SystemLibraryBinding>(binding_json).is_err());
+    }
+
+    /// noetl/ehdb#426: the catalog journal tolerates a torn final line and stays
+    /// appendable, like the transaction log (#262).
+    #[test]
+    fn local_jsonl_catalog_survives_a_torn_tail_and_keeps_appending() {
+        use std::io::Write as _;
+        let path = temp_log_path("torn-tail");
+        let mut catalog = LocalJsonlSystemLibraryCatalog::open(&path).unwrap();
+        catalog
+            .publish(publish_request("system/catalog/bootstrap", 1, '1'))
+            .unwrap();
+        drop(catalog);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"Publish\":{\"pa")
+            .unwrap();
+
+        let mut catalog = LocalJsonlSystemLibraryCatalog::open(&path)
+            .expect("a torn tail must not fail the open");
+        catalog
+            .publish(publish_request("system/catalog/bootstrap", 2, '2'))
+            .unwrap();
+        drop(catalog);
+        LocalJsonlSystemLibraryCatalog::open(&path).expect("one crash + one append must reopen");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

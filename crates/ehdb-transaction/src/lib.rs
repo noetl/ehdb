@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -450,82 +450,26 @@ impl LocalJsonlTransactionLog {
         let path = path.into();
         let mut inner = InMemoryTransactionLog::default();
 
-        let mut torn_tail_skipped = 0usize;
-
-        if path.exists() {
-            let file = File::open(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-            let mut lines = BufReader::new(file).lines();
-            let mut index = 0usize;
-            while let Some(line) = lines.next() {
-                index += 1;
-                let line = line.map_err(|err| EhdbError::Storage(err.to_string()))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let record: TransactionRecord = match serde_json::from_str(&line) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        // noetl/ehdb#262 — a torn record is skipped ONLY when it is
-                        // the tail, and never silently.
-                        //
-                        // The asymmetry is derived from the append protocol, not
-                        // chosen by taste. `append_record_to_disk` is
-                        // `to_writer` -> `write_all(b"\n")` -> `sync_data()`, so a
-                        // crash between the JSON and the newline leaves a partial
-                        // FINAL line whose `sync_data` never completed. No writer
-                        // was ever told that record was durable, and the mirror's
-                        // retrying drain re-delivers it. Skipping it loses nothing
-                        // that was promised.
-                        //
-                        // A torn record with well-formed records AFTER it is the
-                        // opposite case: that record WAS acknowledged and is now
-                        // unreadable. Serving the log without it would be serving
-                        // an edited history, so it still fails the whole open —
-                        // which is the behaviour this function has always had.
-                        //
-                        // ⚠ The previous posture failed on BOTH. On prod
-                        // 2026-08-12 one torn record at line 45 of 46 made every
-                        // execution unreadable and the comparator answered
-                        // `ehdb_unavailable` for all 12 in the batch, 11 of which
-                        // were perfectly intact.
-                        // ⚠ ONLY a TRUNCATED record may be skipped, and only at
-                        // the tail. A line that is complete JSON but fails
-                        // validation — an unknown field, an invalid identifier —
-                        // is not an interrupted append: it is a well-formed record
-                        // with bad content, which means corruption or a version
-                        // skew. Skipping that would discard a record someone
-                        // successfully wrote.
-                        //
-                        // Found by the existing suite: five tests
-                        // (`..._rejects_invalid_record_identifiers_on_open` and
-                        // friends) failed when this checked only "is it the tail",
-                        // because their fixtures are single complete-but-invalid
-                        // records. They were right and the rule was too broad.
-                        if !err.is_eof() {
-                            return Err(map_transaction_log_decode_error(index, err));
-                        }
-                        let mut has_more = false;
-                        for rest in lines.by_ref() {
-                            let rest = rest.map_err(|e| EhdbError::Storage(e.to_string()))?;
-                            if !rest.trim().is_empty() {
-                                has_more = true;
-                                break;
-                            }
-                        }
-                        if has_more {
-                            return Err(map_transaction_log_decode_error(index, err));
-                        }
-                        // Counted on the struct rather than logged here: this
-                        // crate has no tracing dependency, and a low-level store
-                        // acquiring one to emit a single line is worse layering
-                        // than handing the fact to the caller that already has a
-                        // logger and a reply to put it in.
-                        torn_tail_skipped += 1;
-                        break;
-                    }
-                };
-                inner.insert_record(record)?;
-            }
+        // noetl/ehdb#262 — a torn record is skipped ONLY when it is the tail,
+        // and never silently; noetl/ehdb#426 — and it is cut off the file, so
+        // the next append does not glue onto it. The rules, and why each one is
+        // shaped the way it is, live on `ehdb_core::journal::read_jsonl`, shared
+        // with the stream log and the system library catalog.
+        //
+        // ⚠ The skip is safe here and only here: `append_record_to_disk` is
+        // `to_writer` -> `write_all(b"\n")` -> `sync_data()`, so a partial FINAL
+        // line is one whose `sync_data` never completed and that no writer was
+        // told was durable. On prod 2026-08-12 failing on it made every
+        // execution unreadable because of one torn record at line 45 of 46.
+        let read = ehdb_core::journal::read_jsonl::<TransactionRecord>(
+            &path,
+            map_transaction_log_decode_error,
+        )?;
+        // Counted on the struct rather than logged: this crate has no tracing
+        // dependency; the caller has a logger and a reply to put it in.
+        let torn_tail_skipped = read.torn_tail_skipped;
+        for (_, record) in read.entries {
+            inner.insert_record(record)?;
         }
 
         Ok(Self {
@@ -712,6 +656,16 @@ mod torn_record_tests {
         d.join("log.jsonl")
     }
 
+    fn commit(id: &str) -> CommitTransaction {
+        super::tests::stream_transaction(
+            id,
+            TenantId::new("tenant-a").unwrap(),
+            NamespaceName::new("system").unwrap(),
+            "events",
+            1_000,
+        )
+    }
+
     fn append_n(path: &Path, n: usize) {
         let mut log = LocalJsonlTransactionLog::open(path.to_path_buf()).unwrap();
         for i in 0..n {
@@ -754,6 +708,67 @@ mod torn_record_tests {
             "the skip must be COUNTED — a scan that silently returns n-1 records \
              reads exactly like a complete one"
         );
+    }
+
+    /// noetl/ehdb#426: one crash plus one append used to make the log
+    /// unopenable. The torn tail was skipped at open but left on disk, the next
+    /// append was glued onto it, and the reopen saw a torn MIDDLE.
+    #[test]
+    fn an_append_after_a_torn_tail_still_reopens() {
+        let p = tmp("tail-then-append");
+        append_n(&p, 3);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
+        drop(f);
+
+        let mut log = LocalJsonlTransactionLog::open(p.clone()).unwrap();
+        assert_eq!(log.torn_tail_skipped(), 1);
+        log.append(commit("tx-after")).unwrap();
+        drop(log);
+
+        let log = LocalJsonlTransactionLog::open(p).expect("one crash + one append must reopen");
+        assert_eq!(
+            log.torn_tail_skipped(),
+            0,
+            "the torn bytes must be gone from disk"
+        );
+        assert_eq!(log.len(), 4);
+    }
+
+    /// A complete final record that lost only its newline is kept, and the next
+    /// append does not land on the same line.
+    #[test]
+    fn a_final_record_missing_its_newline_is_kept_and_appendable() {
+        let p = tmp("no-newline");
+        append_n(&p, 2);
+        let mut bytes = fs::read(&p).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&p, &bytes).unwrap();
+
+        let mut log = LocalJsonlTransactionLog::open(p.clone()).unwrap();
+        assert_eq!(log.len(), 2);
+        log.append(commit("tx-after")).unwrap();
+        drop(log);
+
+        let log = LocalJsonlTransactionLog::open(p).expect("must reopen");
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.torn_tail_skipped(), 0);
+    }
+
+    /// A crash can tear a multi-byte UTF-8 character. That is a truncated
+    /// record like any other, not an invalid-text error that fails the open.
+    #[test]
+    fn a_tail_torn_inside_a_utf8_character_is_a_torn_tail() {
+        let p = tmp("utf8");
+        append_n(&p, 1);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        // First byte of the 3-byte encoding of U+20AC.
+        f.write_all(b"{\"transaction_id\":\"tx-\xE2").unwrap();
+        drop(f);
+        let log = LocalJsonlTransactionLog::open(p).expect("torn UTF-8 at the tail must open");
+        assert_eq!(log.torn_tail_skipped(), 1);
+        assert_eq!(log.len(), 1);
     }
 
     /// A torn record with well-formed records AFTER it still fails the open.

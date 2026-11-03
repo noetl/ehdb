@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, fmt};
 /// production event-log tier -- does not depend on `ehdb-l0`.
 pub mod fence;
 pub mod hlc;
+pub mod journal;
 
 /// The three resolvers (multi-region spec M0). Here for the same reason as
 /// `hlc`: `ehdb-reference` serves the production event-log tier and does not
