@@ -629,7 +629,7 @@ fn replay_frames<D: Dataset>(
 }
 
 /// The local id in an active-part file name (`part-000042.active` → 42).
-fn active_id(path: &Path) -> Option<u64> {
+pub(crate) fn active_id(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     let digits = name.strip_prefix("part-")?.strip_suffix(".active")?;
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
@@ -649,7 +649,7 @@ fn active_id(path: &Path) -> Option<u64> {
 /// (noetl/ehdb#396), not something an open does silently.
 ///
 /// A file with bit-rot or an undecodable record fails the open, naming it.
-fn choose_live_active<D: Dataset>(part_dir: &Path) -> Result<(Option<u64>, u64)> {
+pub(crate) fn choose_live_active<D: Dataset>(part_dir: &Path) -> Result<(Option<u64>, u64)> {
     let mut floor = 0u64;
     let mut best: Option<(u64, u64)> = None; // (last sort key, id)
     let entries = match fs::read_dir(part_dir) {
@@ -741,6 +741,73 @@ pub(crate) fn read_sealed_part<D: Dataset>(
         },
         records: replayed.records,
     }))
+}
+
+/// The first and last sort keys of an active part's intact records, and the
+/// byte length of those frames (a torn tail excluded). `None` if it holds no
+/// intact record. Bit-rot is an error, as everywhere else on the open path.
+pub(crate) fn active_range<D: Dataset>(path: &Path) -> Result<Option<(u64, u64, u64)>> {
+    let bytes = fs::read(path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+    let frames = iter_frames_from(&bytes, 0)
+        .map_err(|err| EhdbError::Storage(format!("active part {}: {err}", path.display())))?;
+    let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
+        return Ok(None);
+    };
+    let decode = |body: &[u8]| {
+        serde_json::from_slice::<D::Record>(body)
+            .map(|r| D::sort_key(&r))
+            .map_err(|err| EhdbError::Storage(format!("decode {}: {err}", path.display())))
+    };
+    Ok(Some((
+        decode(first.body)?,
+        decode(last.body)?,
+        last.offset + last.frame_len,
+    )))
+}
+
+/// Seal an older incarnation's active part in place (noetl/ehdb#426): cut it to
+/// `intact_len`, rename it to its `.eslog` name, and fsync the directory.
+/// Returns the sealed path.
+///
+/// ⚠ Does not decide whether sealing is safe — the caller checks the range
+/// first, because a part overlapping another breaks the ordered reads that
+/// assume parts do not overlap.
+pub(crate) fn seal_stranded_active(
+    path: &Path,
+    partition: u32,
+    min: u64,
+    max: u64,
+    intact_len: u64,
+) -> Result<PathBuf> {
+    let storage = |err: std::io::Error| EhdbError::Storage(err.to_string());
+    let file = OpenOptions::new().write(true).open(path).map_err(storage)?;
+    if file.metadata().map_err(storage)?.len() > intact_len {
+        file.set_len(intact_len).map_err(storage)?;
+    }
+    file.sync_all().map_err(storage)?;
+    drop(file);
+    let dir = path
+        .parent()
+        .ok_or_else(|| EhdbError::InvalidState(format!("{} has no parent", path.display())))?;
+    let sealed = dir.join(format!("shard-{partition}-seq-{min:020}-{max:020}.eslog"));
+    if sealed.exists() {
+        return Err(EhdbError::AlreadyExists(sealed.display().to_string()));
+    }
+    fs::rename(path, &sealed).map_err(storage)?;
+    sync_dir(dir)?;
+    Ok(sealed)
+}
+
+/// `fsync` a directory so a rename into it survives a power loss. A no-op where
+/// directories cannot be opened for sync (non-unix).
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|err| EhdbError::Storage(format!("fsync dir {}: {err}", dir.display())))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// The deterministic object-store key for a part: recomputed anywhere from

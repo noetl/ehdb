@@ -48,7 +48,8 @@ const MIN_INCREMENTAL_READ: u64 = 256;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{
-    build_merged_part, read_sealed_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart,
+    active_id, active_range, build_merged_part, choose_live_active, read_sealed_part,
+    seal_stranded_active, substrate_key_for, FlushPolicy, PartWriter, SealedPart,
 };
 use crate::substrate::DurableSubstrate;
 use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
@@ -590,6 +591,7 @@ impl<D: Dataset> L0Engine<D> {
         // active window (`UnreplicatedTracker::on_seal`), which must not touch
         // the records recovered from the live active part.
         engine.start_uploader();
+        engine.seal_stranded_active_parts()?;
         engine.adopt_unregistered_sealed_parts()?;
         engine.recover_active_parts()?;
         // ⚠ Unconditional, including on a fresh engine where every value is 0. A pin
@@ -609,6 +611,84 @@ impl<D: Dataset> L0Engine<D> {
             self.ensure_writer(shard)?;
         }
         Ok(())
+    }
+
+    /// Recover older incarnations' active parts by sealing them, when that is
+    /// safe (noetl/ehdb#426).
+    ///
+    /// Each is an active part a previous process appended to, acknowledged, and
+    /// abandoned when it restarted onto a fresh id. Its records are in no
+    /// manifest. It is sealed in place — only the intact frames are kept — and
+    /// the adoption pass that runs next registers and uploads it like any other
+    /// unregistered sealed part.
+    ///
+    /// ⚠ Only when its key range overlaps nothing: no part in the manifest, not
+    /// the live active part, not another part sealed by this pass, and nothing
+    /// at or below the retention floor. Overlap is not hypothetical: the
+    /// incarnation after a crash resumed from the manifest's maximum key, which
+    /// was below the stranded records, and so may have reused their range. An
+    /// overlapping part would break the ordered reads that assume parts do not
+    /// overlap, so it stays where it is and `stranded_active()` keeps reporting
+    /// it — disposing of it is the caller's decision (noetl/ehdb#396).
+    ///
+    /// ⚠ The records reappear at their original, older keys. A follower whose
+    /// cursor has passed those keys will not be re-delivered them; reads by
+    /// index (`read_index_after`) see them. Returns the number sealed.
+    fn seal_stranded_active_parts(&mut self) -> Result<usize> {
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let (coverage_floor, mut taken) = {
+            let m = self.manifest.lock().unwrap();
+            let ranges: Vec<(u32, u64, u64)> = m
+                .parts
+                .iter()
+                .map(|p| (p.partition, p.min_sequence, p.max_sequence))
+                .collect();
+            (m.reclaimed_through, ranges)
+        };
+        let mut sealed = 0usize;
+        for partition in 0..self.config.shard_count.max(1) {
+            let dir = parts_root.join(format!("shard-{partition}"));
+            let (live, _) = choose_live_active::<D>(&dir)?;
+            let mut actives: Vec<(u64, PathBuf)> = match fs::read_dir(&dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter_map(|p| active_id(&p).map(|id| (id, p)))
+                    .collect(),
+                Err(_) => continue,
+            };
+            actives.sort();
+            // The live part's range is off limits too.
+            for (id, path) in &actives {
+                if Some(*id) == live {
+                    if let Some((lo, hi, _)) = active_range::<D>(path)? {
+                        taken.push((partition, lo, hi));
+                    }
+                }
+            }
+            for (id, path) in actives {
+                if Some(id) == live {
+                    continue;
+                }
+                let Some((lo, hi, intact)) = active_range::<D>(&path)? else {
+                    continue;
+                };
+                let overlaps = lo <= coverage_floor
+                    || lo > hi
+                    || taken
+                        .iter()
+                        .any(|&(p, a, b)| p == partition && lo <= b && a <= hi);
+                if overlaps {
+                    continue;
+                }
+                seal_stranded_active(&path, partition, lo, hi, intact)?;
+                taken.push((partition, lo, hi));
+                sealed += 1;
+            }
+        }
+        Ok(sealed)
     }
 
     /// Re-register every sealed part that reached local disk but not the durable

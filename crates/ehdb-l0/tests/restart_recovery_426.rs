@@ -200,49 +200,73 @@ fn reclaim_keeps_an_unreferenced_part_the_manifest_does_not_cover() {
     assert_eq!(seqs(&e), [1, 2]);
 }
 
+/// Plant two active parts in `root`'s shard dir: an older incarnation's at id 5
+/// holding `old_keys`, and the live one at id 2 holding `live_keys`. Ids are
+/// chosen so the older part has the HIGHER id — ids restart per incarnation.
+fn plant_two_incarnations(root: &Path, old_keys: &[u64], live_keys: &[u64]) {
+    let dir = shard_dir(root);
+    for (id, keys, tag) in [(5u32, old_keys, "old"), (2u32, live_keys, "live")] {
+        let src = unique_dir(tag);
+        {
+            let mut e = open(&src, gated(&src.join("obj"), true), 1_000);
+            for &k in keys {
+                e.append_record(ev(k)).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            shard_dir(&src).join("part-000000.active"),
+            dir.join(format!("part-{id:06}.active")),
+        )
+        .unwrap();
+    }
+}
+
+/// An older incarnation's active part whose range overlaps nothing is sealed
+/// and recovered; the newest one stays live.
 #[test]
-fn the_newest_active_part_is_live_and_an_older_one_is_left_alone() {
-    let root = unique_dir("ids");
+fn an_older_active_part_that_overlaps_nothing_is_recovered() {
+    let root = unique_dir("older-ok");
     let store: Arc<dyn DurableSubstrate> = gated(&root.join("obj"), true);
+    plant_two_incarnations(&root, &[1, 2], &[10]);
+    let mut e = open(&root, Arc::clone(&store), 2);
+    assert_eq!(
+        seqs(&e),
+        [1, 2, 10],
+        "the older incarnation's acked records were not recovered"
+    );
+    assert!(e.stranded_active().unwrap().is_empty());
+    e.append_record(ev(11)).unwrap();
+    e.flush_and_wait_uploads().unwrap();
+    drop(e);
+    let e = open(&root, store, 2);
+    assert_eq!(seqs(&e), [1, 2, 10, 11]);
+}
+
+/// One that overlaps the live part is left exactly as it is, and no new
+/// active part reuses its id.
+#[test]
+fn an_older_active_part_that_overlaps_is_left_alone() {
+    let root = unique_dir("older-overlap");
+    let store: Arc<dyn DurableSubstrate> = gated(&root.join("obj"), true);
+    plant_two_incarnations(&root, &[12], &[10, 11, 13]);
     let dir = shard_dir(&root);
-    // An older incarnation's stranded active part at a HIGH id, with a LOW key.
-    {
-        let mut old = open(&root, Arc::clone(&store), 1_000);
-        old.append_record(ev(1)).unwrap();
-    }
-    std::fs::rename(
-        dir.join("part-000000.active"),
-        dir.join("part-000005.active"),
-    )
-    .unwrap();
     let stale = std::fs::read(dir.join("part-000005.active")).unwrap();
-    // The newest incarnation's live part at a LOWER id, with a higher key.
-    let other = unique_dir("ids-src");
-    {
-        let mut src = open(&other, gated(&other.join("obj"), true), 1_000);
-        src.append_record(ev(10)).unwrap();
-    }
-    std::fs::copy(
-        shard_dir(&other).join("part-000000.active"),
-        dir.join("part-000002.active"),
-    )
-    .unwrap();
 
     let mut e = open(&root, Arc::clone(&store), 2);
     assert_eq!(
         seqs(&e),
-        [10],
+        [10, 11, 13],
         "the live part is the one with the newest records"
     );
-    for s in 11..=15 {
+    for s in 14..=18 {
         e.append_record(ev(s)).unwrap();
     }
     e.flush_and_wait_uploads().unwrap();
-    assert_eq!(seqs(&e), [10, 11, 12, 13, 14, 15]);
     assert_eq!(
         std::fs::read(dir.join("part-000005.active")).unwrap(),
         stale,
-        "a new active part reused an old incarnation's id"
+        "an overlapping older part was modified, or its id reused"
     );
     let stranded: Vec<PathBuf> = e
         .stranded_active()
