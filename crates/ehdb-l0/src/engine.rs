@@ -47,7 +47,9 @@ use crate::frame::{iter_frames_from, FRAME_HEADER_LEN};
 const MIN_INCREMENTAL_READ: u64 = 256;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
-use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
+use crate::part::{
+    build_merged_part, read_sealed_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart,
+};
 use crate::substrate::DurableSubstrate;
 use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 
@@ -581,8 +583,15 @@ impl<D: Dataset> L0Engine<D> {
         // writer at all, so recovered records stay invisible until something
         // happens to append.  Both were caught by the engine-level tests and
         // neither is visible from the writer's own unit tests.
-        engine.recover_active_parts()?;
+        //
+        // ⚠ The uploader starts first only so the parts adopted below can be
+        // enqueued; it neither reads nor appends. Adoption runs before the
+        // writers open because registering a part closes the shard's tracked
+        // active window (`UnreplicatedTracker::on_seal`), which must not touch
+        // the records recovered from the live active part.
         engine.start_uploader();
+        engine.adopt_unregistered_sealed_parts()?;
+        engine.recover_active_parts()?;
         // ⚠ Unconditional, including on a fresh engine where every value is 0. A pin
         // inside a config branch is not a pin (server#315): it leaves the series absent
         // on exactly the configuration whose value someone would be reading, and an
@@ -600,6 +609,81 @@ impl<D: Dataset> L0Engine<D> {
             self.ensure_writer(shard)?;
         }
         Ok(())
+    }
+
+    /// Re-register every sealed part that reached local disk but not the durable
+    /// manifest, and re-enqueue its upload (noetl/ehdb#426).
+    ///
+    /// The durable manifest lists only uploaded parts, so a part sealed (and its
+    /// records acknowledged) but not yet uploaded when the process stopped was
+    /// invisible after the restart — and the next [`Self::apply_retention`]
+    /// deleted it through [`Self::reclaim_orphans`]. It is the part's records,
+    /// acked and `fsync`ed, that this keeps.
+    ///
+    /// A file is adopted only when it is a clean sealed part of a live
+    /// partition whose records the manifest does not already cover
+    /// ([`Coverage::superseded`]). A merge output (under `merged/`), a part below the
+    /// retention floor, and anything that fails to decode cleanly are left
+    /// where they are. Returns the number of parts adopted.
+    fn adopt_unregistered_sealed_parts(&mut self) -> Result<usize> {
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let mut files = Vec::new();
+        collect_eslog_files(&parts_root, &mut files)?;
+        files.sort();
+        let (coverage, known) = {
+            let m = self.manifest.lock().unwrap();
+            let known: std::collections::HashSet<String> =
+                m.parts.iter().map(|p| p.part_id.clone()).collect();
+            (Coverage::of(&m), known)
+        };
+        let mut adopted = 0usize;
+        for path in files {
+            let Some(partition) = shard_dir_partition(&parts_root, &path) else {
+                continue;
+            };
+            if partition >= self.config.shard_count.max(1) {
+                continue;
+            }
+            let Some((min, max)) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| parse_part_range(stem, partition))
+            else {
+                continue;
+            };
+            let part_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if known.contains(part_id) || coverage.superseded(partition, min, max) {
+                continue;
+            }
+            let Some(sealed) = read_sealed_part::<D>(&path, partition, self.config.granule_size)?
+            else {
+                continue;
+            };
+            let count = sealed.meta.record_count;
+            if max > self.global_sequence {
+                self.global_sequence = max;
+            }
+            let tail = self.shard_tail_max.entry(partition).or_insert(max);
+            if max > *tail {
+                *tail = max;
+            }
+            for r in &sealed.records {
+                if let Some(key) = D::dedupe_key(r) {
+                    self.dedupe.remember(partition, key, D::sort_key(r));
+                }
+            }
+            self.unreplicated.on_recovered(partition, count);
+            self.register_and_upload(sealed)?;
+            self.metrics.add_recovered_active_records(count);
+            adopted += 1;
+        }
+        Ok(adopted)
     }
 
     /// **Cold-load** a fresh node (empty local dir) from a single substrate:
@@ -1738,7 +1822,7 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     pub fn reclaim_orphans(&mut self) -> Result<usize> {
-        let (referenced_objects, referenced_locals) = {
+        let (referenced_objects, referenced_locals, coverage) = {
             let m = self.manifest.lock().unwrap();
             // Every substrate key referenced by any part's replica list — a
             // part may have N replicas (same key on different substrates), all of
@@ -1753,7 +1837,7 @@ impl<D: Dataset> L0Engine<D> {
                 .iter()
                 .filter_map(|p| p.local_path.clone())
                 .collect();
-            (objs, locals)
+            (objs, locals, Coverage::of(&m))
         };
 
         let mut reclaimed = 0usize;
@@ -1762,7 +1846,12 @@ impl<D: Dataset> L0Engine<D> {
         let prefix = format!("parts/{}/", self.config.dataset);
         for target in &self.replicas {
             for key in target.substrate.list_prefix(&prefix)? {
-                if !referenced_objects.contains(&key) {
+                // ⚠ Unreferenced is not the same as unwanted (noetl/ehdb#426): a
+                // part uploaded just before a crash that lost its manifest write
+                // is unreferenced and is the only durable copy of its records.
+                // Only an object whose records the manifest provably covers is
+                // deleted.
+                if !referenced_objects.contains(&key) && coverage.object_is_superseded(&key) {
                     // Size it WITHOUT fetching it (noetl/ehdb#395). This used
                     // to be `get_all`, i.e. a full read of an object that is
                     // deleted on the very next line — free-ish on a local
@@ -1784,7 +1873,13 @@ impl<D: Dataset> L0Engine<D> {
         collect_eslog_files(&parts_root, &mut local_files)?;
         for path in local_files {
             let path_str = path.to_string_lossy().to_string();
-            if !referenced_locals.contains(&path_str) {
+            // ⚠ Same rule for local files (noetl/ehdb#426). This used to delete
+            // every local part the manifest did not reference, which after a
+            // restart included a sealed part whose upload had not landed: acked
+            // records, deleted by the next retention pass.
+            if !referenced_locals.contains(&path_str)
+                && coverage.local_is_reclaimable(&parts_root, &path)
+            {
                 let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
                 self.metrics.record_orphan_reclaim(bytes);
@@ -2363,6 +2458,134 @@ fn collect_files_with_extension(
         }
     }
     Ok(())
+}
+
+/// `(min, max)` from a part id of the form `shard-<p>-seq-<min>-<max>`, if it
+/// belongs to `partition`.
+fn parse_part_range(part_id: &str, partition: u32) -> Option<(u64, u64)> {
+    let rest = part_id.strip_prefix(&format!("shard-{partition}-seq-"))?;
+    let (min, max) = rest.split_once('-')?;
+    Some((min.parse().ok()?, max.parse().ok()?))
+}
+
+/// The partition of a part file sitting directly in `<parts_root>/shard-<p>/`.
+/// `None` for anything else — notably a merge output under `shard-<p>/merged/`.
+fn shard_dir_partition(parts_root: &std::path::Path, path: &std::path::Path) -> Option<u32> {
+    let dir = path.parent()?;
+    if dir.parent()? != parts_root {
+        return None;
+    }
+    dir.file_name()?
+        .to_str()?
+        .strip_prefix("shard-")?
+        .parse()
+        .ok()
+}
+
+/// What the manifest already accounts for, without its indexes: the retention
+/// floor, every part's range, and which parts are durable. Built once per
+/// reclaim pass instead of cloning a manifest that carries every part's blooms.
+struct Coverage {
+    reclaimed_through: u64,
+    /// `(partition, min, max)`, sorted.
+    ranges: Vec<(u32, u64, u64)>,
+    durable: std::collections::HashSet<String>,
+}
+
+impl Coverage {
+    fn of(m: &Manifest) -> Self {
+        let mut ranges: Vec<(u32, u64, u64)> = m
+            .parts
+            .iter()
+            .map(|p| (p.partition, p.min_sequence, p.max_sequence))
+            .collect();
+        ranges.sort_unstable();
+        Self {
+            reclaimed_through: m.reclaimed_through,
+            ranges,
+            durable: m
+                .parts
+                .iter()
+                .filter(|p| p.is_durable())
+                .map(|p| p.part_id.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether every sort key in `[min, max]` of `partition` is already
+    /// accounted for: below the retention floor, or inside the union of the
+    /// partition's part ranges (noetl/ehdb#426).
+    ///
+    /// This is what makes an unreferenced part safe to delete and not worth
+    /// adopting. A merge output's range is the union of its sources'; a part
+    /// sealed but never registered lies in a gap, because keys ascend within a
+    /// partition. ⚠ That last step assumes the ascending-key contract: an
+    /// out-of-order append (counted by `out_of_order_appends`) can place a
+    /// genuine part inside another's range, and this would then call it
+    /// covered.
+    fn superseded(&self, partition: u32, min: u64, max: u64) -> bool {
+        if max <= self.reclaimed_through {
+            return true;
+        }
+        // The lowest key not yet shown covered; integer keys, so adjacent
+        // ranges leave no gap.
+        let mut need = min.max(self.reclaimed_through.saturating_add(1));
+        for &(_, lo, hi) in self.ranges.iter().filter(|r| r.0 == partition) {
+            if hi < need {
+                continue;
+            }
+            if lo > need {
+                return false;
+            }
+            if hi >= max {
+                return true;
+            }
+            need = hi + 1;
+        }
+        false
+    }
+
+    /// Whether an unreferenced substrate part object may be deleted: only when
+    /// its key parses and [`Self::superseded`] holds. An object this cannot
+    /// place is kept.
+    fn object_is_superseded(&self, key: &str) -> bool {
+        let mut segs = key.rsplit('/');
+        let Some(file) = segs.next() else {
+            return false;
+        };
+        let Some(partition) = segs
+            .next()
+            .and_then(|d| d.strip_prefix("shard-"))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        file.strip_suffix(".eslog")
+            .and_then(|id| parse_part_range(id, partition))
+            .is_some_and(|(min, max)| self.superseded(partition, min, max))
+    }
+
+    /// Whether an unreferenced local part file may be deleted: a local copy of
+    /// a part the manifest lists as durable, a part whose records the manifest
+    /// covers, or a merge output that never made it into the manifest (its
+    /// sources still hold every record). Anything else is kept.
+    fn local_is_reclaimable(&self, parts_root: &std::path::Path, path: &std::path::Path) -> bool {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        if self.durable.contains(stem) {
+            return true;
+        }
+        match shard_dir_partition(parts_root, path) {
+            Some(partition) => parse_part_range(stem, partition)
+                .is_some_and(|(min, max)| self.superseded(partition, min, max)),
+            // Not directly in a shard dir: a merge output (`shard-<p>/merged/`).
+            None => path
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n == "merged"),
+        }
+    }
 }
 
 fn collect_eslog_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
