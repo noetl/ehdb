@@ -160,6 +160,14 @@ impl<D: Dataset> PartWriter<D> {
     }
 
     fn open_active(&mut self) -> Result<()> {
+        // TODO(review): `next_local_id` restarts at 0 on every open and nothing
+        // scans for higher-numbered `.active` files, so a process that sealed at
+        // least once before it died leaves its live `part-00000N.active` (acked,
+        // fsynced records) behind, and recovery below only ever looks at
+        // `part-000000.active`. That is the noetl/ehdb#396 "stranded active"
+        // population; `L0Engine::stranded_active` surveys it but nothing
+        // re-adopts it. Recover every `.active` in `part_dir` (or derive the id
+        // from the highest one present) to close the gap.
         self.active_path = self
             .part_dir
             .join(format!("part-{:06}.active", self.next_local_id));
@@ -312,6 +320,12 @@ impl<D: Dataset> PartWriter<D> {
         // ⚠ Placed BEFORE the write, so a record that fails to write is not in
         // a chain that claims to cover it. The chain must describe what is
         // durable, and the write below is the thing that can fail.
+        //
+        // NOTE(review): the code does the opposite of what the sentence above
+        // claims. `absorb` mutates the roller immediately, so a record whose
+        // `write_all`/`sync_data` below fails IS in the chain. To honour the
+        // stated invariant, absorb after the write (and fsync, per posture)
+        // succeeds, or stage the digest and commit it on success.
         #[cfg(feature = "chain-cert")]
         if self.chain_cert_enabled {
             self.chain_certs.absorb(D::index_key(&record), &body);
@@ -332,6 +346,14 @@ impl<D: Dataset> PartWriter<D> {
             .file
             .as_mut()
             .ok_or_else(|| EhdbError::InvalidState("l0 part writer has no active file".into()))?;
+        // TODO(review): error-path state divergence. If `write_all` fails part
+        // way (ENOSPC) or `sync_data` below fails, the bytes may already be in
+        // the file but `byte_len`, `records` and the granule mark are not
+        // advanced (the mark pushed above stays, with a count of 0). The next
+        // append then records a `mark_offset` that no longer matches the file,
+        // and a restart's `recover_active` replays a record the caller was told
+        // failed. Truncate back to `mark_offset` (and pop the mark) on any
+        // error here.
         file.write_all(&frame)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
 
@@ -545,6 +567,11 @@ impl<D: Dataset> PartWriter<D> {
         );
         let final_name = format!("{part_id}.eslog");
         let final_path = self.part_dir.join(&final_name);
+        // NOTE(review): no fsync of `part_dir` after the rename, so the rename
+        // itself is not crash-durable on every filesystem. Recovery tolerates
+        // either name only partly: the `.active` name is recovered (if it is
+        // `part-000000`), the `.eslog` name is invisible to the durable manifest
+        // until uploaded (see `L0Engine::reclaim_orphans`).
         fs::rename(&self.active_path, &final_path)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
 

@@ -180,12 +180,6 @@ impl Dataset for D1EventLog {
     fn read_partition(execution_id: &str, shard_count: u32) -> u32 {
         shard_for_execution(execution_id, shard_count)
     }
-    /// The writer owns the ordering key: on a writer-assigned append the record's
-    /// `global_sequence` is overwritten with the writer's next monotonic sequence
-    /// so the shard log stays ascending even when the D1 command feed's producer
-    /// (noetl-server) assigned snowflake ids that raced out of order under
-    /// concurrent publish (noetl/ai-meta#203). The command's identity is carried
-    /// in `execution_id` / the payload, not in this key.
     /// D1 carries the HLC column, so it opts in.
     fn stamp_commit_hlc(record: &mut EventRecord, hlc: u64) {
         record.commit_hlc = Some(hlc);
@@ -194,6 +188,12 @@ impl Dataset for D1EventLog {
     fn dedupe_key(record: &EventRecord) -> Option<&str> {
         record.event_id.as_deref()
     }
+    /// The writer owns the ordering key: on a writer-assigned append the record's
+    /// `global_sequence` is overwritten with the writer's next monotonic sequence
+    /// so the shard log stays ascending even when the D1 command feed's producer
+    /// (noetl-server) assigned snowflake ids that raced out of order under
+    /// concurrent publish (noetl/ai-meta#203). The command's identity is carried
+    /// in `execution_id` / the payload, not in this key.
     fn assign_sort_key(mut record: EventRecord, writer_seq: u64) -> EventRecord {
         record.global_sequence = writer_seq;
         record

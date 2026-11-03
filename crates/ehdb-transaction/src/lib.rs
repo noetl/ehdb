@@ -520,6 +520,15 @@ impl LocalJsonlTransactionLog {
                         // acquiring one to emit a single line is worse layering
                         // than handing the fact to the caller that already has a
                         // logger and a reply to put it in.
+                        // TODO(review) P0: the torn bytes are skipped in memory
+                        // but left ON DISK. The next `append` opens with
+                        // O_APPEND and writes directly after them, so the torn
+                        // fragment and the new record share one line, now with
+                        // well-formed records after it. The next open then hits
+                        // the `has_more` branch above and fails hard: one crash
+                        // plus one append = an unopenable log. Truncate the file
+                        // to the end of the last good line here (part.rs's
+                        // recovery does the equivalent for L0).
                         torn_tail_skipped += 1;
                         break;
                     }
@@ -565,6 +574,9 @@ impl LocalJsonlTransactionLog {
     /// a torn write mid-batch leaves the prefix durable, the same state a crash
     /// between two single appends leaves. The log is replay-truth, so a partial
     /// batch replays as a shorter log rather than a corrupt one.
+    ///
+    /// NOTE(review): true only until the next append; see the TODO in `open`
+    /// about the torn tail not being truncated.
     ///
     /// On error nothing is inserted into the in-memory index, so the index
     /// never claims a record the file does not hold.

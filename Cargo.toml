@@ -20,6 +20,10 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/noetl/ehdb"
+# NOTE(review): not accurate. `foca 2.0.0` (ehdb-gossip) requires rustc 1.88,
+# so `cargo build` fails on 1.82 to 1.87 with a resolver error. The pinned
+# toolchain (rust-toolchain.toml, 1.99.0) hides this. Raise this to the true
+# floor and add a CI job that builds with exactly this version.
 rust-version = "1.82"
 
 [workspace.dependencies]

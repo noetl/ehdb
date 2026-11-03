@@ -707,6 +707,16 @@ impl<D: Dataset> L0Engine<D> {
             // fresh process must not re-issue timestamps a previous one used,
             // and the wall clock alone does not guarantee that across a restart
             // during which it stepped back.
+            //
+            // TODO(review): the comment above does not match the code. The seed
+            // is `Hlc::from_parts(0, 0)`, which is equivalent to `default()` —
+            // exactly what `HlcClock::seeded_from`'s own docs (ehdb-core
+            // hlc.rs) warn against — and nothing in ehdb-l0 calls `observe()`
+            // with the recovered tip's `commit_hlc` afterwards. A restart during
+            // which the wall clock stepped back can therefore re-issue an HLC an
+            // earlier process already stamped. Latent while `hlc_mode` defaults
+            // to off and nothing reads `commit_hlc`; fix (seed from the max
+            // `commit_hlc` in the recovered manifest/tail) before turning it on.
             hlc: ehdb_core::hlc::HlcClock::seeded_from(
                 ehdb_core::hlc::Hlc::from_parts(0, 0),
                 Box::new(|| {
@@ -756,6 +766,12 @@ impl<D: Dataset> L0Engine<D> {
                     };
                     let bytes = match read_result {
                         Ok(b) => b,
+                        // NOTE(review): this error is dropped with no metric and
+                        // no log line, unlike the all-replicas-failed path below
+                        // which at least leaves the part visibly local-only. A
+                        // part whose local file vanished (or a backfill source
+                        // that keeps failing) is indistinguishable from a healthy
+                        // idle uploader. Count it.
                         Err(_) => {
                             decrement(&outstanding);
                             continue;
@@ -782,6 +798,16 @@ impl<D: Dataset> L0Engine<D> {
                         m.version += 1;
                         m.durable_view()
                     };
+                    // TODO(review): the version is allocated under the lock but
+                    // published outside it, and the merge/retention path
+                    // publishes too (see `prune_manifest_versions`). Nothing
+                    // stops an older snapshot's `put_overwrite(LATEST)` landing
+                    // AFTER a newer one, so `LATEST` can regress — e.g. back to a
+                    // pre-merge view whose source parts `reclaim_orphans` has
+                    // since deleted. Publish LATEST only if `durable.version` is
+                    // greater than what is there (CAS / generation precondition),
+                    // or serialize publication through one thread.
+                    //
                     // The durable manifest must exist on EVERY replica so any one
                     // of them can serve a cold-load alone.
                     write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
@@ -811,12 +837,6 @@ impl<D: Dataset> L0Engine<D> {
         self.upload_handle = Some(handle);
     }
 
-    /// **Append one record to the hot tier** (dataset-generic). Routes to the
-    /// record's partition ([`Dataset::partition`]), writes it, advances the
-    /// sort-key tip, and seals if the active part is full. The caller supplies a
-    /// fully-formed record whose sort key is `>=` every prior record in its
-    /// partition (the single-writer ascending-sort-key contract). Never touches
-    /// the substrate. Returns the record's sort key.
     /// Has this record's idempotency key already landed? Returns its position.
     ///
     /// `None` whenever the dataset has no key for the record — which is every
@@ -864,6 +884,12 @@ impl<D: Dataset> L0Engine<D> {
         self.append_writer_assigned(record).map(|seq| (seq, true))
     }
 
+    /// **Append one record to the hot tier** (dataset-generic). Routes to the
+    /// record's partition ([`Dataset::partition`]), writes it, advances the
+    /// sort-key tip, and seals if the active part is full. The caller supplies a
+    /// fully-formed record whose sort key is `>=` every prior record in its
+    /// partition (the single-writer ascending-sort-key contract). Never touches
+    /// the substrate. Returns the record's sort key.
     pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
         // ⚠ Before anything else. A duplicate must not touch the shard tail, must
         // not trip the ascending canary, must not seal, and must not advance the
@@ -891,6 +917,13 @@ impl<D: Dataset> L0Engine<D> {
         }
         let sort_key = D::sort_key(&record);
         let shard = D::partition(&record, self.config.shard_count);
+        // NOTE(review): the canary is evaluated (and `shard_tail_max` advanced)
+        // BEFORE `writer.append` below. If that append fails, the tail already
+        // points at a key that is not on disk, and the caller's retry of the
+        // same record is then counted as out-of-order. Metric-only today (the
+        // append is never rejected on this signal); move the update after a
+        // successful append if the canary ever gates anything.
+        //
         // Ascending-contract canary: an append that does not advance its shard's
         // tail lands behind any follower cursor and is silently never delivered
         // (noetl/ai-meta#203). Count it so the loss class is observable rather
@@ -928,6 +961,14 @@ impl<D: Dataset> L0Engine<D> {
         // direction for a durability signal.
         self.unreplicated.on_append(shard);
 
+        // TODO(review): from here on the record is already durable (posture A)
+        // and counted, but a seal/rename or `register_and_upload` failure below
+        // still returns `Err` to the caller. A caller that retries a record
+        // with no `event_id` (no dedupe key) then writes it twice. Also,
+        // `PartWriter::seal` drops the active file handle before the rename, so
+        // a failed rename leaves this shard's writer with no active file and
+        // every later append fails until restart. Consider returning `Ok` with
+        // the seal failure surfaced via metrics/a deferred error instead.
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
             if writer.should_seal() {
@@ -1657,14 +1698,6 @@ impl<D: Dataset> L0Engine<D> {
         Ok(())
     }
 
-    /// **L0.5 orphan reclaim (GC).** Delete every part object + local part file
-    /// the current manifest no longer references — chiefly the superseded source
-    /// parts a merge (L0.3) leaves behind, and parts dropped by
-    /// [`apply_retention`](Self::apply_retention). Idempotent (deleting a missing
-    /// object is a no-op). Returns the number of objects/files reclaimed.
-    ///
-    /// Single-writer assumption: the caller is the shard owner, so no concurrent
-    /// appender is racing an object into existence as GC lists.
     /// **Stranded active parts** — [noetl/ehdb#396](https://github.com/noetl/ehdb/issues/396).
     ///
     /// Every `*.active` file under this dataset's local parts root that is **not** the active
@@ -1737,6 +1770,23 @@ impl<D: Dataset> L0Engine<D> {
         Ok((files, bytes))
     }
 
+    /// **L0.5 orphan reclaim (GC).** Delete every part object + local part file
+    /// the current manifest no longer references — chiefly the superseded source
+    /// parts a merge (L0.3) leaves behind, and parts dropped by
+    /// [`apply_retention`](Self::apply_retention). Idempotent (deleting a missing
+    /// object is a no-op). Returns the number of objects/files reclaimed.
+    ///
+    /// Single-writer assumption: the caller is the shard owner, so no concurrent
+    /// appender is racing an object into existence as GC lists.
+    ///
+    /// ⚠ NOTE(review): "not referenced by the in-RAM manifest" is not the same
+    /// as "garbage" after a restart. The in-RAM manifest is rebuilt from the
+    /// DURABLE view, which omits local-only parts, so a part that was sealed
+    /// (renamed to `.eslog`) but not yet uploaded when the previous process died
+    /// is unreferenced here and its acked records are deleted by this sweep.
+    /// `stranded_active` treats the analogous `.active` case as a
+    /// data-disposition decision; the `.eslog` case deserves the same (re-adopt
+    /// or at least survey local `.eslog` files on open).
     pub fn reclaim_orphans(&mut self) -> Result<usize> {
         let (referenced_objects, referenced_locals) = {
             let m = self.manifest.lock().unwrap();
@@ -2044,7 +2094,13 @@ impl<D: Dataset> L0Engine<D> {
     /// The early break is sound because [`Manifest::prune`] returns parts sorted
     /// by `min_sequence`: once `limit` records are in hand, every remaining part
     /// holds strictly higher sort keys, so the lowest `limit` records after the
-    /// cursor are already collected. The hot buffer is the tail and is only read
+    /// cursor are already collected.
+    ///
+    /// NOTE(review): "strictly higher" assumes parts within a shard do not
+    /// overlap, which holds only while appends are ascending. `append_record`
+    /// counts but does not reject an out-of-order key (`out_of_order_appends`),
+    /// so a caller-assigned key path can produce overlapping parts, and then
+    /// this early break can skip lower keys held in a later part. The hot buffer is the tail and is only read
     /// when the limit has not been reached. Peak becomes O(one part + limit)
     /// rather than O(log).
     ///
@@ -2168,7 +2224,6 @@ impl<D: Dataset> L0Engine<D> {
         Ok(out)
     }
 
-    /// The configured shard (partition) count.
     /// Sample the **D1 durability window** per shard — the age of the oldest
     /// acknowledged record not yet durable on the substrate, and how many such
     /// records there are (noetl/ehdb#328).
@@ -2179,6 +2234,7 @@ impl<D: Dataset> L0Engine<D> {
         self.unreplicated.snapshot()
     }
 
+    /// The configured shard (partition) count.
     pub fn shard_count(&self) -> u32 {
         self.config.shard_count
     }
@@ -2224,7 +2280,6 @@ impl<D: Dataset> L0Engine<D> {
         Arc::clone(&self.metrics)
     }
 
-    /// A snapshot clone of the in-RAM manifest.
     /// Recompute the four state gauges from in-RAM state (noetl/ai-meta#455 C6).
     ///
     /// Cheap but **not free**: it walks the manifest once, so it is O(parts). That is
@@ -2259,6 +2314,7 @@ impl<D: Dataset> L0Engine<D> {
             .set_state_gauges(parts, local_only, under, dedupe);
     }
 
+    /// A snapshot clone of the in-RAM manifest.
     pub fn manifest_snapshot(&self) -> Manifest {
         self.manifest.lock().unwrap().clone()
     }
@@ -2619,6 +2675,13 @@ fn replicate_bytes(
 /// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
 /// replica, so any one of them can serve a cold-load alone. Best-effort per
 /// replica (a down replica is skipped; the survivors carry the manifest).
+///
+/// NOTE(review): every failure here is discarded — serialization, LATEST, and
+/// the versioned snapshot — with no metric, so "no replica has a current
+/// manifest" is invisible until a cold-load. Combined with the publication race
+/// noted at the uploader call site and with `LocalFsSubstrate::write_atomic`
+/// sharing one `<key>.tmp` path between concurrent writers, LATEST is the
+/// weakest-guarded object in the engine.
 fn write_manifest_to_all(
     replicas: &[ReplicaTarget],
     dataset: &str,
@@ -2754,6 +2817,12 @@ fn parse_manifest_version(key: &str) -> Option<u64> {
 /// Load the durable manifest from the **first replica that has it** (L0.6): a
 /// dead `replica-0` does not stop recovery — the manifest is replicated, so any
 /// survivor serves it.
+/// TODO(review): this returns the FIRST replica's LATEST, not the newest. A
+/// replica that was down for later manifest writes (they are best-effort, see
+/// `write_manifest_to_all`) and is listed first wins with a stale view. A decode
+/// error on that replica also aborts the load instead of falling back to the
+/// next one, unlike the read-failure case. Prefer the highest `version` across
+/// all reachable replicas.
 fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Option<Manifest>> {
     let key = manifest_latest_key(dataset);
     for target in replicas {

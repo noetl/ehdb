@@ -125,24 +125,6 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// `KEEPALIVE_IDLE + KEEPALIVE_RETRIES * KEEPALIVE_INTERVAL` ≈ 11 s.
 pub const KEEPALIVE_RETRIES: u32 = 3;
 
-/// The socket posture every ehdb-feed connection gets: `TCP_NODELAY` (a single
-/// record is delivered immediately, not Nagle-batched) **plus TCP keepalive**.
-///
-/// Keepalive is the fix for the silent wedge in noetl/ai-meta#208. Every protocol
-/// in this crate parks on a blocking read while it waits for the peer — a
-/// claimer inside `claim_next`, a subscriber inside its push loop, a publisher
-/// waiting for its durable ack. When the peer's pod dies, whether that read ever
-/// returns depends on a FIN or RST actually arriving: under Kubernetes it often
-/// does not (the veth and conntrack entry go away with the pod), so the socket is
-/// left **half-open** and the read neither yields data nor errors. Without
-/// keepalive the caller parks forever, no error is logged, and every redial path
-/// in this crate and its callers is unreachable because there is no `Err` to
-/// trigger it — which is exactly how a routine writer restart wedged dispatch
-/// with `0 of 30` commands claimed and nothing in any log.
-///
-/// With keepalive armed, the kernel probes an idle connection and a dead peer
-/// becomes an ordinary `io::Error` within ~11 s, so the existing
-/// error-then-reconnect paths do their job unchanged.
 /// The hard ceiling on a single blocking read, from `EHDB_READ_HARD_CEILING_MS`
 /// (default 300_000 = 5 minutes). `0` disables it.
 ///
@@ -174,6 +156,24 @@ pub fn hard_read_ceiling() -> Option<Duration> {
 /// Default for [`hard_read_ceiling`].
 pub const DEFAULT_READ_HARD_CEILING: Duration = Duration::from_millis(300_000);
 
+/// The socket posture every ehdb-feed connection gets: `TCP_NODELAY` (a single
+/// record is delivered immediately, not Nagle-batched) **plus TCP keepalive**.
+///
+/// Keepalive is the fix for the silent wedge in noetl/ai-meta#208. Every protocol
+/// in this crate parks on a blocking read while it waits for the peer — a
+/// claimer inside `claim_next`, a subscriber inside its push loop, a publisher
+/// waiting for its durable ack. When the peer's pod dies, whether that read ever
+/// returns depends on a FIN or RST actually arriving: under Kubernetes it often
+/// does not (the veth and conntrack entry go away with the pod), so the socket is
+/// left **half-open** and the read neither yields data nor errors. Without
+/// keepalive the caller parks forever, no error is logged, and every redial path
+/// in this crate and its callers is unreachable because there is no `Err` to
+/// trigger it — which is exactly how a routine writer restart wedged dispatch
+/// with `0 of 30` commands claimed and nothing in any log.
+///
+/// With keepalive armed, the kernel probes an idle connection and a dead peer
+/// becomes an ordinary `io::Error` within ~11 s, so the existing
+/// error-then-reconnect paths do their job unchanged.
 pub(crate) fn configure_stream(sock: &TcpStream) -> io::Result<()> {
     sock.set_nodelay(true)?;
     let keepalive = socket2::TcpKeepalive::new()
@@ -244,6 +244,18 @@ fn max_frame_bytes() -> usize {
 /// Default for [`max_frame_bytes`].
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+// NOTE(review): `read_frame` is NOT cancel-safe. If the future is dropped
+// between the two `read_exact`s (or inside one), the bytes already consumed are
+// lost and the next call parses mid-frame garbage as a length. `recv_batch`
+// wraps it in `tokio::time::timeout` and then `continue`s on the demote path,
+// so a timeout that fires mid-frame desyncs the stream. Fix: keep a per-
+// connection partial-read buffer, or treat ANY timeout as fatal (redial).
+//
+// NOTE(review): the same 64 MiB cap applies to the unauthenticated handshake
+// in `serve`, so any TCP client can make the writer allocate up to the cap
+// before it has proven anything. Use a small dedicated cap for handshakes.
+// (The error string below also contains a run of embedded spaces from a
+// line-continuation; cosmetic, left unchanged to keep behaviour identical.)
 pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
@@ -302,15 +314,6 @@ where
     D: Dataset,
     D::Record: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
-    /// Wrap an engine as a networked writer, seeding the tip signal at the
-    /// engine's current global sequence.
-    ///
-    /// Takes ownership of the engine's **commit points**: the flush posture is
-    /// switched to [`FlushPolicy::CallerDriven`] and every append path here
-    /// `fsync`s before it returns. Durability is unchanged (a returned sort key
-    /// is still durable), but a batch of records that arrive together shares one
-    /// `fsync` instead of paying one each — the group-commit fix for the command
-    /// bus's dispatch latency (noetl/ai-meta#205).
     /// Wrap an engine behind a **fence**, for a writer that holds an election
     /// token (noetl/ai-meta#460).
     ///
@@ -344,6 +347,15 @@ where
         }
     }
 
+    /// Wrap an engine as a networked writer, seeding the tip signal at the
+    /// engine's current global sequence.
+    ///
+    /// Takes ownership of the engine's **commit points**: the flush posture is
+    /// switched to [`FlushPolicy::CallerDriven`] and every append path here
+    /// `fsync`s before it returns. Durability is unchanged (a returned sort key
+    /// is still durable), but a batch of records that arrive together shares one
+    /// `fsync` instead of paying one each — the group-commit fix for the command
+    /// bus's dispatch latency (noetl/ai-meta#205).
     pub fn new(engine: L0Engine<D>) -> Self {
         // One construction path: an unfenced writer is a fenced writer whose
         // fence is `Off` — no ledger, no checks, no counters.
@@ -407,6 +419,11 @@ where
     /// strictly-increasing key keeps the shard log ascending, so the feed cursor
     /// never skips an ingested record. The command's identity stays in its
     /// payload; the returned key is the ack token followers commit against.
+    // NOTE(review): append / append_batch / append_batch_reporting take the
+    // engine's blocking `std::sync::Mutex` and run an fsync under it, but they
+    // are called from tokio tasks. Under contention this parks runtime worker
+    // threads. Prefer `spawn_blocking` (or a dedicated writer thread fed by a
+    // channel) for the lock + fsync section.
     pub fn append(&self, record: D::Record) -> io::Result<u64> {
         // Cheap pre-check: a sealed writer never even contends for the lock.
         self.ensure_open()?;
@@ -430,25 +447,7 @@ where
         Ok(seq)
     }
 
-    /// **Group commit** — append a whole batch under **one** engine-lock
-    /// acquisition and **one** `fsync`, returning each record's writer-assigned
-    /// sort key in the order given. The fix for the command bus's dispatch
-    /// latency (noetl/ai-meta#205): under posture A every append paid its own
-    /// ~4 ms `sync_data()` while holding the engine lock, which capped the bus at
-    /// ~230 commands/s and turned the control plane's publish path into a queue.
-    /// N records that arrive together now share one `fsync`.
-    ///
-    /// Durability is **unchanged**: this returns only after the `fsync` that
-    /// covers every record in the batch, so a returned key is as durable as one
-    /// from [`append`](Self::append). Ordering is unchanged: the writer still
-    /// assigns each key ([`L0Engine::append_writer_assigned`]) under the same
-    /// serialized lock, strictly increasing across the batch, so the ascending
-    /// shard-log contract the #203 fix restored holds exactly as before.
-    ///
-    /// Followers are woken **once**, at the batch tip — a [`watch`] signal
-    /// carries the latest value, and a woken follower drains its feed to the tip
-    /// before parking again, so one wake per batch delivers every record in it.
-    /// [`append_batch`](Self::append_batch), reporting per record whether it was
+    /// Same as [`append_batch`](Self::append_batch), reporting per record whether it was
     /// actually written.
     ///
     /// `(sort_key, appended)` per record, in request order. `appended == false`
@@ -491,6 +490,24 @@ where
         Ok(seqs)
     }
 
+    /// **Group commit** — append a whole batch under **one** engine-lock
+    /// acquisition and **one** `fsync`, returning each record's writer-assigned
+    /// sort key in the order given. The fix for the command bus's dispatch
+    /// latency (noetl/ai-meta#205): under posture A every append paid its own
+    /// ~4 ms `sync_data()` while holding the engine lock, which capped the bus at
+    /// ~230 commands/s and turned the control plane's publish path into a queue.
+    /// N records that arrive together now share one `fsync`.
+    ///
+    /// Durability is **unchanged**: this returns only after the `fsync` that
+    /// covers every record in the batch, so a returned key is as durable as one
+    /// from [`append`](Self::append). Ordering is unchanged: the writer still
+    /// assigns each key ([`L0Engine::append_writer_assigned`]) under the same
+    /// serialized lock, strictly increasing across the batch, so the ascending
+    /// shard-log contract the #203 fix restored holds exactly as before.
+    ///
+    /// Followers are woken **once**, at the batch tip — a [`watch`] signal
+    /// carries the latest value, and a woken follower drains its feed to the tip
+    /// before parking again, so one wake per batch delivers every record in it.
     pub fn append_batch(&self, records: Vec<D::Record>) -> io::Result<Vec<u64>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -607,6 +624,11 @@ where
                 tracing::warn!(error = %e, "feed: rejecting connection (socket setup)");
                 return;
             }
+            // NOTE(review): no authentication on any feed face (subscribe,
+            // publish, claim). Anything that can reach the port can read the
+            // shard log or append to it; isolation rests on network policy.
+            // There is also no handshake timeout, so an idle connection holds
+            // a task until keepalive kills it.
             let req_bytes = match read_frame(&mut sock).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -702,6 +724,9 @@ pub struct FeedSubscription {
     /// How long a parked read may go quiet before the peer is declared dead.
     /// Cleared once a peer proves it does not heartbeat, so an older writer
     /// never triggers a redial loop on a genuinely idle feed.
+    ///
+    /// NOTE(review): stale since noetl/ai-meta#297. It is no longer cleared;
+    /// `recv_batch` demotes it to `hard_read_ceiling()` on the first miss.
     read_deadline: Option<Duration>,
     /// Has this connection ever seen a heartbeat? Only then is a missed one
     /// evidence of a dead peer.
@@ -758,8 +783,10 @@ impl FeedSubscription {
     /// parked this consumes the writer's heartbeat frames, and once the peer has
     /// proven it heartbeats, [`HEARTBEAT_MISS_FACTOR`] missed beats return an
     /// error so the caller resubscribes (noetl/ai-meta#225). A writer that never
-    /// heartbeats (a pre-#225 build) disarms the deadline on the first miss and
-    /// liveness falls back to TCP keepalive alone.
+    /// heartbeats (a pre-#225 build) no longer disarms the deadline: the first
+    /// miss demotes it to [`crate::hard_read_ceiling`], and a miss at the
+    /// ceiling is an error (noetl/ai-meta#297). (Doc corrected in review; it
+    /// previously still described the pre-#297 "disarm on first miss" rule.)
     pub async fn recv_batch<R: DeserializeOwned>(&mut self) -> io::Result<Vec<R>> {
         loop {
             let body = match self.read_deadline {

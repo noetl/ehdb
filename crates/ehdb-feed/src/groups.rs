@@ -697,6 +697,10 @@ impl GroupClaimClient {
     /// return an error so the caller redials (noetl/ai-meta#225). A coordinator
     /// that never heartbeats (a pre-#225 writer) disarms the deadline on the
     /// first miss and liveness falls back to TCP keepalive alone.
+    ///
+    /// NOTE(review): stale since noetl/ai-meta#297; the code below demotes to the
+    /// hard read ceiling instead of disarming. Same cancel-safety caveat as
+    /// `read_frame` in lib.rs applies to the `timeout` here.
     pub async fn claim_next<R: DeserializeOwned>(&mut self) -> io::Result<GroupClaimed<R>> {
         let req = serde_json::to_vec(&GroupClaimReq::Next {
             group: self.group.clone(),

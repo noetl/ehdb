@@ -2009,6 +2009,13 @@ impl LocalArrowSnapshotScanner {
 }
 
 impl ReferenceDatabase {
+    /// NOTE(review): NOT atomic. Mutations are applied one by one, so an error
+    /// on mutation k leaves 0..k applied (and `apply_catalog`'s CreateTable
+    /// id-mismatch check fires AFTER the table was inserted). Callers that
+    /// matter compensate: `LocalReferenceRuntime::append` applies to a clone
+    /// and swaps on success, and `open` aborts on error. Any new caller must do
+    /// the same. The clone-per-append is O(whole state); a persistent/
+    /// copy-on-write structure or an undo log would remove that cost.
     pub fn apply_record(&mut self, record: &TransactionRecord) -> Result<()> {
         for mutation in &record.mutations {
             self.apply_mutation(record, mutation)?;

@@ -324,6 +324,11 @@ impl FenceLedger {
     }
 
     /// Compare `epoch` against the high-water mark, advancing it when higher.
+    ///
+    /// TODO(review): read-modify-write with no lock. Two writers with epochs 5
+    /// and 6 can both read 4, both pass, and the marker ends at whichever
+    /// rename lands last, possibly 5 (the high-water mark regresses). Serialise
+    /// with a per-shard mutex (in-process) or an flock on the marker.
     pub fn check_and_advance(&self, shard: u32, epoch: u64) -> Result<FenceDecision> {
         let highest = self.highest_epoch(shard)?;
         if epoch < highest {
@@ -341,6 +346,12 @@ impl FenceLedger {
 
     fn write_marker(&self, shard: u32, epoch: u64) -> Result<()> {
         let path = self.marker(shard);
+        // TODO(review): no fsync of the tmp file before rename, and no dir
+        // fsync after it. After power loss the marker can be empty or the old
+        // value, i.e. the fence forgets an epoch it accepted. The older port in
+        // ehdb-reference/src/fencing.rs (`write_marker`) does `sync_all()`
+        // before the rename; this one regressed. Fixed tmp name has the same
+        // concurrent-writer hazard as substrate.rs `write_atomic`.
         let tmp = path.with_extension("epoch.tmp");
         std::fs::write(&tmp, epoch.to_string())
             .map_err(|e| EhdbError::Storage(format!("write fence marker: {e}")))?;

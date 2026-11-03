@@ -27,6 +27,10 @@ pub const MAX_FRAME_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// CRC-32 (IEEE, reflected, `0xEDB88320`) — byte-identical to the #254
 /// `crc32` (same init/xor-out, same polynomial). A shared known-answer vector in
 /// [`tests`] pins it to #254's `crc32_matches_known_vector`.
+// NOTE(review): bit-at-a-time CRC (8 iterations per byte, no table). It runs
+// on every append and every frame read, so it is a measurable share of the
+// read path for large parts. A table-driven or `crc32fast` (hardware) version
+// produces byte-identical output, so the #254 compatibility pin is unaffected.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
@@ -94,6 +98,14 @@ pub fn read_frame_at(bytes: &[u8], offset: u64) -> Result<Option<DecodedFrame<'_
     }
     let body_start = start + FRAME_HEADER_LEN;
     let body_end = body_start + body_len;
+    // NOTE(review): "body runs past EOF" is classified as a torn tail, which
+    // is right for the ACTIVE part after a crash. For a SEALED part (immutable,
+    // length known from `PartMeta::byte_size`), the same condition can only
+    // mean corruption, e.g. a bit-flip in `body_len`, yet callers such as
+    // `read_partition_after_limited` and `replay_all` then silently return the
+    // prefix. Consider a strict variant for sealed parts that errors unless
+    // the frames end exactly at `byte_size`.
+    //
     // A truncated body at EOF is a torn tail — stop, keep the prefix.
     if body_end > bytes.len() {
         return Ok(None);

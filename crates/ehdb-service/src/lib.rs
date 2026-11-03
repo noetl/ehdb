@@ -54,6 +54,9 @@ pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024 * 10
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RESULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_RETRIEVAL_CONTEXT_MAX_RECEIPT_PAYLOAD_BYTES: usize = 64 * 1024;
 
+// NOTE(review): `Debug` is derived, so `{:?}` of this policy (or of
+// `LocalArrowFlightServerConfig`, which embeds it) prints the bearer token.
+// Implement Debug by hand and redact `token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlightAuthPolicy {
     DisabledForLocalReference,
@@ -102,6 +105,15 @@ impl FlightAuthPolicy {
                         "EHDB Flight auth header is missing",
                     ));
                 };
+                // TODO(review): `==` on &str short-circuits on the first
+                // differing byte, a timing side channel on the shared token.
+                // Use a constant-time comparison (e.g. `subtle::ConstantTimeEq`).
+                // Also: this is ONE shared token for every caller, and tenant /
+                // namespace / principal are then taken from client-supplied
+                // headers (FlightScanScopePolicy, FlightScanGrantPolicy), so any
+                // token holder can claim any principal. Catalog grants are only
+                // as strong as the token's distribution; bind identity to the
+                // credential.
                 if value.to_str().ok() == Some(token.as_str()) {
                     None
                 } else {

@@ -13,6 +13,10 @@ ehdb-l0 = { path = "../ehdb-l0" }
 # noetl/ai-meta#332 — transport + failure detection ONLY. All membership STATE
 # lives in EHDB (D8). foca does no I/O and has two required deps of its own.
 foca = { version = "2", features = ["std", "serde"] }
+# NOTE(review): the only crate that declares serde (and rand/foca) directly
+# instead of through [workspace.dependencies], and it uses bare path deps for
+# ehdb-core/ehdb-l0. Move these to `workspace = true` so versions are managed
+# in one place. foca 2 is also what raises the real MSRV (see root Cargo.toml).
 serde = { version = "1", features = ["derive"] }
 rand = "0.10"
 

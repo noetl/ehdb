@@ -612,6 +612,13 @@ impl LocalJsonlStreamLog {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // TODO(review): unlike LocalJsonlTransactionLog::open
+                // (noetl/ehdb#262), a torn FINAL line here (crash between the
+                // JSON and the `\n` in `append_entry_to_disk`) fails the whole
+                // open, making every stream in the file unreadable. The four
+                // JSONL journals (stream, transaction, system, reference) each
+                // re-implement open/append with different torn-tail policies;
+                // extract one shared journal type.
                 let entry: StreamJournalEntry = serde_json::from_str(&line)
                     .map_err(|err| map_stream_journal_decode_error(index + 1, err))?;
                 apply_journal_entry(&mut inner, entry)?;
@@ -765,6 +772,12 @@ impl LocalJsonlStreamLog {
             .append(true)
             .open(&self.path)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // NOTE(review): `to_writer` on an unbuffered File issues many small
+        // write(2) calls per entry; serialise to a Vec and `write_all` once (as
+        // the transaction log's batch path does). Payloads are `Vec<u8>`, so
+        // serde_json writes them as arrays of numbers (~3-4x the raw size).
+        // Retention (`MaxRecords`) only trims memory; the journal is never
+        // compacted, so file size and open-time replay grow without bound.
         serde_json::to_writer(&mut file, entry)
             .map_err(|err| EhdbError::Storage(err.to_string()))?;
         file.write_all(b"\n")

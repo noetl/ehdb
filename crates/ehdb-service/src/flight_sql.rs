@@ -85,6 +85,12 @@ pub const MAX_LIMIT: usize = 1000;
 pub trait ProjectionReadModel: Send + Sync + 'static {
     /// Bounded, ordered list of execution-state read-model rows (committed /
     /// materialized only).
+    ///
+    /// NOTE(review): there is no tenant / namespace parameter, and
+    /// `ExecutionStateView` carries none, so any caller that passes
+    /// `ReadTokenVerifier::verify` reads every tenant's executions. Fine for a
+    /// single-tenant deployment; for multi-tenant, the verifier should return
+    /// a scope that is threaded into this call.
     fn list_executions(&self, limit: usize) -> Result<Vec<ExecutionStateView>>;
 }
 
@@ -640,6 +646,11 @@ where
 {
     use arrow_flight::flight_service_server::FlightServiceServer;
     use tonic::transport::Server;
+
+    // NOTE(review): unlike `LocalArrowFlightServerConfig::validate` in lib.rs,
+    // this path has no loopback guard for `new_local_reference` (auth off), no
+    // max message size, and no concurrency limit. Consider sharing that config
+    // and its validation across both Flight surfaces.
 
     Server::builder()
         .add_service(FlightServiceServer::new(service))

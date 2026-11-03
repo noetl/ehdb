@@ -130,6 +130,13 @@ impl<D: Dataset> FencedEngine<D> {
     /// ⚠ The check happens **before** the lock is taken, so a refused write does
     /// not queue behind the append lock to be told no. The ledger read is a
     /// small file read; under contention it is cheaper than the lock it avoids.
+    ///
+    /// NOTE(review): check-then-lock is a TOCTOU window. A writer can pass the
+    /// check, be superseded (a newer epoch lands in the ledger), and still
+    /// mutate once it gets the lock. `ehdb-reference/src/fencing.rs` (module
+    /// docs) states the rule this breaks: "only a check the store performs as
+    /// part of the write closes it". Re-check under the guard (cheap) before
+    /// handing out `EngineWrite`, keeping the early check as a fast-fail.
     pub fn write(&self, path: MutationPath) -> Result<EngineWrite<'_, D>> {
         let decision = self.fence.check(self.shard, path)?;
         Ok(EngineWrite {

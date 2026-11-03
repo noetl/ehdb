@@ -260,6 +260,13 @@ impl InMemoryRetrievalCatalog {
             .ok_or_else(|| EhdbError::NotFound(format!("{chunk_id}.{model_id}")))
     }
 
+    /// NOTE(review): brute-force scan of every embedding, with an O(D) Vec
+    /// `contains` per candidate for scoping, then a full sort. Fine for the
+    /// bounded reference (SCOPE.md: bounded, projection-scoped retrieval), but
+    /// index embeddings by (tenant, namespace, model) and use a bounded heap
+    /// for top-k before it serves real volumes. In `search_hybrid`, the text
+    /// score is a raw match count while the vector score is cosine in [-1, 1],
+    /// so the weights are not on comparable scales.
     pub fn search_similar(&self, request: VectorSearch) -> Result<Vec<VectorSearchHit>> {
         if request.limit == 0 {
             return Err(EhdbError::InvalidState(
@@ -415,6 +422,14 @@ impl InMemoryRetrievalCatalog {
         self.embeddings.len()
     }
 
+    // TODO(review) P1 (tenant isolation): documents are keyed by
+    // (tenant, namespace, id), but this lookup matches on `id` ALONE, and
+    // `chunks` is keyed globally by ChunkId with only a `document_id` back-ref.
+    // If two tenants both register document "d1", a chunk registered for one
+    // attaches to whichever is found first, and `search_*` (which scopes by
+    // `document_ids_for_scope`, also bare ids) returns the other tenant's
+    // chunks. `chunks_for_document` has no scope at all. Carry
+    // (tenant, namespace) in Chunk / RegisterChunk and in every key.
     fn document_by_id(&self, document_id: &DocumentId) -> Result<&Document> {
         self.documents
             .values()

@@ -122,6 +122,13 @@ impl InMemoryCatalog {
             )));
         }
 
+        // NOTE(review): the id is a `_`-joined concatenation, which is not
+        // injective if identifiers may contain `_` (tenant "a_b"/ns "c" and
+        // tenant "a"/ns "b_c" yield the same id). Lookups here are safe because
+        // TableIdentity also keys on tenant + namespace, but anything that uses
+        // TableId alone (object paths, logs, external refs) can collide. It
+        // also makes ids non-stable under rename. Consider an opaque id
+        // (ULID / content hash) or an unambiguous separator.
         let table = CatalogTable {
             id: TableId::new(format!(
                 "{}_{}_{}",
@@ -145,6 +152,10 @@ impl InMemoryCatalog {
         Ok(table)
     }
 
+    /// NOTE(review): `files` are not checked to live under this table's
+    /// tenant/namespace prefix (`table_snapshot_object_path` in ehdb-storage),
+    /// so a snapshot can reference another tenant's objects. There is also no
+    /// drop-table, revoke-grant, or snapshot expiry, so state only grows.
     pub fn commit_snapshot(&mut self, request: CommitSnapshot) -> Result<CatalogSnapshot> {
         if request.files.is_empty() {
             return Err(EhdbError::InvalidState(

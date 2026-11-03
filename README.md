@@ -52,9 +52,18 @@ crates/
 |-- ehdb-stream    # stream logs, durable consumers, replay cursors
 |-- ehdb-retrieval # RAG documents, chunks, embeddings, retrieval metadata
 |-- ehdb-system    # system WASM library manifests and environment bindings
-|-- ehdb-service   # service-facing request/result boundaries
-`-- ehdb-transaction # transaction records, replay, local durable log
+|-- ehdb-service   # service-facing request/result boundaries, Arrow Flight / Flight SQL
+|-- ehdb-transaction # transaction records, replay, local durable log
+|-- ehdb-l0        # L0 durable event-log engine: parts, manifest, substrate replicas
+|-- ehdb-feed      # TCP feed / claim / group faces over an L0 writer, epoch fencing
+|-- ehdb-gossip    # SWIM (foca) transport feeding membership into the runtime log
+`-- ehdb-slm-context # SLM execution-context event payloads and their pure fold
 ```
+
+> Review note (2026-11): this list previously omitted `ehdb-l0`, `ehdb-feed`,
+> `ehdb-gossip` and `ehdb-slm-context`. See
+> [`docs/design-review.md`](docs/design-review.md) for an architecture overview
+> and a ranked list of open design issues.
 
 Future workspace areas include network services and NoETL integration
 surfaces. ⚠ **Analytical execution is not among them** — a new analytical view

@@ -303,6 +303,9 @@ impl LocalJsonlSystemLibraryCatalog {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // TODO(review): same torn-final-line hazard as the stream
+                // journal: a crash mid-append makes the whole catalog
+                // unopenable. See the note in ehdb-stream `open`.
                 let entry: SystemLibraryJournalEntry = serde_json::from_str(&line)
                     .map_err(|err| map_system_library_journal_decode_error(index + 1, err))?;
                 apply_journal_entry(&mut inner, entry)?;

@@ -146,6 +146,14 @@ impl LocalFsSubstrate {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
+        // TODO(review): the temp name is FIXED per key (`<key>.tmp`, and
+        // `with_extension` also maps `a.json` and `a.bin` to the same `a.tmp`).
+        // Two concurrent writers of the same key (the uploader thread and
+        // merge/retention both `put_overwrite` LATEST, see engine.rs) truncate
+        // and write the same tmp file, so the rename can publish interleaved
+        // bytes. Use a unique tmp name (pid + counter / tempfile) per call.
+        // Also: no fsync of the parent directory after `rename`, so the new
+        // name itself is not durable across power loss.
         let tmp = target.with_extension("tmp");
         {
             let mut f = OpenOptions::new()
@@ -181,6 +189,10 @@ impl DurableSubstrate for LocalFsSubstrate {
 
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         let target = self.resolve(key)?;
+        // NOTE(review): check-then-write, not atomic. Two racing callers can
+        // both see "absent" and both write (last rename wins, both return
+        // true). Atomic alternatives: `hard_link(tmp, target)` (fails with
+        // EEXIST) or `renameat2(RENAME_NOREPLACE)`.
         if target.exists() {
             return Ok(false);
         }

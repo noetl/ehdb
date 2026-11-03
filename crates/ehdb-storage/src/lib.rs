@@ -13,6 +13,12 @@ pub struct ObjectPath(String);
 impl ObjectPath {
     pub fn new(path: impl Into<String>) -> Result<Self> {
         let path = path.into();
+        // NOTE(review): accepts empty segments (`a//b`) and a trailing `/`,
+        // which resolve to a different (or directory) path on the local store
+        // and to a distinct key on S3-style stores. `contains("..")` also
+        // rejects legal names like `v1..2.parquet`; checking per-segment
+        // (`seg == ".." || seg == "." || seg.is_empty()`) is both stricter and
+        // more precise.
         let safe = !path.is_empty()
             && !path.starts_with('/')
             && !path.contains("..")
@@ -480,6 +486,12 @@ impl ImmutableObjectStore for LocalObjectStore {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
 
+        // TODO(review): writes straight to the final path with no fsync. A
+        // crash mid-write leaves a short file at `target`; because of
+        // `create_new`, every retry then fails with AlreadyExists, so the
+        // object is permanently corrupt (only `get_verified` notices). Write to
+        // a unique tmp, `sync_all`, then link/rename into place, as
+        // ehdb-l0's substrate does.
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

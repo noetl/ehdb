@@ -38,6 +38,9 @@
 //! Both are backward compatible: heartbeats are only sent to a client that asked,
 //! and a client whose peer never heartbeats disarms its deadline and falls back to
 //! keepalive-only.
+//!
+//! NOTE(review): stale since noetl/ai-meta#297. A non-heartbeating peer now
+//! demotes to `hard_read_ceiling()` rather than disarming (see `claim_next`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -936,6 +939,10 @@ impl ClaimClient {
     /// error so the caller redials (noetl/ai-meta#208 defect 1). A coordinator that
     /// never heartbeats (an older writer) disarms the deadline on the first miss
     /// and liveness falls back to TCP keepalive alone.
+    ///
+    /// NOTE(review): stale since noetl/ai-meta#297; the code below demotes to the
+    /// hard read ceiling instead of disarming. Same cancel-safety caveat as
+    /// `read_frame` in lib.rs applies to the `timeout` here.
     pub async fn claim_next<R: DeserializeOwned>(&mut self) -> std::io::Result<Claimed<R>> {
         let req = serde_json::to_vec(&ClaimReq::Next {
             member: self.member,
