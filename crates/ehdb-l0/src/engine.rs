@@ -396,6 +396,15 @@ pub struct L0Engine<D: Dataset> {
     /// In-RAM catalog — local-only + durable parts. Shared with the uploader
     /// thread, which records a replica on upload.
     manifest: Arc<Mutex<Manifest>>,
+    /// Highest manifest version published to `LATEST` (noetl/ehdb#426).
+    ///
+    /// Versions are allocated under [`Self::manifest`], but the substrate writes
+    /// happen outside it and come from two producers (the uploader thread and
+    /// the merge / retention path), so they can land out of order. This lock
+    /// serialises publication and drops a view older than one already published,
+    /// so `LATEST` only moves forward. It is a separate lock so a slow substrate
+    /// still never blocks appends or reads.
+    published: Arc<Mutex<u64>>,
     /// Per-shard active writers (engine-owned single writer).
     writers: HashMap<u32, PartWriter<D>>,
     /// Highest sort key seen (D1: the global-sequence tip).
@@ -692,6 +701,7 @@ impl<D: Dataset> L0Engine<D> {
             config,
             replicas,
             metrics,
+            published: Arc::new(Mutex::new(manifest.version)),
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
             tail_cursor: HashMap::new(),
@@ -732,6 +742,7 @@ impl<D: Dataset> L0Engine<D> {
         let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
         let manifest_retain = self.config.manifest_retain;
+        let published = Arc::clone(&self.published);
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
             .spawn(move || {
@@ -784,7 +795,14 @@ impl<D: Dataset> L0Engine<D> {
                     };
                     // The durable manifest must exist on EVERY replica so any one
                     // of them can serve a cold-load alone.
-                    write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
+                    write_manifest_to_all(
+                        &replicas,
+                        &published,
+                        &dataset,
+                        &durable,
+                        manifest_retain,
+                        &metrics,
+                    );
 
                     match job.sealed_at {
                         Some(sealed_at) => {
@@ -1646,6 +1664,7 @@ impl<D: Dataset> L0Engine<D> {
         };
         write_manifest_to_all(
             &self.replicas,
+            &self.published,
             &self.config.dataset,
             &durable,
             self.config.manifest_retain,
@@ -1824,6 +1843,7 @@ impl<D: Dataset> L0Engine<D> {
         };
         write_manifest_to_all(
             &self.replicas,
+            &self.published,
             &self.config.dataset,
             &durable,
             self.config.manifest_retain,
@@ -2619,8 +2639,17 @@ fn replicate_bytes(
 /// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
 /// replica, so any one of them can serve a cold-load alone. Best-effort per
 /// replica (a down replica is skipped; the survivors carry the manifest).
+///
+/// ⚠ Publication is serialised by `published` and only moves forward
+/// (noetl/ehdb#426). A view whose version is not above the last published one
+/// is dropped: it was taken under the manifest lock *before* the published one,
+/// so the published view already contains every change it carries. Without this
+/// the uploader and the merge path could each write `LATEST` in the opposite
+/// order to the one they allocated versions in, and a restart would load the
+/// older catalog — resurrecting merged-away sources or forgetting an upload.
 fn write_manifest_to_all(
     replicas: &[ReplicaTarget],
+    published: &Mutex<u64>,
     dataset: &str,
     durable: &Manifest,
     manifest_retain: usize,
@@ -2629,6 +2658,12 @@ fn write_manifest_to_all(
     let Ok(ser) = serde_json::to_vec(durable) else {
         return;
     };
+    // Poison-tolerant: the guarded value is a plain integer, always valid.
+    let mut high_water = published.lock().unwrap_or_else(|p| p.into_inner());
+    if durable.version <= *high_water {
+        return;
+    }
+    *high_water = durable.version;
     for target in replicas {
         let _ = target
             .substrate
@@ -2637,6 +2672,7 @@ fn write_manifest_to_all(
             .substrate
             .put_if_absent(&manifest_version_key(dataset, durable.version), &ser);
     }
+    drop(high_water);
     prune_manifest_versions(replicas, dataset, durable.version, manifest_retain, metrics);
 }
 
@@ -2751,22 +2787,195 @@ fn parse_manifest_version(key: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// Load the durable manifest from the **first replica that has it** (L0.6): a
-/// dead `replica-0` does not stop recovery — the manifest is replicated, so any
-/// survivor serves it.
+/// Load the durable manifest (L0.6): a dead `replica-0` does not stop recovery —
+/// the manifest is replicated, so any survivor serves it.
+///
+/// ⚠ Reads `LATEST` from **every** replica and keeps the highest version that
+/// decodes (noetl/ehdb#426). It used to take the first replica that had one, so
+/// a replica that missed the newest writes (down for a while, then back) won
+/// over one that had them, and a single undecodable copy failed the open even
+/// when another replica held a good one.
+///
+/// When any copy fails to decode, the versioned snapshots are consulted as well,
+/// because the damaged `LATEST` may have been the newest: losing it must not
+/// silently roll the catalog back further than the snapshots allow.
+///
+/// Returns `Ok(None)` only when **no** replica has a manifest. If some do and
+/// none decodes, that is an error — treating it as an empty store would orphan
+/// every part.
 fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Option<Manifest>> {
     let key = manifest_latest_key(dataset);
+    let mut best: Option<Manifest> = None;
+    let mut failures: Vec<String> = Vec::new();
+    let keep = |m: Manifest, best: &mut Option<Manifest>| {
+        if best.as_ref().is_none_or(|b| m.version > b.version) {
+            *best = Some(m);
+        }
+    };
     for target in replicas {
         match target.substrate.exists(&key) {
             Ok(true) => {}
             _ => continue,
         }
-        let Ok(bytes) = target.substrate.get_all(&key) else {
+        let bytes = match target.substrate.get_all(&key) {
+            Ok(b) => b,
+            Err(err) => {
+                failures.push(format!("{}: read: {err}", target.id));
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Manifest>(&bytes) {
+            Ok(m) => keep(m, &mut best),
+            Err(err) => failures.push(format!("{}: decode: {err}", target.id)),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(best);
+    }
+    // Some copy of LATEST was unreadable. Fall back to the versioned snapshots.
+    let prefix = format!("manifest/{dataset}/");
+    for target in replicas {
+        let Ok(keys) = target.substrate.list_prefix(&prefix) else {
             continue;
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|err| EhdbError::Storage(format!("decode durable manifest: {err}")))?;
-        return Ok(Some(manifest));
+        let mut versions: Vec<(u64, String)> = keys
+            .into_iter()
+            .filter_map(|k| parse_manifest_version(&k).map(|v| (v, k)))
+            .collect();
+        versions.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+        for (version, k) in versions {
+            if best.as_ref().is_some_and(|b| b.version >= version) {
+                break;
+            }
+            let Ok(bytes) = target.substrate.get_all(&k) else {
+                continue;
+            };
+            if let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) {
+                keep(m, &mut best);
+                break;
+            }
+        }
     }
-    Ok(None)
+    match best {
+        Some(m) => Ok(Some(m)),
+        None => Err(EhdbError::Storage(format!(
+            "decode durable manifest: no replica holds a readable manifest ({})",
+            failures.join("; ")
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod manifest_publication_tests {
+    //! noetl/ehdb#426 — `LATEST` publication order and multi-replica load.
+    use super::*;
+    use crate::substrate::LocalFsSubstrate;
+    use std::path::Path;
+
+    const DS: &str = "d1_event_log";
+
+    fn dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "ehdb-426-manifest-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    fn replica(id: &str, root: &Path) -> ReplicaTarget {
+        ReplicaTarget::new(id, Arc::new(LocalFsSubstrate::new(root).unwrap()))
+    }
+
+    fn manifest(version: u64) -> Manifest {
+        let mut m = Manifest::empty(DS);
+        m.version = version;
+        m
+    }
+
+    fn publish(replicas: &[ReplicaTarget], published: &Mutex<u64>, version: u64) {
+        let metrics = L0Metrics::new();
+        write_manifest_to_all(replicas, published, DS, &manifest(version), 64, &metrics);
+    }
+
+    #[test]
+    fn an_older_view_never_overwrites_a_newer_latest() {
+        let root = dir("order");
+        let replicas = vec![replica("replica-0", &root)];
+        let published = Mutex::new(0);
+        // Allocated 1 then 2; the substrate writes land 2 then 1.
+        publish(&replicas, &published, 2);
+        publish(&replicas, &published, 1);
+        let loaded = load_durable_manifest(&replicas, DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 2, "LATEST went backwards");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_takes_the_highest_version_across_replicas() {
+        let (a, b) = (dir("hi-a"), dir("hi-b"));
+        let ra = replica("replica-0", &a);
+        let rb = replica("replica-1", &b);
+        // replica-0 missed the newest writes; it must not win just by being first.
+        publish(std::slice::from_ref(&ra), &Mutex::new(0), 3);
+        publish(std::slice::from_ref(&rb), &Mutex::new(0), 5);
+        let loaded = load_durable_manifest(&[ra, rb], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 5);
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
+    }
+
+    #[test]
+    fn a_corrupt_latest_falls_back_to_another_replica() {
+        let (a, b) = (dir("cor-a"), dir("cor-b"));
+        let ra = replica("replica-0", &a);
+        let rb = replica("replica-1", &b);
+        publish(&[ra.clone(), rb.clone()], &Mutex::new(0), 4);
+        ra.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"{not json")
+            .unwrap();
+        let loaded = load_durable_manifest(&[ra, rb], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 4);
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
+    }
+
+    #[test]
+    fn a_corrupt_latest_falls_back_to_the_newest_snapshot() {
+        let root = dir("snap");
+        let r = replica("replica-0", &root);
+        let published = Mutex::new(0);
+        for v in 1..=3 {
+            publish(std::slice::from_ref(&r), &published, v);
+        }
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"\0\0torn")
+            .unwrap();
+        let loaded = load_durable_manifest(&[r], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
+        let root = dir("none");
+        let r = replica("replica-0", &root);
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"garbage")
+            .unwrap();
+        assert!(
+            load_durable_manifest(&[r], DS).is_err(),
+            "a store whose manifest cannot be read must not open as empty"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_manifest_anywhere_is_a_fresh_store() {
+        let root = dir("fresh");
+        let r = replica("replica-0", &root);
+        assert!(load_durable_manifest(&[r], DS).unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
 }
