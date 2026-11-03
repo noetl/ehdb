@@ -914,17 +914,24 @@ impl<D: Dataset> L0Engine<D> {
         // (noetl/ai-meta#203). Count it so the loss class is observable rather
         // than silent. `append_writer_assigned` assigns a strictly-advancing key
         // so it never trips this.
-        match self.shard_tail_max.get(&shard) {
-            Some(&prev) if sort_key <= prev => self.metrics.incr_out_of_order_appends(),
-            _ => {
-                self.shard_tail_max.insert(shard, sort_key);
-            }
-        }
+        //
+        // ⚠ The tail only advances once the append succeeded (noetl/ehdb#426).
+        // Advancing it first meant a failed append raised the tail, so the
+        // retry of that same record was counted as out of order.
+        let out_of_order = matches!(
+            self.shard_tail_max.get(&shard),
+            Some(&prev) if sort_key <= prev
+        );
         self.ensure_writer(shard)?;
         let dedupe_key = D::dedupe_key(&record).map(str::to_string);
         {
             let writer = self.writers.get_mut(&shard).unwrap();
             writer.append(record)?;
+        }
+        if out_of_order {
+            self.metrics.incr_out_of_order_appends();
+        } else {
+            self.shard_tail_max.insert(shard, sort_key);
         }
         // ⚠ AFTER the append, never before. Remembering first would make a failed
         // append poison its key: the retry that the failure exists to invite would
@@ -946,16 +953,27 @@ impl<D: Dataset> L0Engine<D> {
         // direction for a durability signal.
         self.unreplicated.on_append(shard);
 
+        // ⚠ From here on the record is durable, so this call must report
+        // success whatever happens to the seal (noetl/ehdb#426). Returning the
+        // seal's error used to tell the caller the append failed; a caller that
+        // retries then writes the record twice unless its dataset dedupes. A
+        // failed seal leaves the records in the active part, which the next
+        // seal attempt — or recovery on restart — picks up, so the failure is
+        // counted (`seal_failed`) rather than propagated.
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
             if writer.should_seal() {
-                writer.seal()?
+                writer.seal()
             } else {
-                None
+                Ok(None)
             }
         };
-        if let Some(sealed) = sealed {
-            self.register_and_upload(sealed)?;
+        let registered = sealed.and_then(|sealed| match sealed {
+            Some(sealed) => self.register_and_upload(sealed),
+            None => Ok(()),
+        });
+        if registered.is_err() {
+            self.metrics.incr_seal_failed();
         }
         Ok(sort_key)
     }
