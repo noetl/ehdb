@@ -47,7 +47,10 @@ use crate::frame::{iter_frames_exact, iter_frames_from, FRAME_HEADER_LEN};
 const MIN_INCREMENTAL_READ: u64 = 256;
 use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
-use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
+use crate::part::{
+    active_id, active_range, build_merged_part, choose_live_active, read_sealed_part,
+    seal_stranded_active, substrate_key_for, FlushPolicy, PartWriter, SealedPart,
+};
 use crate::substrate::DurableSubstrate;
 use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 
@@ -396,6 +399,15 @@ pub struct L0Engine<D: Dataset> {
     /// In-RAM catalog — local-only + durable parts. Shared with the uploader
     /// thread, which records a replica on upload.
     manifest: Arc<Mutex<Manifest>>,
+    /// Highest manifest version published to `LATEST` (noetl/ehdb#426).
+    ///
+    /// Versions are allocated under [`Self::manifest`], but the substrate writes
+    /// happen outside it and come from two producers (the uploader thread and
+    /// the merge / retention path), so they can land out of order. This lock
+    /// serialises publication and drops a view older than one already published,
+    /// so `LATEST` only moves forward. It is a separate lock so a slow substrate
+    /// still never blocks appends or reads.
+    published: Arc<Mutex<u64>>,
     /// Per-shard active writers (engine-owned single writer).
     writers: HashMap<u32, PartWriter<D>>,
     /// Highest sort key seen (D1: the global-sequence tip).
@@ -581,8 +593,16 @@ impl<D: Dataset> L0Engine<D> {
         // writer at all, so recovered records stay invisible until something
         // happens to append.  Both were caught by the engine-level tests and
         // neither is visible from the writer's own unit tests.
-        engine.recover_active_parts()?;
+        //
+        // ⚠ The uploader starts first only so the parts adopted below can be
+        // enqueued; it neither reads nor appends. Adoption runs before the
+        // writers open because registering a part closes the shard's tracked
+        // active window (`UnreplicatedTracker::on_seal`), which must not touch
+        // the records recovered from the live active part.
         engine.start_uploader();
+        engine.seal_stranded_active_parts()?;
+        engine.adopt_unregistered_sealed_parts()?;
+        engine.recover_active_parts()?;
         // ⚠ Unconditional, including on a fresh engine where every value is 0. A pin
         // inside a config branch is not a pin (server#315): it leaves the series absent
         // on exactly the configuration whose value someone would be reading, and an
@@ -600,6 +620,159 @@ impl<D: Dataset> L0Engine<D> {
             self.ensure_writer(shard)?;
         }
         Ok(())
+    }
+
+    /// Recover older incarnations' active parts by sealing them, when that is
+    /// safe (noetl/ehdb#426).
+    ///
+    /// Each is an active part a previous process appended to, acknowledged, and
+    /// abandoned when it restarted onto a fresh id. Its records are in no
+    /// manifest. It is sealed in place — only the intact frames are kept — and
+    /// the adoption pass that runs next registers and uploads it like any other
+    /// unregistered sealed part.
+    ///
+    /// ⚠ Only when its key range overlaps nothing: no part in the manifest, not
+    /// the live active part, not another part sealed by this pass, and nothing
+    /// at or below the retention floor. Overlap is not hypothetical: the
+    /// incarnation after a crash resumed from the manifest's maximum key, which
+    /// was below the stranded records, and so may have reused their range. An
+    /// overlapping part would break the ordered reads that assume parts do not
+    /// overlap, so it stays where it is and `stranded_active()` keeps reporting
+    /// it — disposing of it is the caller's decision (noetl/ehdb#396).
+    ///
+    /// ⚠ The records reappear at their original, older keys. A follower whose
+    /// cursor has passed those keys will not be re-delivered them; reads by
+    /// index (`read_index_after`) see them. Returns the number sealed.
+    fn seal_stranded_active_parts(&mut self) -> Result<usize> {
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let (coverage_floor, mut taken) = {
+            let m = self.manifest.lock().unwrap();
+            let ranges: Vec<(u32, u64, u64)> = m
+                .parts
+                .iter()
+                .map(|p| (p.partition, p.min_sequence, p.max_sequence))
+                .collect();
+            (m.reclaimed_through, ranges)
+        };
+        let mut sealed = 0usize;
+        for partition in 0..self.config.shard_count.max(1) {
+            let dir = parts_root.join(format!("shard-{partition}"));
+            let (live, _) = choose_live_active::<D>(&dir)?;
+            let mut actives: Vec<(u64, PathBuf)> = match fs::read_dir(&dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter_map(|p| active_id(&p).map(|id| (id, p)))
+                    .collect(),
+                Err(_) => continue,
+            };
+            actives.sort();
+            // The live part's range is off limits too.
+            for (id, path) in &actives {
+                if Some(*id) == live {
+                    if let Some((lo, hi, _)) = active_range::<D>(path)? {
+                        taken.push((partition, lo, hi));
+                    }
+                }
+            }
+            for (id, path) in actives {
+                if Some(id) == live {
+                    continue;
+                }
+                let Some((lo, hi, intact)) = active_range::<D>(&path)? else {
+                    continue;
+                };
+                let overlaps = lo <= coverage_floor
+                    || lo > hi
+                    || taken
+                        .iter()
+                        .any(|&(p, a, b)| p == partition && lo <= b && a <= hi);
+                if overlaps {
+                    continue;
+                }
+                seal_stranded_active(&path, partition, lo, hi, intact)?;
+                taken.push((partition, lo, hi));
+                sealed += 1;
+            }
+        }
+        Ok(sealed)
+    }
+
+    /// Re-register every sealed part that reached local disk but not the durable
+    /// manifest, and re-enqueue its upload (noetl/ehdb#426).
+    ///
+    /// The durable manifest lists only uploaded parts, so a part sealed (and its
+    /// records acknowledged) but not yet uploaded when the process stopped was
+    /// invisible after the restart — and the next [`Self::apply_retention`]
+    /// deleted it through [`Self::reclaim_orphans`]. It is the part's records,
+    /// acked and `fsync`ed, that this keeps.
+    ///
+    /// A file is adopted only when it is a clean sealed part of a live
+    /// partition whose records the manifest does not already cover
+    /// ([`Coverage::superseded`]). A merge output (under `merged/`), a part below the
+    /// retention floor, and anything that fails to decode cleanly are left
+    /// where they are. Returns the number of parts adopted.
+    fn adopt_unregistered_sealed_parts(&mut self) -> Result<usize> {
+        let parts_root = self
+            .config
+            .local_root
+            .join(format!("parts/{}", self.config.dataset));
+        let mut files = Vec::new();
+        collect_eslog_files(&parts_root, &mut files)?;
+        files.sort();
+        let (coverage, known) = {
+            let m = self.manifest.lock().unwrap();
+            let known: std::collections::HashSet<String> =
+                m.parts.iter().map(|p| p.part_id.clone()).collect();
+            (Coverage::of(&m), known)
+        };
+        let mut adopted = 0usize;
+        for path in files {
+            let Some(partition) = shard_dir_partition(&parts_root, &path) else {
+                continue;
+            };
+            if partition >= self.config.shard_count.max(1) {
+                continue;
+            }
+            let Some((min, max)) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| parse_part_range(stem, partition))
+            else {
+                continue;
+            };
+            let part_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if known.contains(part_id) || coverage.superseded(partition, min, max) {
+                continue;
+            }
+            let Some(sealed) = read_sealed_part::<D>(&path, partition, self.config.granule_size)?
+            else {
+                continue;
+            };
+            let count = sealed.meta.record_count;
+            if max > self.global_sequence {
+                self.global_sequence = max;
+            }
+            let tail = self.shard_tail_max.entry(partition).or_insert(max);
+            if max > *tail {
+                *tail = max;
+            }
+            for r in &sealed.records {
+                if let Some(key) = D::dedupe_key(r) {
+                    self.dedupe.remember(partition, key, D::sort_key(r));
+                }
+            }
+            self.unreplicated.on_recovered(partition, count);
+            self.register_and_upload(sealed)?;
+            self.metrics.add_recovered_active_records(count);
+            adopted += 1;
+        }
+        Ok(adopted)
     }
 
     /// **Cold-load** a fresh node (empty local dir) from a single substrate:
@@ -692,6 +865,7 @@ impl<D: Dataset> L0Engine<D> {
             config,
             replicas,
             metrics,
+            published: Arc::new(Mutex::new(manifest.version)),
             manifest: Arc::new(Mutex::new(manifest)),
             writers: HashMap::new(),
             tail_cursor: HashMap::new(),
@@ -732,6 +906,7 @@ impl<D: Dataset> L0Engine<D> {
         let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
         let manifest_retain = self.config.manifest_retain;
+        let published = Arc::clone(&self.published);
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
             .spawn(move || {
@@ -784,7 +959,14 @@ impl<D: Dataset> L0Engine<D> {
                     };
                     // The durable manifest must exist on EVERY replica so any one
                     // of them can serve a cold-load alone.
-                    write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
+                    write_manifest_to_all(
+                        &replicas,
+                        &published,
+                        &dataset,
+                        &durable,
+                        manifest_retain,
+                        &metrics,
+                    );
 
                     match job.sealed_at {
                         Some(sealed_at) => {
@@ -896,17 +1078,24 @@ impl<D: Dataset> L0Engine<D> {
         // (noetl/ai-meta#203). Count it so the loss class is observable rather
         // than silent. `append_writer_assigned` assigns a strictly-advancing key
         // so it never trips this.
-        match self.shard_tail_max.get(&shard) {
-            Some(&prev) if sort_key <= prev => self.metrics.incr_out_of_order_appends(),
-            _ => {
-                self.shard_tail_max.insert(shard, sort_key);
-            }
-        }
+        //
+        // ⚠ The tail only advances once the append succeeded (noetl/ehdb#426).
+        // Advancing it first meant a failed append raised the tail, so the
+        // retry of that same record was counted as out of order.
+        let out_of_order = matches!(
+            self.shard_tail_max.get(&shard),
+            Some(&prev) if sort_key <= prev
+        );
         self.ensure_writer(shard)?;
         let dedupe_key = D::dedupe_key(&record).map(str::to_string);
         {
             let writer = self.writers.get_mut(&shard).unwrap();
             writer.append(record)?;
+        }
+        if out_of_order {
+            self.metrics.incr_out_of_order_appends();
+        } else {
+            self.shard_tail_max.insert(shard, sort_key);
         }
         // ⚠ AFTER the append, never before. Remembering first would make a failed
         // append poison its key: the retry that the failure exists to invite would
@@ -928,16 +1117,27 @@ impl<D: Dataset> L0Engine<D> {
         // direction for a durability signal.
         self.unreplicated.on_append(shard);
 
+        // ⚠ From here on the record is durable, so this call must report
+        // success whatever happens to the seal (noetl/ehdb#426). Returning the
+        // seal's error used to tell the caller the append failed; a caller that
+        // retries then writes the record twice unless its dataset dedupes. A
+        // failed seal leaves the records in the active part, which the next
+        // seal attempt — or recovery on restart — picks up, so the failure is
+        // counted (`seal_failed`) rather than propagated.
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
             if writer.should_seal() {
-                writer.seal()?
+                writer.seal()
             } else {
-                None
+                Ok(None)
             }
         };
-        if let Some(sealed) = sealed {
-            self.register_and_upload(sealed)?;
+        let registered = sealed.and_then(|sealed| match sealed {
+            Some(sealed) => self.register_and_upload(sealed),
+            None => Ok(()),
+        });
+        if registered.is_err() {
+            self.metrics.incr_seal_failed();
         }
         Ok(sort_key)
     }
@@ -1646,6 +1846,7 @@ impl<D: Dataset> L0Engine<D> {
         };
         write_manifest_to_all(
             &self.replicas,
+            &self.published,
             &self.config.dataset,
             &durable,
             self.config.manifest_retain,
@@ -1738,7 +1939,7 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     pub fn reclaim_orphans(&mut self) -> Result<usize> {
-        let (referenced_objects, referenced_locals) = {
+        let (referenced_objects, referenced_locals, coverage) = {
             let m = self.manifest.lock().unwrap();
             // Every substrate key referenced by any part's replica list — a
             // part may have N replicas (same key on different substrates), all of
@@ -1753,7 +1954,7 @@ impl<D: Dataset> L0Engine<D> {
                 .iter()
                 .filter_map(|p| p.local_path.clone())
                 .collect();
-            (objs, locals)
+            (objs, locals, Coverage::of(&m))
         };
 
         let mut reclaimed = 0usize;
@@ -1762,7 +1963,12 @@ impl<D: Dataset> L0Engine<D> {
         let prefix = format!("parts/{}/", self.config.dataset);
         for target in &self.replicas {
             for key in target.substrate.list_prefix(&prefix)? {
-                if !referenced_objects.contains(&key) {
+                // ⚠ Unreferenced is not the same as unwanted (noetl/ehdb#426): a
+                // part uploaded just before a crash that lost its manifest write
+                // is unreferenced and is the only durable copy of its records.
+                // Only an object whose records the manifest provably covers is
+                // deleted.
+                if !referenced_objects.contains(&key) && coverage.object_is_superseded(&key) {
                     // Size it WITHOUT fetching it (noetl/ehdb#395). This used
                     // to be `get_all`, i.e. a full read of an object that is
                     // deleted on the very next line — free-ish on a local
@@ -1784,7 +1990,13 @@ impl<D: Dataset> L0Engine<D> {
         collect_eslog_files(&parts_root, &mut local_files)?;
         for path in local_files {
             let path_str = path.to_string_lossy().to_string();
-            if !referenced_locals.contains(&path_str) {
+            // ⚠ Same rule for local files (noetl/ehdb#426). This used to delete
+            // every local part the manifest did not reference, which after a
+            // restart included a sealed part whose upload had not landed: acked
+            // records, deleted by the next retention pass.
+            if !referenced_locals.contains(&path_str)
+                && coverage.local_is_reclaimable(&parts_root, &path)
+            {
                 let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 fs::remove_file(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
                 self.metrics.record_orphan_reclaim(bytes);
@@ -1824,6 +2036,7 @@ impl<D: Dataset> L0Engine<D> {
         };
         write_manifest_to_all(
             &self.replicas,
+            &self.published,
             &self.config.dataset,
             &durable,
             self.config.manifest_retain,
@@ -2365,6 +2578,134 @@ fn collect_files_with_extension(
     Ok(())
 }
 
+/// `(min, max)` from a part id of the form `shard-<p>-seq-<min>-<max>`, if it
+/// belongs to `partition`.
+fn parse_part_range(part_id: &str, partition: u32) -> Option<(u64, u64)> {
+    let rest = part_id.strip_prefix(&format!("shard-{partition}-seq-"))?;
+    let (min, max) = rest.split_once('-')?;
+    Some((min.parse().ok()?, max.parse().ok()?))
+}
+
+/// The partition of a part file sitting directly in `<parts_root>/shard-<p>/`.
+/// `None` for anything else — notably a merge output under `shard-<p>/merged/`.
+fn shard_dir_partition(parts_root: &std::path::Path, path: &std::path::Path) -> Option<u32> {
+    let dir = path.parent()?;
+    if dir.parent()? != parts_root {
+        return None;
+    }
+    dir.file_name()?
+        .to_str()?
+        .strip_prefix("shard-")?
+        .parse()
+        .ok()
+}
+
+/// What the manifest already accounts for, without its indexes: the retention
+/// floor, every part's range, and which parts are durable. Built once per
+/// reclaim pass instead of cloning a manifest that carries every part's blooms.
+struct Coverage {
+    reclaimed_through: u64,
+    /// `(partition, min, max)`, sorted.
+    ranges: Vec<(u32, u64, u64)>,
+    durable: std::collections::HashSet<String>,
+}
+
+impl Coverage {
+    fn of(m: &Manifest) -> Self {
+        let mut ranges: Vec<(u32, u64, u64)> = m
+            .parts
+            .iter()
+            .map(|p| (p.partition, p.min_sequence, p.max_sequence))
+            .collect();
+        ranges.sort_unstable();
+        Self {
+            reclaimed_through: m.reclaimed_through,
+            ranges,
+            durable: m
+                .parts
+                .iter()
+                .filter(|p| p.is_durable())
+                .map(|p| p.part_id.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether every sort key in `[min, max]` of `partition` is already
+    /// accounted for: below the retention floor, or inside the union of the
+    /// partition's part ranges (noetl/ehdb#426).
+    ///
+    /// This is what makes an unreferenced part safe to delete and not worth
+    /// adopting. A merge output's range is the union of its sources'; a part
+    /// sealed but never registered lies in a gap, because keys ascend within a
+    /// partition. ⚠ That last step assumes the ascending-key contract: an
+    /// out-of-order append (counted by `out_of_order_appends`) can place a
+    /// genuine part inside another's range, and this would then call it
+    /// covered.
+    fn superseded(&self, partition: u32, min: u64, max: u64) -> bool {
+        if max <= self.reclaimed_through {
+            return true;
+        }
+        // The lowest key not yet shown covered; integer keys, so adjacent
+        // ranges leave no gap.
+        let mut need = min.max(self.reclaimed_through.saturating_add(1));
+        for &(_, lo, hi) in self.ranges.iter().filter(|r| r.0 == partition) {
+            if hi < need {
+                continue;
+            }
+            if lo > need {
+                return false;
+            }
+            if hi >= max {
+                return true;
+            }
+            need = hi + 1;
+        }
+        false
+    }
+
+    /// Whether an unreferenced substrate part object may be deleted: only when
+    /// its key parses and [`Self::superseded`] holds. An object this cannot
+    /// place is kept.
+    fn object_is_superseded(&self, key: &str) -> bool {
+        let mut segs = key.rsplit('/');
+        let Some(file) = segs.next() else {
+            return false;
+        };
+        let Some(partition) = segs
+            .next()
+            .and_then(|d| d.strip_prefix("shard-"))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        file.strip_suffix(".eslog")
+            .and_then(|id| parse_part_range(id, partition))
+            .is_some_and(|(min, max)| self.superseded(partition, min, max))
+    }
+
+    /// Whether an unreferenced local part file may be deleted: a local copy of
+    /// a part the manifest lists as durable, a part whose records the manifest
+    /// covers, or a merge output that never made it into the manifest (its
+    /// sources still hold every record). Anything else is kept.
+    fn local_is_reclaimable(&self, parts_root: &std::path::Path, path: &std::path::Path) -> bool {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        if self.durable.contains(stem) {
+            return true;
+        }
+        match shard_dir_partition(parts_root, path) {
+            Some(partition) => parse_part_range(stem, partition)
+                .is_some_and(|(min, max)| self.superseded(partition, min, max)),
+            // Not directly in a shard dir: a merge output (`shard-<p>/merged/`).
+            None => path
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n == "merged"),
+        }
+    }
+}
+
 fn collect_eslog_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -2619,8 +2960,17 @@ fn replicate_bytes(
 /// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
 /// replica, so any one of them can serve a cold-load alone. Best-effort per
 /// replica (a down replica is skipped; the survivors carry the manifest).
+///
+/// ⚠ Publication is serialised by `published` and only moves forward
+/// (noetl/ehdb#426). A view whose version is not above the last published one
+/// is dropped: it was taken under the manifest lock *before* the published one,
+/// so the published view already contains every change it carries. Without this
+/// the uploader and the merge path could each write `LATEST` in the opposite
+/// order to the one they allocated versions in, and a restart would load the
+/// older catalog — resurrecting merged-away sources or forgetting an upload.
 fn write_manifest_to_all(
     replicas: &[ReplicaTarget],
+    published: &Mutex<u64>,
     dataset: &str,
     durable: &Manifest,
     manifest_retain: usize,
@@ -2629,6 +2979,12 @@ fn write_manifest_to_all(
     let Ok(ser) = serde_json::to_vec(durable) else {
         return;
     };
+    // Poison-tolerant: the guarded value is a plain integer, always valid.
+    let mut high_water = published.lock().unwrap_or_else(|p| p.into_inner());
+    if durable.version <= *high_water {
+        return;
+    }
+    *high_water = durable.version;
     for target in replicas {
         let _ = target
             .substrate
@@ -2637,6 +2993,7 @@ fn write_manifest_to_all(
             .substrate
             .put_if_absent(&manifest_version_key(dataset, durable.version), &ser);
     }
+    drop(high_water);
     prune_manifest_versions(replicas, dataset, durable.version, manifest_retain, metrics);
 }
 
@@ -2751,22 +3108,195 @@ fn parse_manifest_version(key: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// Load the durable manifest from the **first replica that has it** (L0.6): a
-/// dead `replica-0` does not stop recovery — the manifest is replicated, so any
-/// survivor serves it.
+/// Load the durable manifest (L0.6): a dead `replica-0` does not stop recovery —
+/// the manifest is replicated, so any survivor serves it.
+///
+/// ⚠ Reads `LATEST` from **every** replica and keeps the highest version that
+/// decodes (noetl/ehdb#426). It used to take the first replica that had one, so
+/// a replica that missed the newest writes (down for a while, then back) won
+/// over one that had them, and a single undecodable copy failed the open even
+/// when another replica held a good one.
+///
+/// When any copy fails to decode, the versioned snapshots are consulted as well,
+/// because the damaged `LATEST` may have been the newest: losing it must not
+/// silently roll the catalog back further than the snapshots allow.
+///
+/// Returns `Ok(None)` only when **no** replica has a manifest. If some do and
+/// none decodes, that is an error — treating it as an empty store would orphan
+/// every part.
 fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Option<Manifest>> {
     let key = manifest_latest_key(dataset);
+    let mut best: Option<Manifest> = None;
+    let mut failures: Vec<String> = Vec::new();
+    let keep = |m: Manifest, best: &mut Option<Manifest>| {
+        if best.as_ref().is_none_or(|b| m.version > b.version) {
+            *best = Some(m);
+        }
+    };
     for target in replicas {
         match target.substrate.exists(&key) {
             Ok(true) => {}
             _ => continue,
         }
-        let Ok(bytes) = target.substrate.get_all(&key) else {
+        let bytes = match target.substrate.get_all(&key) {
+            Ok(b) => b,
+            Err(err) => {
+                failures.push(format!("{}: read: {err}", target.id));
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Manifest>(&bytes) {
+            Ok(m) => keep(m, &mut best),
+            Err(err) => failures.push(format!("{}: decode: {err}", target.id)),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(best);
+    }
+    // Some copy of LATEST was unreadable. Fall back to the versioned snapshots.
+    let prefix = format!("manifest/{dataset}/");
+    for target in replicas {
+        let Ok(keys) = target.substrate.list_prefix(&prefix) else {
             continue;
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|err| EhdbError::Storage(format!("decode durable manifest: {err}")))?;
-        return Ok(Some(manifest));
+        let mut versions: Vec<(u64, String)> = keys
+            .into_iter()
+            .filter_map(|k| parse_manifest_version(&k).map(|v| (v, k)))
+            .collect();
+        versions.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+        for (version, k) in versions {
+            if best.as_ref().is_some_and(|b| b.version >= version) {
+                break;
+            }
+            let Ok(bytes) = target.substrate.get_all(&k) else {
+                continue;
+            };
+            if let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) {
+                keep(m, &mut best);
+                break;
+            }
+        }
     }
-    Ok(None)
+    match best {
+        Some(m) => Ok(Some(m)),
+        None => Err(EhdbError::Storage(format!(
+            "decode durable manifest: no replica holds a readable manifest ({})",
+            failures.join("; ")
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod manifest_publication_tests {
+    //! noetl/ehdb#426 — `LATEST` publication order and multi-replica load.
+    use super::*;
+    use crate::substrate::LocalFsSubstrate;
+    use std::path::Path;
+
+    const DS: &str = "d1_event_log";
+
+    fn dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "ehdb-426-manifest-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&p);
+        p
+    }
+
+    fn replica(id: &str, root: &Path) -> ReplicaTarget {
+        ReplicaTarget::new(id, Arc::new(LocalFsSubstrate::new(root).unwrap()))
+    }
+
+    fn manifest(version: u64) -> Manifest {
+        let mut m = Manifest::empty(DS);
+        m.version = version;
+        m
+    }
+
+    fn publish(replicas: &[ReplicaTarget], published: &Mutex<u64>, version: u64) {
+        let metrics = L0Metrics::new();
+        write_manifest_to_all(replicas, published, DS, &manifest(version), 64, &metrics);
+    }
+
+    #[test]
+    fn an_older_view_never_overwrites_a_newer_latest() {
+        let root = dir("order");
+        let replicas = vec![replica("replica-0", &root)];
+        let published = Mutex::new(0);
+        // Allocated 1 then 2; the substrate writes land 2 then 1.
+        publish(&replicas, &published, 2);
+        publish(&replicas, &published, 1);
+        let loaded = load_durable_manifest(&replicas, DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 2, "LATEST went backwards");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_takes_the_highest_version_across_replicas() {
+        let (a, b) = (dir("hi-a"), dir("hi-b"));
+        let ra = replica("replica-0", &a);
+        let rb = replica("replica-1", &b);
+        // replica-0 missed the newest writes; it must not win just by being first.
+        publish(std::slice::from_ref(&ra), &Mutex::new(0), 3);
+        publish(std::slice::from_ref(&rb), &Mutex::new(0), 5);
+        let loaded = load_durable_manifest(&[ra, rb], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 5);
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
+    }
+
+    #[test]
+    fn a_corrupt_latest_falls_back_to_another_replica() {
+        let (a, b) = (dir("cor-a"), dir("cor-b"));
+        let ra = replica("replica-0", &a);
+        let rb = replica("replica-1", &b);
+        publish(&[ra.clone(), rb.clone()], &Mutex::new(0), 4);
+        ra.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"{not json")
+            .unwrap();
+        let loaded = load_durable_manifest(&[ra, rb], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 4);
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
+    }
+
+    #[test]
+    fn a_corrupt_latest_falls_back_to_the_newest_snapshot() {
+        let root = dir("snap");
+        let r = replica("replica-0", &root);
+        let published = Mutex::new(0);
+        for v in 1..=3 {
+            publish(std::slice::from_ref(&r), &published, v);
+        }
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"\0\0torn")
+            .unwrap();
+        let loaded = load_durable_manifest(&[r], DS).unwrap().unwrap();
+        assert_eq!(loaded.version, 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
+        let root = dir("none");
+        let r = replica("replica-0", &root);
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"garbage")
+            .unwrap();
+        assert!(
+            load_durable_manifest(&[r], DS).is_err(),
+            "a store whose manifest cannot be read must not open as empty"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_manifest_anywhere_is_a_fresh_store() {
+        let root = dir("fresh");
+        let r = replica("replica-0", &root);
+        assert!(load_durable_manifest(&[r], DS).unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

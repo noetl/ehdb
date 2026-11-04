@@ -324,8 +324,17 @@ impl FenceLedger {
     }
 
     /// Compare `epoch` against the high-water mark, advancing it when higher.
+    ///
+    /// ⚠ The read and the write are one critical section per marker
+    /// (noetl/ehdb#426). Unlocked, two concurrent checks at epochs 5 and 7 could
+    /// both read 3, write 7, then write 5 — the high-water mark went *down*, and
+    /// a superseded epoch read as fresh. The lock is shared by every ledger in
+    /// this process that names the same marker file, not just this instance.
     pub fn check_and_advance(&self, shard: u32, epoch: u64) -> Result<FenceDecision> {
+        let state = marker_state(&self.marker(shard));
+        let _guard = state.lock.lock().unwrap_or_else(|p| p.into_inner());
         let highest = self.highest_epoch(shard)?;
+        state.highest.fetch_max(highest, Ordering::SeqCst);
         if epoch < highest {
             return Ok(FenceDecision::Stale {
                 observed: epoch,
@@ -335,23 +344,85 @@ impl FenceLedger {
         let advanced = epoch > highest;
         if advanced {
             self.write_marker(shard, epoch)?;
+            state.highest.fetch_max(epoch, Ordering::SeqCst);
         }
         Ok(FenceDecision::Fresh { epoch, advanced })
     }
 
+    /// The highest epoch this process has seen accepted on `shard`'s marker,
+    /// without touching the disk. A cheap re-check for a decision already made
+    /// against the file — see [`EpochFence::confirm`].
+    pub fn known_highest(&self, shard: u32) -> u64 {
+        marker_state(&self.marker(shard))
+            .highest
+            .load(Ordering::SeqCst)
+    }
+
+    /// Write the marker durably: a unique temp file, `sync_all`, rename, then
+    /// `fsync` the directory (noetl/ehdb#426).
+    ///
+    /// ⚠ This used to be `fs::write` + rename with neither synced — a regression
+    /// from the reference port. After a power loss the marker could come back
+    /// at an older epoch, or empty, and the fence would forget an epoch it had
+    /// already accepted: exactly the superseded writer it exists to refuse
+    /// would then read as fresh. The temp name is unique so two ledgers on one
+    /// root cannot interleave bytes in a shared `.tmp`.
     fn write_marker(&self, shard: u32, epoch: u64) -> Result<()> {
+        use std::io::Write as _;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = self.marker(shard);
-        let tmp = path.with_extension("epoch.tmp");
-        std::fs::write(&tmp, epoch.to_string())
-            .map_err(|e| EhdbError::Storage(format!("write fence marker: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| EhdbError::Storage(format!("commit fence marker: {e}")))?;
+        let tmp = path.with_extension(format!(
+            "epoch.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = |what: &str, e: std::io::Error| {
+            EhdbError::Storage(format!("{what} fence marker {}: {e}", path.display()))
+        };
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(epoch.to_string().as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(storage("write", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(storage("commit", e));
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| storage("fsync dir of", e))?;
         Ok(())
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Per-marker-file state shared by every [`FenceLedger`] in the process.
+#[derive(Debug, Default)]
+struct MarkerState {
+    /// Serialises `check_and_advance` on this marker.
+    lock: std::sync::Mutex<()>,
+    /// Highest epoch this process has read or written on this marker.
+    highest: AtomicU64,
+}
+
+/// The state for one marker file, keyed by path so that two ledgers opened on
+/// the same root share it. Entries are never removed: there is one per shard
+/// marker, a small fixed set for the life of the process.
+fn marker_state(path: &Path) -> Arc<MarkerState> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<MarkerState>>>,
+    > = std::sync::OnceLock::new();
+    let registry = REGISTRY.get_or_init(Default::default);
+    let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(map.entry(path.to_path_buf()).or_default())
 }
 
 /// The fence itself: a mode, a token, a ledger and counters.
@@ -446,6 +517,42 @@ impl EpochFence {
             }
         }
     }
+
+    /// Re-check a decision once the caller holds the engine lock
+    /// (noetl/ehdb#426). `Err` only when enforcing.
+    ///
+    /// [`Self::check`] runs before the lock so a refused write does not queue to
+    /// be told no. But between that check and the lock, another check can
+    /// advance the marker past this writer's token, and the queued write would
+    /// then land on a store that has already accepted a newer writer. This
+    /// closes that window without a second file read: it compares the token
+    /// with the highest epoch the process has seen accepted, one atomic load.
+    ///
+    /// A `decision` that was already stale (shadow mode) is not re-counted.
+    pub fn confirm(&self, shard: u32, path: MutationPath, decision: &FenceDecision) -> Result<()> {
+        if matches!(decision, FenceDecision::Stale { .. }) {
+            return Ok(());
+        }
+        let Some(ledger) = self.ledger.as_ref() else {
+            return Ok(());
+        };
+        let epoch = self.epoch();
+        let highest = ledger.known_highest(shard);
+        if epoch >= highest {
+            return Ok(());
+        }
+        self.metrics.stale_observed.fetch_add(1, Ordering::Relaxed);
+        if self.mode.is_enforcing() {
+            self.metrics.stale_refused.fetch_add(1, Ordering::Relaxed);
+            self.metrics.refused_by_path[path.index()].fetch_add(1, Ordering::Relaxed);
+            return Err(EhdbError::InvalidState(format!(
+                "stale epoch: shard {shard} {} at epoch {epoch}, store accepted {highest} \
+                 while this write waited for the engine lock",
+                path.as_str()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +615,85 @@ mod tests {
         assert_eq!(f.metrics().epoch_advances.load(Ordering::Relaxed), 1);
         assert_eq!(f.metrics().writes_checked.load(Ordering::Relaxed), 2);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// noetl/ehdb#426: concurrent advances on one marker must leave the highest
+    /// epoch, never a lower one written by a slower racer. Each thread opens its
+    /// own ledger on the shared root, as separate components in one process do.
+    #[test]
+    fn concurrent_advances_never_lower_the_high_water_mark() {
+        for round in 0..30 {
+            let root = tmp(&format!("race-{round}"));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (1..=8u64)
+                .map(|epoch| {
+                    let root = root.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let led = FenceLedger::new(&root).unwrap();
+                        barrier.wait();
+                        led.check_and_advance(0, epoch * 10).unwrap();
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let led = FenceLedger::new(&root).unwrap();
+            assert_eq!(
+                led.highest_epoch(0).unwrap(),
+                80,
+                "round {round}: the mark regressed"
+            );
+            let leftovers: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temp markers left behind: {leftovers:?}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// noetl/ehdb#426: a write checked fresh, then overtaken by a newer epoch
+    /// before it took the engine lock, is refused by `confirm` under enforce and
+    /// counted once under shadow.
+    #[test]
+    fn confirm_refuses_a_write_overtaken_while_it_waited() {
+        for (mode, refused) in [(FenceMode::Enforce, true), (FenceMode::Shadow, false)] {
+            let root = tmp("confirm");
+            let old = EpochFence::new(
+                mode,
+                Some(FenceLedger::new(&root).unwrap()),
+                FenceMetrics::new(),
+            );
+            old.set_epoch(5);
+            let decision = old.check(0, MutationPath::AppendRecord).unwrap();
+            assert!(old
+                .confirm(0, MutationPath::AppendRecord, &decision)
+                .is_ok());
+
+            // A newer writer is accepted on the same marker meanwhile.
+            let newer = EpochFence::new(
+                mode,
+                Some(FenceLedger::new(&root).unwrap()),
+                FenceMetrics::new(),
+            );
+            newer.set_epoch(7);
+            newer.check(0, MutationPath::AppendRecord).unwrap();
+
+            let confirmed = old.confirm(0, MutationPath::AppendRecord, &decision);
+            assert_eq!(confirmed.is_err(), refused, "{mode:?}");
+            assert_eq!(old.metrics().stale_observed.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                old.metrics().stale_refused.load(Ordering::Relaxed),
+                u64::from(refused)
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// ⭐ The positive control: the fence must be SEEN to refuse.

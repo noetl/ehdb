@@ -92,6 +92,49 @@ pub(crate) fn should_fail_append() -> bool {
         .is_ok()
 }
 
+static FAIL_NEXT_WRITES_PARTWAY: AtomicUsize = AtomicUsize::new(0);
+static FAIL_NEXT_SYNCS: AtomicUsize = AtomicUsize::new(0);
+
+/// Make the next `n` frame writes in `PartWriter::append` write only the first
+/// half of the frame and then fail (noetl/ehdb#426) — the torn write a full disk
+/// or I/O error leaves behind. Unlike [`fail_next_appends`] the bytes really
+/// reach the file, which is what the rollback exists to undo.
+pub fn fail_next_writes_partway(n: usize) {
+    FAIL_NEXT_WRITES_PARTWAY.store(n, Ordering::SeqCst);
+}
+
+/// Make the next `n` frame syncs in `PartWriter::append` fail after the whole
+/// frame was written (noetl/ehdb#426). Only fires on an append that syncs
+/// (`FlushPolicy::EveryAppend`, or a `Buffered` append that reaches its count).
+pub fn fail_next_syncs(n: usize) {
+    FAIL_NEXT_SYNCS.store(n, Ordering::SeqCst);
+}
+
+/// Injected write/sync failures still armed — the positive control for tests
+/// using the two seams above.
+pub fn pending_injected_io_failures() -> usize {
+    FAIL_NEXT_WRITES_PARTWAY.load(Ordering::SeqCst) + FAIL_NEXT_SYNCS.load(Ordering::SeqCst)
+}
+
+pub(crate) fn should_fail_write_partway() -> bool {
+    take_one(&FAIL_NEXT_WRITES_PARTWAY)
+}
+
+pub(crate) fn should_fail_sync() -> bool {
+    take_one(&FAIL_NEXT_SYNCS)
+}
+
+fn take_one(counter: &AtomicUsize) -> bool {
+    if counter.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // See `should_fail_append` for why the deprecated name is kept.
+    #[allow(deprecated)]
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

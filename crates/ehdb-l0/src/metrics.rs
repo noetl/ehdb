@@ -140,6 +140,13 @@ pub struct L0Metrics {
     /// because the remedy is completely different — a version/schema mismatch
     /// between publisher and writer, not a sick volume.
     pub ingest_decode_failed: AtomicU64,
+    /// Seals (or the manifest registration that follows one) that failed
+    /// **after** the record that triggered them was already durable in the
+    /// active part (noetl/ehdb#426). The append itself is reported `Ok` — it
+    /// is on disk and will be recovered or sealed later — so this counter is
+    /// the only place the failure is visible. Non-zero means parts are not
+    /// sealing: the active part keeps growing and durability lags.
+    pub seal_failed: AtomicU64,
     /// Records recovered by replaying an unsealed active part left behind by a
     /// crash (noetl/ai-meta#209 defect 2). These were `fsync`ed and acked to a
     /// publisher but sat outside the durable manifest, which lists sealed parts
@@ -379,6 +386,9 @@ impl L0Metrics {
     pub fn incr_ingest_decode_failed(&self) {
         self.ingest_decode_failed.fetch_add(1, Ordering::Relaxed);
     }
+    pub(crate) fn incr_seal_failed(&self) {
+        self.seal_failed.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub(crate) fn add_recovered_active_records(&self, n: u64) {
         self.recovered_active_records
@@ -480,6 +490,7 @@ impl L0Metrics {
             manifest_versions_retained: self.manifest_versions_retained.load(Ordering::Relaxed),
             ingest_append_failed: self.ingest_append_failed.load(Ordering::Relaxed),
             ingest_decode_failed: self.ingest_decode_failed.load(Ordering::Relaxed),
+            seal_failed: self.seal_failed.load(Ordering::Relaxed),
             recovered_active_records: self.recovered_active_records.load(Ordering::Relaxed),
             seals: self.seals.load(Ordering::Relaxed),
             uploads: self.uploads.load(Ordering::Relaxed),
@@ -541,6 +552,7 @@ pub struct L0MetricsSnapshot {
     pub manifest_versions_retained: u64,
     pub ingest_append_failed: u64,
     pub ingest_decode_failed: u64,
+    pub seal_failed: u64,
     pub recovered_active_records: u64,
     pub seals: u64,
     pub uploads: u64,
@@ -654,6 +666,11 @@ const SERIES: &[(&str, &str, &str)] = &[
     (
         "ingest_decode_failed",
         "Ingest frames that failed to decode.",
+        "counter",
+    ),
+    (
+        "seal_failed",
+        "Seals that failed after the triggering append was durable.",
         "counter",
     ),
     (
@@ -821,6 +838,7 @@ impl L0MetricsSnapshot {
             "manifest_versions_retained" => self.manifest_versions_retained,
             "ingest_append_failed" => self.ingest_append_failed,
             "ingest_decode_failed" => self.ingest_decode_failed,
+            "seal_failed" => self.seal_failed,
             "recovered_active_records" => self.recovered_active_records,
             "seals" => self.seals,
             "uploads" => self.uploads,

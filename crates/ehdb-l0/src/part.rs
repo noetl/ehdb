@@ -19,7 +19,7 @@
 //! the hot buffer regardless of flush posture — read-your-writes for the tail.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,10 @@ pub struct PartWriter<D: Dataset> {
     partition: u32,
     /// Directory holding this partition's part files.
     part_dir: PathBuf,
+    /// Lowest local id no file in `part_dir` already uses (noetl/ehdb#426).
+    /// Seals never reuse an id below it, so a new active part can never open a
+    /// path an earlier incarnation left behind.
+    fresh_id_floor: u64,
     /// Sealed-part id counter within this partition (for the active file name;
     /// the durable part id is derived from the sort-key range on seal).
     next_local_id: u64,
@@ -135,6 +139,7 @@ impl<D: Dataset> PartWriter<D> {
             partition,
             part_dir,
             next_local_id: 0,
+            fresh_id_floor: 0,
             granule_size: granule_size.max(1),
             seal_max_bytes,
             seal_max_records,
@@ -155,6 +160,13 @@ impl<D: Dataset> PartWriter<D> {
             #[cfg(feature = "chain-cert")]
             chain_cert_enabled: false,
         };
+        // noetl/ehdb#426 — pick up the active part the previous process was
+        // writing, whatever its id. `next_local_id` used to restart at 0, so the
+        // writer reopened `part-000000.active` — gone since the first seal —
+        // and the part actually holding the last acked records was stranded.
+        let (live, floor) = choose_live_active::<D>(&w.part_dir)?;
+        w.fresh_id_floor = floor;
+        w.next_local_id = live.unwrap_or(floor);
         w.open_active()?;
         Ok(w)
     }
@@ -231,29 +243,13 @@ impl<D: Dataset> PartWriter<D> {
             // create and the first complete frame). Start clean.
             return Ok(false);
         }
-        let mut intact_len = 0u64;
-        for frame in &frames {
-            let record: D::Record = serde_json::from_slice(frame.body)
-                .map_err(|err| EhdbError::Storage(format!("decode recovered l0 record: {err}")))?;
-            let sort_key = D::sort_key(&record);
-            if self.record_count % self.granule_size as u64 == 0 {
-                self.marks.push(GranuleMark {
-                    first_sequence: sort_key,
-                    byte_offset: frame.offset,
-                    record_count: 0,
-                });
-            }
-            if self.record_count == 0 {
-                self.min_sequence = sort_key;
-            }
-            self.max_sequence = sort_key;
-            self.record_count += 1;
-            if let Some(last) = self.marks.last_mut() {
-                last.record_count += 1;
-            }
-            self.records.push(record);
-            intact_len = frame.offset + frame.frame_len;
-        }
+        let replayed = replay_frames::<D>(&frames, self.granule_size)?;
+        let intact_len = replayed.intact_len;
+        self.marks = replayed.marks;
+        self.min_sequence = replayed.min_sequence;
+        self.max_sequence = replayed.max_sequence;
+        self.record_count = replayed.records.len() as u64;
+        self.records = replayed.records;
         self.byte_len = intact_len;
         if self.record_count > 0 && self.first_append_at.is_none() {
             // Recovered from a crashed active part. The records' true append
@@ -303,56 +299,88 @@ impl<D: Dataset> PartWriter<D> {
             .map_err(|err| EhdbError::Storage(format!("encode l0 record: {err}")))?;
         let frame = encode_frame(&body)?;
 
+        let mark_offset = self.byte_len;
+
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EhdbError::InvalidState("l0 part writer has no active file".into()))?;
+
+        // ⚠ Write and (policy-dependent) sync as one fallible unit, and undo it
+        // on failure (noetl/ehdb#426). A failed `write_all` can leave a partial
+        // frame on disk, and a failed `sync` leaves a whole one, while the
+        // in-memory state below never counted it. The next append then lands
+        // after those bytes but is indexed at `byte_len`, which no longer
+        // matches the file — marks point at the wrong frame, and on restart the
+        // recovered part contains a record the caller was told had failed.
+        let mut synced = false;
+        let write_frame = |file: &mut File| -> std::io::Result<()> {
+            if crate::fault::should_fail_write_partway() {
+                file.write_all(&frame[..frame.len() / 2])?;
+                return Err(std::io::Error::other(
+                    "injected partial write (ehdb-l0 fault seam)",
+                ));
+            }
+            file.write_all(&frame)
+        };
+        let sync = |file: &mut File| -> std::io::Result<()> {
+            if crate::fault::should_fail_sync() {
+                return Err(std::io::Error::other(
+                    "injected sync failure (ehdb-l0 fault seam)",
+                ));
+            }
+            file.sync_data()
+        };
+        let written = write_frame(file).and_then(|()| match self.flush {
+            FlushPolicy::EveryAppend => {
+                synced = true;
+                sync(file)
+            }
+            FlushPolicy::Buffered { fsync_every } => {
+                if self.unflushed_since_fsync + 1 >= fsync_every.max(1) {
+                    synced = true;
+                    sync(file)
+                } else {
+                    Ok(())
+                }
+            }
+            // The caller closes the durability window (group commit) — see
+            // `sync`.
+            FlushPolicy::CallerDriven => Ok(()),
+        });
+        if let Err(err) = written {
+            return Err(self.roll_back_to(mark_offset, err));
+        }
+        if synced {
+            self.unflushed_since_fsync = 0;
+        } else {
+            // Track the debt so `sync` can skip a no-op fsync.
+            self.unflushed_since_fsync += 1;
+        }
+
         // Chain certificate (noetl/ai-meta#366). `body` IS the bytes this
-        // append writes, so the digest costs only SHA-256 block processing.
+        // append wrote, so the digest costs only SHA-256 block processing.
         // Keyed by the dataset's index dimension (`execution_id` for D1)
         // because the certificate is a per-execution quantity while a
         // PartWriter carries many executions.
         //
-        // ⚠ Placed BEFORE the write, so a record that fails to write is not in
-        // a chain that claims to cover it. The chain must describe what is
-        // durable, and the write below is the thing that can fail.
+        // ⚠ AFTER the write succeeds (noetl/ehdb#426). It used to run before
+        // the write on the reasoning that a failed record must not be in the
+        // chain — but absorbing first is exactly what puts it there. The chain
+        // must describe what is on disk.
         #[cfg(feature = "chain-cert")]
         if self.chain_cert_enabled {
             self.chain_certs.absorb(D::index_key(&record), &body);
         }
 
-        let mark_offset = self.byte_len;
-
-        // Start-of-granule mark: first record of each granule.
+        // Start-of-granule mark: first record of each granule. Pushed only
+        // once the frame is on disk, so a failed append leaves no mark behind.
         if self.record_count % self.granule_size as u64 == 0 {
             self.marks.push(GranuleMark {
                 first_sequence: sort_key,
                 byte_offset: mark_offset,
                 record_count: 0,
             });
-        }
-
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| EhdbError::InvalidState("l0 part writer has no active file".into()))?;
-        file.write_all(&frame)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
-
-        match self.flush {
-            FlushPolicy::EveryAppend => {
-                file.sync_data()
-                    .map_err(|err| EhdbError::Storage(err.to_string()))?;
-            }
-            FlushPolicy::Buffered { fsync_every } => {
-                self.unflushed_since_fsync += 1;
-                if self.unflushed_since_fsync >= fsync_every.max(1) {
-                    file.sync_data()
-                        .map_err(|err| EhdbError::Storage(err.to_string()))?;
-                    self.unflushed_since_fsync = 0;
-                }
-            }
-            // The caller closes the durability window (group commit) — see
-            // `sync`. Track the debt so `sync` can skip a no-op fsync.
-            FlushPolicy::CallerDriven => {
-                self.unflushed_since_fsync += 1;
-            }
         }
 
         if self.record_count == 0 {
@@ -370,6 +398,36 @@ impl<D: Dataset> PartWriter<D> {
         }
         self.records.push(record);
         Ok(mark_offset)
+    }
+
+    /// Undo a failed append: cut the active file back to `offset` (the end of
+    /// the last frame the in-memory state counts) and return the error to
+    /// report. Nothing in memory was advanced before the failure, so only the
+    /// file needs repairing.
+    ///
+    /// If the truncate itself fails the file and the state can no longer be
+    /// reconciled, so the writer drops its file handle: every later append
+    /// errors with "no active file" instead of writing at a wrong offset, and a
+    /// restart replays whatever intact frames are on disk.
+    fn roll_back_to(&mut self, offset: u64, cause: std::io::Error) -> EhdbError {
+        let repaired = self
+            .file
+            .as_mut()
+            .map(|f| {
+                f.set_len(offset)
+                    .and_then(|()| f.seek(SeekFrom::Start(offset)).map(|_| ()))
+            })
+            .unwrap_or(Ok(()));
+        match repaired {
+            Ok(()) => EhdbError::Storage(cause.to_string()),
+            Err(trunc) => {
+                self.file = None;
+                EhdbError::Storage(format!(
+                    "{cause}; rolling the active part back to {offset} also failed ({trunc}), \
+                     writer disabled until reopen"
+                ))
+            }
+        }
     }
 
     /// Turn chain certification on or off for this writer
@@ -545,8 +603,28 @@ impl<D: Dataset> PartWriter<D> {
         );
         let final_name = format!("{part_id}.eslog");
         let final_path = self.part_dir.join(&final_name);
-        fs::rename(&self.active_path, &final_path)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        if let Err(err) = fs::rename(&self.active_path, &final_path) {
+            // ⚠ Reopen before reporting (noetl/ehdb#426). The handle was closed
+            // above, so returning here used to leave the writer with no active
+            // file: every later append failed until a restart. Nothing has been
+            // taken out of `self` yet, so the part is intact and the next seal
+            // attempt retries it.
+            self.file = Some(
+                OpenOptions::new()
+                    .append(true)
+                    .open(&self.active_path)
+                    .map_err(|reopen| {
+                        EhdbError::Storage(format!(
+                            "seal rename failed ({err}); reopening the active part also failed \
+                             ({reopen})"
+                        ))
+                    })?,
+            );
+            return Err(EhdbError::Storage(format!("seal rename: {err}")));
+        }
+        // The rename is only durable once the directory entry is: without this
+        // a power loss can bring back `part-N.active` *and* lose the `.eslog`.
+        sync_dir(&self.part_dir)?;
 
         let marks = std::mem::take(&mut self.marks);
         let records = std::mem::take(&mut self.records);
@@ -574,7 +652,7 @@ impl<D: Dataset> PartWriter<D> {
             granule_blooms,
         };
 
-        self.next_local_id += 1;
+        self.next_local_id = (self.next_local_id + 1).max(self.fresh_id_floor);
         self.open_active()?;
 
         // The part is local-only (`replicas` empty) until the async uploader
@@ -583,6 +661,235 @@ impl<D: Dataset> PartWriter<D> {
         // without threading it through state.
         Ok(Some(SealedPart { meta, records }))
     }
+}
+
+/// Records replayed from a run of intact frames, with the sparse-index marks
+/// an orderly append would have produced.
+struct Replayed<D: Dataset> {
+    records: Vec<D::Record>,
+    marks: Vec<GranuleMark>,
+    min_sequence: u64,
+    max_sequence: u64,
+    /// End of the last intact frame.
+    intact_len: u64,
+}
+
+fn replay_frames<D: Dataset>(
+    frames: &[crate::frame::DecodedFrame<'_>],
+    granule_size: u32,
+) -> Result<Replayed<D>> {
+    let granule_size = granule_size.max(1) as u64;
+    let mut out = Replayed {
+        records: Vec::with_capacity(frames.len()),
+        marks: Vec::new(),
+        min_sequence: 0,
+        max_sequence: 0,
+        intact_len: 0,
+    };
+    for frame in frames {
+        let record: D::Record = serde_json::from_slice(frame.body)
+            .map_err(|err| EhdbError::Storage(format!("decode recovered l0 record: {err}")))?;
+        let sort_key = D::sort_key(&record);
+        if out.records.len() as u64 % granule_size == 0 {
+            out.marks.push(GranuleMark {
+                first_sequence: sort_key,
+                byte_offset: frame.offset,
+                record_count: 0,
+            });
+        }
+        if out.records.is_empty() {
+            out.min_sequence = sort_key;
+        }
+        out.max_sequence = sort_key;
+        if let Some(last) = out.marks.last_mut() {
+            last.record_count += 1;
+        }
+        out.records.push(record);
+        out.intact_len = frame.offset + frame.frame_len;
+    }
+    Ok(out)
+}
+
+/// The local id in an active-part file name (`part-000042.active` → 42).
+pub(crate) fn active_id(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let digits = name.strip_prefix("part-")?.strip_suffix(".active")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Which `*.active` in `part_dir` the reopening writer should continue, and
+/// the first id no existing file uses (noetl/ehdb#426).
+///
+/// The live part is the one whose last intact record has the **highest sort
+/// key** — the most recent incarnation's — not the one with the lowest or
+/// highest id: ids restart per incarnation, so an older crash can hold a higher
+/// id than the newest. Every other active part is left exactly where it is,
+/// for [`crate::engine::L0Engine::stranded_active`] to report: discarding or
+/// replaying an older incarnation's acked records is a disposition decision
+/// (noetl/ehdb#396), not something an open does silently.
+///
+/// A file with bit-rot or an undecodable record fails the open, naming it.
+pub(crate) fn choose_live_active<D: Dataset>(part_dir: &Path) -> Result<(Option<u64>, u64)> {
+    let mut floor = 0u64;
+    let mut best: Option<(u64, u64)> = None; // (last sort key, id)
+    let entries = match fs::read_dir(part_dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(err) => return Err(EhdbError::Storage(err.to_string())),
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|err| EhdbError::Storage(err.to_string()))?
+            .path();
+        let Some(id) = active_id(&path) else {
+            continue;
+        };
+        floor = floor.max(id + 1);
+        let bytes = fs::read(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // ⚠ Bit-rot fails the open, as it always has for the active part: it is
+        // never silently repaired, and which file is live cannot be decided
+        // without reading every one. A torn tail is not bit-rot — it yields the
+        // intact prefix.
+        let frames = iter_frames_from(&bytes, 0)
+            .map_err(|err| EhdbError::Storage(format!("active part {}: {err}", path.display())))?;
+        let Some(last) = frames.last() else {
+            continue;
+        };
+        let record = serde_json::from_slice::<D::Record>(last.body).map_err(|err| {
+            EhdbError::Storage(format!(
+                "decode recovered l0 record in {}: {err}",
+                path.display()
+            ))
+        })?;
+        let key = (D::sort_key(&record), id);
+        if best.is_none_or(|b| key > b) {
+            best = Some(key);
+        }
+    }
+    Ok((best.map(|(_, id)| id), floor))
+}
+
+/// Rebuild a sealed `.eslog` part's catalog row from its bytes, for a part that
+/// reached disk but not the durable manifest (noetl/ehdb#426). Returns `None`
+/// unless the file is a clean sealed part of `partition`: every byte decodes
+/// as an intact frame, and the name matches the records' range. A sealed part
+/// with a torn tail is corruption, not a crash artefact, and is left alone.
+pub(crate) fn read_sealed_part<D: Dataset>(
+    path: &Path,
+    partition: u32,
+    granule_size: u32,
+) -> Result<Option<SealedPart<D>>> {
+    let bytes = fs::read(path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+    let Ok(frames) = iter_frames_from(&bytes, 0) else {
+        return Ok(None);
+    };
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    let Ok(replayed) = replay_frames::<D>(&frames, granule_size) else {
+        return Ok(None);
+    };
+    if replayed.intact_len != bytes.len() as u64 {
+        return Ok(None);
+    }
+    let part_id = format!(
+        "shard-{partition}-seq-{:020}-{:020}",
+        replayed.min_sequence, replayed.max_sequence
+    );
+    if path.file_stem().and_then(|s| s.to_str()) != Some(part_id.as_str()) {
+        return Ok(None);
+    }
+    let granule_size = granule_size.max(1);
+    let (execution_bloom, granule_blooms) =
+        build_index_blooms::<D>(&replayed.records, &replayed.marks, granule_size);
+    Ok(Some(SealedPart {
+        meta: PartMeta {
+            part_id,
+            partition,
+            min_sequence: replayed.min_sequence,
+            max_sequence: replayed.max_sequence,
+            record_count: replayed.records.len() as u64,
+            byte_size: bytes.len() as u64,
+            replicas: Vec::new(),
+            local_path: Some(path.to_string_lossy().to_string()),
+            sparse_index: SparseIndex {
+                granule_size,
+                marks: replayed.marks,
+            },
+            execution_bloom: Some(execution_bloom),
+            granule_blooms,
+        },
+        records: replayed.records,
+    }))
+}
+
+/// The first and last sort keys of an active part's intact records, and the
+/// byte length of those frames (a torn tail excluded). `None` if it holds no
+/// intact record. Bit-rot is an error, as everywhere else on the open path.
+pub(crate) fn active_range<D: Dataset>(path: &Path) -> Result<Option<(u64, u64, u64)>> {
+    let bytes = fs::read(path).map_err(|err| EhdbError::Storage(err.to_string()))?;
+    let frames = iter_frames_from(&bytes, 0)
+        .map_err(|err| EhdbError::Storage(format!("active part {}: {err}", path.display())))?;
+    let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
+        return Ok(None);
+    };
+    let decode = |body: &[u8]| {
+        serde_json::from_slice::<D::Record>(body)
+            .map(|r| D::sort_key(&r))
+            .map_err(|err| EhdbError::Storage(format!("decode {}: {err}", path.display())))
+    };
+    Ok(Some((
+        decode(first.body)?,
+        decode(last.body)?,
+        last.offset + last.frame_len,
+    )))
+}
+
+/// Seal an older incarnation's active part in place (noetl/ehdb#426): cut it to
+/// `intact_len`, rename it to its `.eslog` name, and fsync the directory.
+/// Returns the sealed path.
+///
+/// ⚠ Does not decide whether sealing is safe — the caller checks the range
+/// first, because a part overlapping another breaks the ordered reads that
+/// assume parts do not overlap.
+pub(crate) fn seal_stranded_active(
+    path: &Path,
+    partition: u32,
+    min: u64,
+    max: u64,
+    intact_len: u64,
+) -> Result<PathBuf> {
+    let storage = |err: std::io::Error| EhdbError::Storage(err.to_string());
+    let file = OpenOptions::new().write(true).open(path).map_err(storage)?;
+    if file.metadata().map_err(storage)?.len() > intact_len {
+        file.set_len(intact_len).map_err(storage)?;
+    }
+    file.sync_all().map_err(storage)?;
+    drop(file);
+    let dir = path
+        .parent()
+        .ok_or_else(|| EhdbError::InvalidState(format!("{} has no parent", path.display())))?;
+    let sealed = dir.join(format!("shard-{partition}-seq-{min:020}-{max:020}.eslog"));
+    if sealed.exists() {
+        return Err(EhdbError::AlreadyExists(sealed.display().to_string()));
+    }
+    fs::rename(path, &sealed).map_err(storage)?;
+    sync_dir(dir)?;
+    Ok(sealed)
+}
+
+/// `fsync` a directory so a rename into it survives a power loss. A no-op where
+/// directories cannot be opened for sync (non-unix).
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|err| EhdbError::Storage(format!("fsync dir {}: {err}", dir.display())))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// The deterministic object-store key for a part: recomputed anywhere from
