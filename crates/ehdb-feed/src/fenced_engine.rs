@@ -130,12 +130,15 @@ impl<D: Dataset> FencedEngine<D> {
     /// ⚠ The check happens **before** the lock is taken, so a refused write does
     /// not queue behind the append lock to be told no. The ledger read is a
     /// small file read; under contention it is cheaper than the lock it avoids.
+    ///
+    /// ⚠ And re-confirmed **after** it is taken (noetl/ehdb#426): a newer epoch
+    /// can be accepted while this write waits for the lock. The re-check is an
+    /// atomic load, not a second ledger read.
     pub fn write(&self, path: MutationPath) -> Result<EngineWrite<'_, D>> {
         let decision = self.fence.check(self.shard, path)?;
-        Ok(EngineWrite {
-            guard: self.lock_inner(),
-            decision,
-        })
+        let guard = self.lock_inner();
+        self.fence.confirm(self.shard, path, &decision)?;
+        Ok(EngineWrite { guard, decision })
     }
 
     /// Read the engine **without blocking**, or `None` if the lock is held.
@@ -164,14 +167,14 @@ impl<D: Dataset> FencedEngine<D> {
     /// must not.
     pub fn try_write(&self, path: MutationPath) -> Result<Option<EngineWrite<'_, D>>> {
         let decision = self.fence.check(self.shard, path)?;
-        Ok(match self.inner.try_lock() {
-            Ok(guard) => Some(EngineWrite { guard, decision }),
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(EngineWrite {
-                guard: p.into_inner(),
-                decision,
-            }),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        })
+        let guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        // Same re-check as `write`, under the lock (noetl/ehdb#426).
+        self.fence.confirm(self.shard, path, &decision)?;
+        Ok(Some(EngineWrite { guard, decision }))
     }
 
     /// Run `f` against the engine **without ever parking a Tokio worker on the
