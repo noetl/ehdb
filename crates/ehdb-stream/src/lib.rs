@@ -598,6 +598,8 @@ enum StreamJournalEntry {
 pub struct LocalJsonlStreamLog {
     path: PathBuf,
     inner: InMemoryStreamLog,
+    /// Applied before the first append; see `ehdb_core::journal::TailRepair`.
+    repair: ehdb_core::journal::TailRepair,
 }
 
 impl LocalJsonlStreamLog {
@@ -618,7 +620,11 @@ impl LocalJsonlStreamLog {
             apply_journal_entry(&mut inner, entry)?;
         }
 
-        Ok(Self { path, inner })
+        Ok(Self {
+            path,
+            inner,
+            repair: read.repair,
+        })
     }
 
     pub fn create_stream(&mut self, config: StreamConfig) -> Result<()> {
@@ -755,7 +761,10 @@ impl LocalJsonlStreamLog {
         &self.path
     }
 
-    fn append_entry_to_disk(&self, entry: &StreamJournalEntry) -> Result<()> {
+    fn append_entry_to_disk(&mut self, entry: &StreamJournalEntry) -> Result<()> {
+        // Repair a torn tail left by a crash BEFORE appending, never at
+        // open: open is also a read path (noetl/ehdb#426).
+        self.repair.apply(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }

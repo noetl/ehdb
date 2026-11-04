@@ -289,6 +289,8 @@ enum SystemLibraryJournalEntry {
 pub struct LocalJsonlSystemLibraryCatalog {
     path: PathBuf,
     inner: InMemorySystemLibraryCatalog,
+    /// Applied before the first append; see `ehdb_core::journal::TailRepair`.
+    repair: ehdb_core::journal::TailRepair,
 }
 
 impl LocalJsonlSystemLibraryCatalog {
@@ -309,7 +311,11 @@ impl LocalJsonlSystemLibraryCatalog {
             apply_journal_entry(&mut inner, entry)?;
         }
 
-        Ok(Self { path, inner })
+        Ok(Self {
+            path,
+            inner,
+            repair: read.repair,
+        })
     }
 
     pub fn publish(&mut self, request: PublishSystemLibrary) -> Result<WasmSystemLibrary> {
@@ -344,7 +350,10 @@ impl LocalJsonlSystemLibraryCatalog {
         &self.path
     }
 
-    fn append_entry_to_disk(&self, entry: &SystemLibraryJournalEntry) -> Result<()> {
+    fn append_entry_to_disk(&mut self, entry: &SystemLibraryJournalEntry) -> Result<()> {
+        // Repair a torn tail left by a crash BEFORE appending, never at
+        // open: open is also a read path (noetl/ehdb#426).
+        self.repair.apply(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }

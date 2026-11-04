@@ -443,6 +443,8 @@ pub struct LocalJsonlTransactionLog {
     /// worse than failing — it turns a loud corruption signal into a quiet
     /// wrong answer. Callers must propagate this.
     torn_tail_skipped: usize,
+    /// Applied before the first append; see `ehdb_core::journal::TailRepair`.
+    repair: ehdb_core::journal::TailRepair,
 }
 
 impl LocalJsonlTransactionLog {
@@ -468,6 +470,7 @@ impl LocalJsonlTransactionLog {
         // Counted on the struct rather than logged: this crate has no tracing
         // dependency; the caller has a logger and a reply to put it in.
         let torn_tail_skipped = read.torn_tail_skipped;
+        let repair = read.repair;
         for (_, record) in read.entries {
             inner.insert_record(record)?;
         }
@@ -476,6 +479,7 @@ impl LocalJsonlTransactionLog {
             path,
             inner,
             torn_tail_skipped,
+            repair,
         })
     }
 
@@ -575,7 +579,10 @@ impl LocalJsonlTransactionLog {
     /// One open, N writes, ONE `sync_data`. The single-record path is this with
     /// a batch of one, kept separate only so the hot single-append path does not
     /// allocate a slice.
-    fn append_records_to_disk(&self, records: &[TransactionRecord]) -> Result<()> {
+    fn append_records_to_disk(&mut self, records: &[TransactionRecord]) -> Result<()> {
+        // Repair a torn tail left by a crash BEFORE appending, never at
+        // open: open is also a read path (noetl/ehdb#426).
+        self.repair.apply(&self.path)?;
         if records.is_empty() {
             return Ok(());
         }
@@ -604,7 +611,10 @@ impl LocalJsonlTransactionLog {
         Ok(())
     }
 
-    fn append_record_to_disk(&self, record: &TransactionRecord) -> Result<()> {
+    fn append_record_to_disk(&mut self, record: &TransactionRecord) -> Result<()> {
+        // Repair a torn tail left by a crash BEFORE appending, never at
+        // open: open is also a read path (noetl/ehdb#426).
+        self.repair.apply(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
@@ -707,6 +717,35 @@ mod torn_record_tests {
             1,
             "the skip must be COUNTED — a scan that silently returns n-1 records \
              reads exactly like a complete one"
+        );
+    }
+
+    /// noetl/ehdb#426: opening is a read. A sealed segment is opened by read
+    /// paths that never append, and each of them must still see — and report —
+    /// its torn tail. The first fix repaired the file during open, so only the
+    /// first reader ever saw the tear.
+    #[test]
+    fn opening_without_appending_leaves_the_tear_visible_and_the_file_untouched() {
+        let p = tmp("ro-open");
+        append_n(&p, 2);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"{\"transaction_id\":\"tx-torn\",\"ten")
+            .unwrap();
+        drop(f);
+        let before = fs::read(&p).unwrap();
+        for _ in 0..3 {
+            let log = LocalJsonlTransactionLog::open(p.clone()).unwrap();
+            assert_eq!(
+                log.torn_tail_skipped(),
+                1,
+                "a reader lost the torn-tail signal"
+            );
+            assert_eq!(log.len(), 2);
+        }
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            before,
+            "opening the log changed the file"
         );
     }
 
