@@ -276,3 +276,130 @@ fn an_older_active_part_that_overlaps_is_left_alone() {
         .collect();
     assert_eq!(stranded, vec![dir.join("part-000005.active")]);
 }
+
+/// `(min, max)` of every sealed part on local disk, from the `.eslog` names.
+fn sealed_ranges(root: &Path) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = std::fs::read_dir(shard_dir(root))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let stem = name.strip_suffix(".eslog")?;
+            let mut it = stem.rsplit('-');
+            let max: u64 = it.next()?.parse().ok()?;
+            let min: u64 = it.next()?.parse().ok()?;
+            Some((min, max))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn assert_disjoint(ranges: &[(u64, u64)]) {
+    for w in ranges.windows(2) {
+        assert!(
+            w[0].1 < w[1].0,
+            "sealed parts overlap: {:?} and {:?} (all: {ranges:?})",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+/// The prod layout of 2026-11-04 (ai-meta#516 pre-flight): the live writer had
+/// just sealed, so its active part was EMPTY, while an older incarnation's
+/// active part — holding records below every sealed part — sat beside it.
+///
+/// An empty file carries no key, so "the active part with the newest records"
+/// chose the stale one; the writer then appended today's records to a part that
+/// began a day earlier, and its seal produced a part overlapping every part
+/// sealed in between. A stranded part below the sealed range can never be the
+/// live one.
+#[test]
+fn a_stale_active_part_below_the_sealed_range_is_never_resumed() {
+    let root = unique_dir("stale-below");
+    let store: Arc<dyn DurableSubstrate> = gated(&root.join("obj"), true);
+    {
+        let mut e = open(&root, Arc::clone(&store), 2);
+        for s in 10..=13 {
+            e.append_record(ev(s)).unwrap();
+        }
+        e.flush_and_wait_uploads().unwrap();
+    }
+    assert_eq!(sealed_ranges(&root), [(10, 11), (12, 13)]);
+    // The older incarnation's part: higher id, records below the sealed range.
+    let src = unique_dir("stale-below-src");
+    {
+        let mut e = open(&src, gated(&src.join("obj"), true), 1_000);
+        for k in [5, 6] {
+            e.append_record(ev(k)).unwrap();
+        }
+    }
+    std::fs::copy(
+        shard_dir(&src).join("part-000000.active"),
+        shard_dir(&root).join("part-000007.active"),
+    )
+    .unwrap();
+
+    let mut e = open(&root, Arc::clone(&store), 2);
+    for s in 14..=16 {
+        e.append_record(ev(s)).unwrap();
+    }
+    e.flush_and_wait_uploads().unwrap();
+    assert_disjoint(&sealed_ranges(&root));
+    assert_eq!(
+        seqs(&e),
+        [5, 6, 10, 11, 12, 13, 14, 15, 16],
+        "acked records lost, or the stale part's records not recovered"
+    );
+    drop(e);
+    let e = open(&root, store, 2);
+    assert_eq!(seqs(&e), [5, 6, 10, 11, 12, 13, 14, 15, 16]);
+    assert_disjoint(&sealed_ranges(&root));
+}
+
+/// Same layout, but the stale part overlaps a sealed part: it cannot be sealed
+/// in place, so it must be left exactly as it is and reported — never resumed.
+#[test]
+fn a_stale_active_part_overlapping_a_sealed_part_is_left_and_reported() {
+    let root = unique_dir("stale-overlap");
+    let store: Arc<dyn DurableSubstrate> = gated(&root.join("obj"), true);
+    {
+        let mut e = open(&root, Arc::clone(&store), 2);
+        for s in 10..=13 {
+            e.append_record(ev(s)).unwrap();
+        }
+        e.flush_and_wait_uploads().unwrap();
+    }
+    let src = unique_dir("stale-overlap-src");
+    {
+        let mut e = open(&src, gated(&src.join("obj"), true), 1_000);
+        e.append_record(ev(11)).unwrap();
+    }
+    let stale_path = shard_dir(&root).join("part-000007.active");
+    std::fs::copy(shard_dir(&src).join("part-000000.active"), &stale_path).unwrap();
+    let stale = std::fs::read(&stale_path).unwrap();
+
+    let mut e = open(&root, Arc::clone(&store), 2);
+    for s in 14..=16 {
+        e.append_record(ev(s)).unwrap();
+    }
+    e.flush_and_wait_uploads().unwrap();
+    assert_disjoint(&sealed_ranges(&root));
+    assert_eq!(
+        std::fs::read(&stale_path).unwrap(),
+        stale,
+        "the stale part was modified"
+    );
+    // Reported; anything else reported is an empty leftover from an earlier
+    // seal (pre-existing, and harmless: it holds no record).
+    let stranded = e.stranded_active().unwrap();
+    assert!(stranded.iter().any(|(p, _)| *p == stale_path));
+    assert!(
+        stranded
+            .iter()
+            .all(|(p, len)| *p == stale_path || *len == 0),
+        "{stranded:?}"
+    );
+    assert_eq!(seqs(&e), [10, 11, 12, 13, 14, 15, 16]);
+}

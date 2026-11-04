@@ -131,6 +131,32 @@ impl<D: Dataset> PartWriter<D> {
         seal_max_records: u64,
         flush: FlushPolicy,
     ) -> Result<Self> {
+        Self::open_above(
+            dataset,
+            partition,
+            part_dir,
+            granule_size,
+            seal_max_bytes,
+            seal_max_records,
+            flush,
+            0,
+        )
+    }
+
+    /// [`Self::open`], where `sealed_max` is the highest key any sealed part of
+    /// this partition holds — the engine passes its manifest's. An active part
+    /// that starts at or below it is never resumed (see [`choose_live_active`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_above(
+        dataset: impl Into<String>,
+        partition: u32,
+        part_dir: impl Into<PathBuf>,
+        granule_size: u32,
+        seal_max_bytes: u64,
+        seal_max_records: u64,
+        flush: FlushPolicy,
+        sealed_max: u64,
+    ) -> Result<Self> {
         let dataset = dataset.into();
         let part_dir = part_dir.into();
         fs::create_dir_all(&part_dir).map_err(|err| EhdbError::Storage(err.to_string()))?;
@@ -164,7 +190,7 @@ impl<D: Dataset> PartWriter<D> {
         // writing, whatever its id. `next_local_id` used to restart at 0, so the
         // writer reopened `part-000000.active` — gone since the first seal —
         // and the part actually holding the last acked records was stranded.
-        let (live, floor) = choose_live_active::<D>(&w.part_dir)?;
+        let (live, floor) = choose_live_active::<D>(&w.part_dir, sealed_max)?;
         w.fresh_id_floor = floor;
         w.next_local_id = live.unwrap_or(floor);
         w.open_active()?;
@@ -730,8 +756,22 @@ pub(crate) fn active_id(path: &Path) -> Option<u64> {
 /// replaying an older incarnation's acked records is a disposition decision
 /// (noetl/ehdb#396), not something an open does silently.
 ///
+/// ⚠ A part whose first key is at or below `sealed_max` — or below any sealed
+/// `.eslog` in `part_dir` — is never the live one, whatever its keys. The live
+/// writer seals in key order, so its active part always starts above every part
+/// it sealed. A stale part can win "newest last key" when the live part is
+/// EMPTY (it just sealed): an empty file carries no key. Resuming the stale
+/// part appended new records to a part that began a day earlier, and its seal
+/// overlapped every part sealed in between (the prod layout found by the
+/// noetl/ai-meta#516 pre-flight). With no candidate the writer opens a fresh
+/// id, and the stale part is left to [`seal_stranded_active`]'s overlap check.
+///
 /// A file with bit-rot or an undecodable record fails the open, naming it.
-pub(crate) fn choose_live_active<D: Dataset>(part_dir: &Path) -> Result<(Option<u64>, u64)> {
+pub(crate) fn choose_live_active<D: Dataset>(
+    part_dir: &Path,
+    sealed_max: u64,
+) -> Result<(Option<u64>, u64)> {
+    let sealed_max = sealed_max.max(sealed_max_in_dir(part_dir));
     let mut floor = 0u64;
     let mut best: Option<(u64, u64)> = None; // (last sort key, id)
     let entries = match fs::read_dir(part_dir) {
@@ -754,21 +794,46 @@ pub(crate) fn choose_live_active<D: Dataset>(part_dir: &Path) -> Result<(Option<
         // intact prefix.
         let frames = iter_frames_from(&bytes, 0)
             .map_err(|err| EhdbError::Storage(format!("active part {}: {err}", path.display())))?;
-        let Some(last) = frames.last() else {
+        let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
             continue;
         };
-        let record = serde_json::from_slice::<D::Record>(last.body).map_err(|err| {
-            EhdbError::Storage(format!(
-                "decode recovered l0 record in {}: {err}",
-                path.display()
-            ))
-        })?;
-        let key = (D::sort_key(&record), id);
+        let decode = |body: &[u8]| {
+            serde_json::from_slice::<D::Record>(body)
+                .map(|r| D::sort_key(&r))
+                .map_err(|err| {
+                    EhdbError::Storage(format!(
+                        "decode recovered l0 record in {}: {err}",
+                        path.display()
+                    ))
+                })
+        };
+        let (first_key, last_key) = (decode(first.body)?, decode(last.body)?);
+        if first_key <= sealed_max {
+            continue;
+        }
+        let key = (last_key, id);
         if best.is_none_or(|b| key > b) {
             best = Some(key);
         }
     }
     Ok((best.map(|(_, id)| id), floor))
+}
+
+/// The highest key any sealed part in `part_dir` holds, read from the
+/// `shard-<p>-seq-<min>-<max>.eslog` names; 0 when there is none.
+pub(crate) fn sealed_max_in_dir(part_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(part_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let stem = name.to_str()?.strip_suffix(".eslog")?.to_string();
+            stem.rsplit('-').next()?.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Rebuild a sealed `.eslog` part's catalog row from its bytes, for a part that
