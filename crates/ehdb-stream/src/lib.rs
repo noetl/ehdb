@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -605,17 +605,17 @@ impl LocalJsonlStreamLog {
         let path = path.into();
         let mut inner = InMemoryStreamLog::default();
 
-        if path.exists() {
-            let file = File::open(&path).map_err(|err| EhdbError::Storage(err.to_string()))?;
-            for (index, line) in BufReader::new(file).lines().enumerate() {
-                let line = line.map_err(|err| EhdbError::Storage(err.to_string()))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let entry: StreamJournalEntry = serde_json::from_str(&line)
-                    .map_err(|err| map_stream_journal_decode_error(index + 1, err))?;
-                apply_journal_entry(&mut inner, entry)?;
-            }
+        // A torn final line (a crash mid-append) is skipped and cut off, and a
+        // final record missing its newline is terminated, so one crash cannot
+        // make the journal unopenable — the #262 rule the transaction log
+        // already had, applied here too (noetl/ehdb#426). See
+        // `ehdb_core::journal::read_jsonl` for what is and is not tolerated.
+        let read = ehdb_core::journal::read_jsonl::<StreamJournalEntry>(
+            &path,
+            map_stream_journal_decode_error,
+        )?;
+        for (_, entry) in read.entries {
+            apply_journal_entry(&mut inner, entry)?;
         }
 
         Ok(Self { path, inner })
@@ -1419,6 +1419,49 @@ mod tests {
             .unwrap();
         assert_eq!(third.sequence.value(), 3);
 
+        fs::remove_file(path).unwrap();
+    }
+
+    /// noetl/ehdb#426: a crash mid-append used to fail every later open of the
+    /// stream journal. The torn tail is skipped and cut, and appends continue.
+    #[test]
+    fn local_jsonl_log_survives_a_torn_tail_and_keeps_appending() {
+        use std::io::Write as _;
+        let path = temp_log_path("torn-tail");
+        let (tenant, namespace, stream) = ids();
+        let mut log = LocalJsonlStreamLog::open(&path).unwrap();
+        log.create_stream(StreamConfig {
+            tenant: tenant.clone(),
+            namespace: namespace.clone(),
+            name: stream.clone(),
+            retention: RetentionPolicy::KeepAll,
+        })
+        .unwrap();
+        let publish = |log: &mut LocalJsonlStreamLog, txn: &str| {
+            log.publish(
+                &tenant,
+                &namespace,
+                &stream,
+                Subject::new("noetl.event").unwrap(),
+                b"e".to_vec(),
+                TransactionId::new(txn).unwrap(),
+            )
+            .unwrap()
+        };
+        publish(&mut log, "txn-0001");
+        drop(log);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"Publish\":{\"tenant\":")
+            .unwrap();
+
+        let mut log = LocalJsonlStreamLog::open(&path).expect("a torn tail must not fail the open");
+        let second = publish(&mut log, "txn-0002");
+        assert_eq!(second.sequence.value(), 2);
+        drop(log);
+        LocalJsonlStreamLog::open(&path).expect("one crash + one append must reopen");
         fs::remove_file(path).unwrap();
     }
 
