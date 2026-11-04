@@ -876,11 +876,21 @@ impl<D: Dataset> L0Engine<D> {
             // on the commit path, and the mode cannot change under a running
             // process anyway.
             hlc_mode: hlc_mode_resolved,
-            // ⚠ Seeded from the tip the engine just recovered, not from
-            // `default()`. `HlcClock::seeded_from` exists precisely because a
+            // ⚠ NOT seeded from the recovered tip — the seed below is zero, and
+            // an earlier version of this comment said otherwise (noetl/ehdb#426,
+            // design-review P1 #20). `HlcClock::seeded_from` exists because a
             // fresh process must not re-issue timestamps a previous one used,
             // and the wall clock alone does not guarantee that across a restart
             // during which it stepped back.
+            //
+            // Seeding properly means reading the highest `commit_hlc` the log
+            // already carries, and nothing may read that field before M3's
+            // closed timestamps exist (`tests/commit_hlc_stamp.rs`,
+            // `nothing_reads_the_commit_hlc_yet`). Until then the zero seed is
+            // harmless only because stamping is write-only and off by default:
+            // a timestamp re-issued after a backwards clock step is wrong but
+            // unread. Seeding from the recovered maximum is M3 work, and must
+            // land before anything reads `commit_hlc`.
             hlc: ehdb_core::hlc::HlcClock::seeded_from(
                 ehdb_core::hlc::Hlc::from_parts(0, 0),
                 Box::new(|| {
