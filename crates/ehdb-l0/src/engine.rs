@@ -660,7 +660,13 @@ impl<D: Dataset> L0Engine<D> {
         let mut sealed = 0usize;
         for partition in 0..self.config.shard_count.max(1) {
             let dir = parts_root.join(format!("shard-{partition}"));
-            let (live, _) = choose_live_active::<D>(&dir)?;
+            let sealed_max = taken
+                .iter()
+                .filter(|&&(p, _, _)| p == partition)
+                .map(|&(_, _, hi)| hi)
+                .max()
+                .unwrap_or(0);
+            let (live, _) = choose_live_active::<D>(&dir, sealed_max)?;
             let mut actives: Vec<(u64, PathBuf)> = match fs::read_dir(&dir) {
                 Ok(entries) => entries
                     .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1241,7 +1247,19 @@ impl<D: Dataset> L0Engine<D> {
 
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {
         if !self.writers.contains_key(&shard) {
-            let writer = PartWriter::<D>::open(
+            // The manifest's highest key for this shard: an active part starting
+            // at or below it is stale, never the live one (noetl/ai-meta#516).
+            let sealed_max = self
+                .manifest
+                .lock()
+                .unwrap()
+                .parts
+                .iter()
+                .filter(|p| p.partition == shard)
+                .map(|p| p.max_sequence)
+                .max()
+                .unwrap_or(0);
+            let writer = PartWriter::<D>::open_above(
                 self.config.dataset.clone(),
                 shard,
                 self.config.part_dir(shard),
@@ -1249,6 +1267,7 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_bytes,
                 self.config.seal_max_records,
                 self.config.flush,
+                sealed_max,
             )?;
             let mut writer = writer;
             writer.set_seal_max_age(self.config.seal_max_age);
