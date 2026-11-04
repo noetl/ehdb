@@ -261,6 +261,75 @@ pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result
     Ok(buf)
 }
 
+/// A **cancel-safe** frame reader for a client connection (noetl/ehdb#426).
+///
+/// [`read_frame`] is two `read_exact` calls, which are not cancel-safe: dropped
+/// part-way, the bytes already read are gone. Every client receive loop wraps
+/// its read in `tokio::time::timeout`, and on the never-heartbeated path a
+/// timeout `continue`s on the same socket — which then reads the remainder of
+/// the abandoned frame as the next length prefix. The connection is desynced
+/// with nothing to say so: a garbage length either trips the frame cap or
+/// allocates for, and waits on, bytes that are not coming.
+///
+/// This keeps partial bytes in `pending` across calls. Its only await is a
+/// single `read` into a local buffer, which tokio documents as cancel-safe (if
+/// the future is dropped, no data was read); the bytes are moved into `pending`
+/// with no await in between. Every read on a socket that ever goes through this
+/// must go through it, or `pending` is skipped.
+#[derive(Debug, Default)]
+pub(crate) struct FrameReader {
+    pending: Vec<u8>,
+}
+
+impl FrameReader {
+    pub(crate) async fn read<R: AsyncReadExt + Unpin>(&mut self, r: &mut R) -> io::Result<Vec<u8>> {
+        self.read_capped(r, max_frame_bytes()).await
+    }
+
+    pub(crate) async fn read_capped<R: AsyncReadExt + Unpin>(
+        &mut self,
+        r: &mut R,
+        cap: usize,
+    ) -> io::Result<Vec<u8>> {
+        loop {
+            if self.pending.len() >= 4 {
+                let n = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
+                if n > cap {
+                    return Err(io_err(format!(
+                        "feed frame of {n} bytes exceeds the {cap}-byte cap; refusing to allocate \
+                         (noetl/ai-meta#298)"
+                    )));
+                }
+                if self.pending.len() >= 4 + n {
+                    let body = self.pending[4..4 + n].to_vec();
+                    self.pending.drain(..4 + n);
+                    return Ok(body);
+                }
+            }
+            let mut chunk = [0u8; 64 * 1024];
+            let got = r.read(&mut chunk).await?;
+            if got == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "feed peer closed the connection",
+                ));
+            }
+            self.pending.extend_from_slice(&chunk[..got]);
+        }
+    }
+}
+
+/// Largest `SubscribeReq` the subscribe face accepts before the handshake
+/// completes (noetl/ehdb#426). The general frame cap is 64 MiB and applied to
+/// an unauthenticated first frame, so any peer could make the writer allocate
+/// that much by naming the size. A real request is a few hundred bytes.
+pub const MAX_HANDSHAKE_FRAME_BYTES: usize = 64 * 1024;
+
+/// How long a new subscriber connection has to send its `SubscribeReq`
+/// (noetl/ehdb#426). Without a bound, a peer that connects and says nothing
+/// holds a task and a socket forever.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The per-shard writer's networked face: owns the L0 engine (the durable log)
 /// and signals followers on every append. Wrap in an [`Arc`] and share one clone
 /// with [`serve`] and one with the appending control plane.
@@ -607,10 +676,23 @@ where
                 tracing::warn!(error = %e, "feed: rejecting connection (socket setup)");
                 return;
             }
-            let req_bytes = match read_frame(&mut sock).await {
-                Ok(b) => b,
-                Err(e) => {
+            let mut frames = FrameReader::default();
+            let req_bytes = match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                frames.read_capped(&mut sock, MAX_HANDSHAKE_FRAME_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     tracing::warn!(error = %e, "feed: rejecting connection (bad handshake frame)");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = HANDSHAKE_TIMEOUT.as_millis() as u64,
+                        "feed: rejecting connection (no handshake)"
+                    );
                     return;
                 }
             };
@@ -699,6 +781,8 @@ where
 /// A subscriber connection to a [`FeedWriter`]'s shard feed.
 pub struct FeedSubscription {
     sock: TcpStream,
+    /// Every read on `sock` goes through here (cancel-safe; noetl/ehdb#426).
+    frames: crate::FrameReader,
     /// How long a parked read may go quiet before the peer is declared dead.
     /// Cleared once a peer proves it does not heartbeat, so an older writer
     /// never triggers a redial loop on a genuinely idle feed.
@@ -745,6 +829,7 @@ impl FeedSubscription {
         write_frame(&mut sock, &req).await?;
         Ok(Self {
             sock,
+            frames: crate::FrameReader::default(),
             read_deadline: heartbeat.map(|hb| hb * HEARTBEAT_MISS_FACTOR),
             peer_heartbeats: false,
             deadline_demoted: false,
@@ -763,9 +848,9 @@ impl FeedSubscription {
     pub async fn recv_batch<R: DeserializeOwned>(&mut self) -> io::Result<Vec<R>> {
         loop {
             let body = match self.read_deadline {
-                None => read_frame(&mut self.sock).await?,
+                None => self.frames.read(&mut self.sock).await?,
                 Some(deadline) => {
-                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                    match tokio::time::timeout(deadline, self.frames.read(&mut self.sock)).await {
                         Ok(body) => body?,
                         Err(_) if self.peer_heartbeats => {
                             return Err(io_err(format!(
@@ -816,5 +901,50 @@ impl FeedSubscription {
     /// from heartbeat-backed liveness.
     pub fn peer_heartbeats(&self) -> bool {
         self.peer_heartbeats
+    }
+}
+
+#[cfg(test)]
+mod frame_reader_tests {
+    use super::*;
+
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut f = (body.len() as u32).to_be_bytes().to_vec();
+        f.extend_from_slice(body);
+        f
+    }
+
+    /// noetl/ehdb#426: a read cancelled part-way through a frame — what every
+    /// client's `timeout(deadline, ...)` does — must not lose the bytes it had
+    /// already taken. The next read returns that same frame, whole, and the one
+    /// after it is still aligned.
+    #[tokio::test]
+    async fn a_read_cancelled_mid_frame_loses_nothing() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let first = frame(b"first-frame-body");
+        let second = frame(b"second");
+        let mut frames = FrameReader::default();
+
+        // Half of the first frame arrives, then the deadline fires.
+        server.write_all(&first[..7]).await.unwrap();
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), frames.read(&mut client)).await;
+        assert!(cancelled.is_err(), "the read should still be waiting");
+
+        server.write_all(&first[7..]).await.unwrap();
+        server.write_all(&second).await.unwrap();
+        assert_eq!(frames.read(&mut client).await.unwrap(), b"first-frame-body");
+        assert_eq!(frames.read(&mut client).await.unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn a_frame_over_the_cap_is_refused_before_its_body_arrives() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        server
+            .write_all(&(1_000_000u32).to_be_bytes())
+            .await
+            .unwrap();
+        let mut frames = FrameReader::default();
+        assert!(frames.read_capped(&mut client, 1024).await.is_err());
     }
 }

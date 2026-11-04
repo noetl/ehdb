@@ -866,6 +866,8 @@ pub struct Claimed<R> {
 /// competing with the other replicas sharing its subject filter.
 pub struct ClaimClient {
     sock: TcpStream,
+    /// Every read on `sock` goes through here (cancel-safe; noetl/ehdb#426).
+    frames: crate::FrameReader,
     member: MemberId,
     filter: String,
     /// The heartbeat interval this client asked the coordinator for (`None` =
@@ -917,6 +919,7 @@ impl ClaimClient {
         crate::configure_stream(&sock)?;
         Ok(Self {
             sock,
+            frames: crate::FrameReader::default(),
             member,
             filter: filter.into(),
             heartbeat,
@@ -946,9 +949,9 @@ impl ClaimClient {
         write_frame(&mut self.sock, &req).await?;
         loop {
             let body = match self.read_deadline {
-                None => read_frame(&mut self.sock).await?,
+                None => self.frames.read(&mut self.sock).await?,
                 Some(deadline) => {
-                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                    match tokio::time::timeout(deadline, self.frames.read(&mut self.sock)).await {
                         Ok(body) => body?,
                         Err(_) if self.peer_heartbeats => {
                             return Err(io_err(format!(
@@ -1025,7 +1028,7 @@ impl ClaimClient {
     /// inside a parked claim, so at most a few can be queued).
     async fn read_reply(&mut self) -> std::io::Result<()> {
         loop {
-            let body = read_frame(&mut self.sock).await?;
+            let body = self.frames.read(&mut self.sock).await?;
             if !is_heartbeat(&body) {
                 return Ok(());
             }

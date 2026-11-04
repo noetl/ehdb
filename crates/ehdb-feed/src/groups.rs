@@ -619,6 +619,8 @@ pub struct GroupClaimed<R> {
 /// competing with the other replicas that share its group **and** filter.
 pub struct GroupClaimClient {
     sock: TcpStream,
+    /// Every read on `sock` goes through here (cancel-safe; noetl/ehdb#426).
+    frames: crate::FrameReader,
     group: String,
     member: MemberId,
     filter: String,
@@ -672,6 +674,7 @@ impl GroupClaimClient {
         crate::configure_stream(&sock)?;
         Ok(Self {
             sock,
+            frames: crate::FrameReader::default(),
             group: group.into(),
             member,
             filter: filter.into(),
@@ -708,9 +711,9 @@ impl GroupClaimClient {
         write_frame(&mut self.sock, &req).await?;
         loop {
             let body = match self.read_deadline {
-                None => read_frame(&mut self.sock).await?,
+                None => self.frames.read(&mut self.sock).await?,
                 Some(deadline) => {
-                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                    match tokio::time::timeout(deadline, self.frames.read(&mut self.sock)).await {
                         Ok(body) => body?,
                         Err(_) if self.peer_heartbeats => {
                             return Err(io_err(format!(
@@ -776,7 +779,7 @@ impl GroupClaimClient {
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
-        let _ = read_frame(&mut self.sock).await?;
+        let _ = self.frames.read(&mut self.sock).await?;
         Ok(())
     }
 
@@ -788,7 +791,7 @@ impl GroupClaimClient {
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
-        let _ = read_frame(&mut self.sock).await?;
+        let _ = self.frames.read(&mut self.sock).await?;
         Ok(())
     }
 }
