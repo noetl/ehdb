@@ -6,11 +6,21 @@
 //! end of the file, and [`read_jsonl`] handles both:
 //!
 //! - **A torn final line** — a record cut off part-way. Its `sync_data` never
-//!   completed, so no caller was told it was durable. It is skipped, counted,
-//!   and **cut off the file**, because leaving it there glues the next append
-//!   onto it and turns a recoverable tail into an unreadable middle.
-//! - **A complete final record with no newline** — it is read normally and its
-//!   newline is restored, so the next append starts a new line.
+//!   completed, so no caller was told it was durable. It is skipped and counted.
+//! - **A complete final record with no newline** — it is read normally.
+//!
+//! Either one must be repaired **before the next append**, or the append is
+//! glued onto it and a recoverable tail becomes an unreadable middle. That
+//! repair is returned as a [`TailRepair`] and applied by the journal's append
+//! path ([`TailRepair::apply`]) — **never by the read**.
+//!
+//! ⚠ Reading must not mutate the file (noetl/ehdb#426). The first version of this
+//! module repaired the tail during open. Open is also a read path — including
+//! reads of SEALED segments that are never appended to again — so the first
+//! read truncated the torn bytes and every later read reported a clean segment:
+//! the `torn_tail_skipped` signal callers surface (#262) was erased by the act of
+//! looking. Caught by noetl/worker's
+//! `a_torn_sealed_segment_is_reported_by_every_read_path`.
 //!
 //! Anything else that fails to decode — a truncated record with records after
 //! it, or a complete record with bad content — is an error. Those records were
@@ -33,10 +43,49 @@ pub struct JournalRead<T> {
     /// Torn tail records skipped (0 or 1). Callers must surface this: a read
     /// that silently returns n-1 records looks exactly like a complete one.
     pub torn_tail_skipped: usize,
+    /// What must be done to the file before anything is appended to it.
+    pub repair: TailRepair,
 }
 
-/// Read every record of the JSONL journal at `path`, repairing a torn tail on
-/// disk so the journal is safe to append to. A missing file reads as empty.
+/// The fix a journal needs before its next append — computed by [`read_jsonl`],
+/// applied by the append path, never by a read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TailRepair {
+    /// Cut the file to this length (the start of a torn final line).
+    truncate_to: Option<u64>,
+    /// Append a newline (a complete final record lost only its newline).
+    append_newline: bool,
+}
+
+impl TailRepair {
+    /// Whether anything needs doing.
+    pub fn is_needed(&self) -> bool {
+        self.truncate_to.is_some() || self.append_newline
+    }
+
+    /// Apply the repair to `path`, `sync_data` it, and mark it done. Idempotent:
+    /// a second call does nothing. Call it immediately before appending.
+    pub fn apply(&mut self, path: &Path) -> Result<()> {
+        if let Some(len) = self.truncate_to {
+            let file = OpenOptions::new().write(true).open(path).map_err(storage)?;
+            file.set_len(len).map_err(storage)?;
+            file.sync_data().map_err(storage)?;
+        } else if self.append_newline {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(storage)?;
+            file.write_all(b"\n").map_err(storage)?;
+            file.sync_data().map_err(storage)?;
+        }
+        *self = Self::default();
+        Ok(())
+    }
+}
+
+/// Read every record of the JSONL journal at `path`. **Read-only**: a torn tail
+/// is reported in [`JournalRead::repair`], not fixed. A missing file reads as
+/// empty.
 ///
 /// `decode_error` maps a record that fails to decode (and is not a torn tail)
 /// to the caller's error, given its 1-based line number.
@@ -47,6 +96,7 @@ pub fn read_jsonl<T: DeserializeOwned>(
     let mut out = JournalRead {
         entries: Vec::new(),
         torn_tail_skipped: 0,
+        repair: TailRepair::default(),
     };
     let file = match File::open(path) {
         Ok(f) => f,
@@ -90,17 +140,10 @@ pub fn read_jsonl<T: DeserializeOwned>(
     }
     if let Some((_, start, _)) = torn {
         out.torn_tail_skipped = 1;
-        // A line starts right after a `\n`, so the cut leaves a clean end.
-        let file = OpenOptions::new().write(true).open(path).map_err(storage)?;
-        file.set_len(start).map_err(storage)?;
-        file.sync_data().map_err(storage)?;
+        // A line starts right after a newline, so the cut leaves a clean end.
+        out.repair.truncate_to = Some(start);
     } else if last_byte.is_some_and(|b| b != b'\n') {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(storage)?;
-        file.write_all(b"\n").map_err(storage)?;
-        file.sync_data().map_err(storage)?;
+        out.repair.append_newline = true;
     }
     Ok(out)
 }
@@ -161,13 +204,51 @@ mod tests {
         assert_eq!(r.torn_tail_skipped, 0);
     }
 
+    /// The writer's sequence: read, repair, then append.
+    fn repair_then_append(p: &Path, r: &mut JournalRead<Rec>, bytes: &[u8]) {
+        r.repair.apply(p).unwrap();
+        append(p, bytes);
+    }
+
+    /// noetl/ehdb#426: reading never changes the file, so a torn tail is
+    /// reported on EVERY read until a writer repairs it — the signal callers
+    /// surface must not be erased by the act of reading.
+    #[test]
+    fn reading_never_mutates_the_file() {
+        let cases: [(&str, &[u8]); 2] = [
+            ("ro-torn", b"{\"n\":1}\n{\"n\":"),
+            ("ro-nonl", b"{\"n\":1}"),
+        ];
+        for (tag, bytes) in cases {
+            let p = tmp(tag);
+            append(&p, bytes);
+            for _ in 0..3 {
+                let r = read(&p).unwrap();
+                assert!(r.repair.is_needed(), "{tag}");
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    bytes,
+                    "{tag}: a read changed the file"
+                );
+            }
+        }
+        let p = tmp("ro-torn-count");
+        append(&p, b"{\"n\":1}\n{\"n\":");
+        assert_eq!(read(&p).unwrap().torn_tail_skipped, 1);
+        assert_eq!(
+            read(&p).unwrap().torn_tail_skipped,
+            1,
+            "the second read lost the signal"
+        );
+    }
+
     #[test]
     fn a_torn_tail_is_skipped_and_cut_so_the_next_append_reopens() {
         let p = tmp("torn");
         append(&p, b"{\"n\":1}\n{\"n\":2}\n{\"n\":");
-        let r = read(&p).unwrap();
+        let mut r = read(&p).unwrap();
         assert_eq!((ns(&r), r.torn_tail_skipped), (vec![1, 2], 1));
-        append(&p, b"{\"n\":3}\n");
+        repair_then_append(&p, &mut r, b"{\"n\":3}\n");
         let r = read(&p).expect("one crash + one append must reopen");
         assert_eq!((ns(&r), r.torn_tail_skipped), (vec![1, 2, 3], 0));
     }
@@ -176,8 +257,9 @@ mod tests {
     fn a_final_record_missing_its_newline_is_kept_and_terminated() {
         let p = tmp("nonl");
         append(&p, b"{\"n\":1}\n{\"n\":2}");
-        assert_eq!(ns(&read(&p).unwrap()), vec![1, 2]);
-        append(&p, b"{\"n\":3}\n");
+        let mut r = read(&p).unwrap();
+        assert_eq!(ns(&r), vec![1, 2]);
+        repair_then_append(&p, &mut r, b"{\"n\":3}\n");
         assert_eq!(ns(&read(&p).unwrap()), vec![1, 2, 3]);
     }
 
