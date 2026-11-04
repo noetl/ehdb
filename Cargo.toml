@@ -27,6 +27,8 @@ arrow-array = "53"
 arrow-flight = { version = "53", features = ["flight-sql-experimental"] }
 arrow-ipc = "53"
 arrow-schema = { version = "53", features = ["serde"] }
+# Bloom bits in the manifest as base64 (noetl/ehdb#426); already in the graph.
+base64 = "0.22"
 criterion = "0.5"
 prost = "0.13"
 sqlparser = "0.51"

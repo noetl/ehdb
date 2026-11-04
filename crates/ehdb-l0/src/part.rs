@@ -907,12 +907,40 @@ fn build_index_blooms<D: Dataset>(
     marks: &[GranuleMark],
     granule_size: u32,
 ) -> (Bloom, Vec<Bloom>) {
-    let mut part_bloom = Bloom::for_expected(records.len());
+    let gsize = granule_size.max(1) as usize;
+    // The legacy scheme sizes from the record count and is left exactly as it was,
+    // so Release A writes today's bytes. The mixed scheme sizes from the
+    // number of DISTINCT keys — what a bloom actually holds — so a part (or a
+    // merged part) with many records of few executions is not over-allocated,
+    // and one with many executions is not under-allocated (noetl/ehdb#426).
+    let scheme = crate::bloom::BloomScheme::for_writes();
+    let size_for = |range: std::ops::Range<usize>| -> usize {
+        match scheme {
+            crate::bloom::BloomScheme::Legacy => range.len(),
+            crate::bloom::BloomScheme::Mixed => records[range]
+                .iter()
+                .map(|r| D::index_key(r))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        }
+    };
+    let mut part_bloom = Bloom::for_expected_in(size_for(0..records.len()), scheme);
     let mut granule_blooms: Vec<Bloom> = marks
         .iter()
-        .map(|m| Bloom::for_expected(m.record_count as usize))
+        .enumerate()
+        .map(|(g, m)| {
+            let start = (g * gsize).min(records.len());
+            let end = (start + m.record_count as usize).min(records.len());
+            match scheme {
+                crate::bloom::BloomScheme::Legacy => {
+                    Bloom::for_expected_in(m.record_count as usize, scheme)
+                }
+                crate::bloom::BloomScheme::Mixed => {
+                    Bloom::for_expected_in(size_for(start..end), scheme)
+                }
+            }
+        })
         .collect();
-    let gsize = granule_size.max(1) as usize;
     for (i, record) in records.iter().enumerate() {
         let key = D::index_key(record);
         part_bloom.insert(key);
