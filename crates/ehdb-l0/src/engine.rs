@@ -3153,6 +3153,16 @@ fn parse_manifest_version(key: &str) -> Option<u64> {
 /// Returns `Ok(None)` only when **no** replica has a manifest. If some do and
 /// none decodes, that is an error — treating it as an empty store would orphan
 /// every part.
+///
+/// ⚠⚠ **Torn is not the same as newer** (noetl/ehdb#439). The fallback above
+/// exists for a torn or corrupt `LATEST`. A copy that is well-formed JSON but
+/// does not decode as a [`Manifest`] is not torn: a newer binary wrote a format
+/// this one does not understand (an unknown field, an unknown bloom scheme).
+/// Falling back past it opened an older snapshot, re-adopted parts against it,
+/// and published a *different* manifest under a version that already existed.
+/// So such a copy — in `LATEST` or in a versioned snapshot newer than what did
+/// decode — refuses the open. Refusing is recoverable; running on the wrong
+/// copy is not.
 fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Option<Manifest>> {
     let key = manifest_latest_key(dataset);
     let mut best: Option<Manifest> = None;
@@ -3176,7 +3186,10 @@ fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Op
         };
         match serde_json::from_slice::<Manifest>(&bytes) {
             Ok(m) => keep(m, &mut best),
-            Err(err) => failures.push(format!("{}: decode: {err}", target.id)),
+            Err(err) => {
+                refuse_if_newer_format(&bytes, &format!("{}: {key}", target.id), &err)?;
+                failures.push(format!("{}: decode: {err}", target.id));
+            }
         }
     }
     if failures.is_empty() {
@@ -3200,9 +3213,14 @@ fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Op
             let Ok(bytes) = target.substrate.get_all(&k) else {
                 continue;
             };
-            if let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) {
-                keep(m, &mut best);
-                break;
+            match serde_json::from_slice::<Manifest>(&bytes) {
+                Ok(m) => {
+                    keep(m, &mut best);
+                    break;
+                }
+                // Newer than anything that decoded, so skipping it would roll
+                // the catalog back past a version a newer writer published.
+                Err(err) => refuse_if_newer_format(&bytes, &format!("{}: {k}", target.id), &err)?,
             }
         }
     }
@@ -3213,6 +3231,27 @@ fn load_durable_manifest(replicas: &[ReplicaTarget], dataset: &str) -> Result<Op
             failures.join("; ")
         ))),
     }
+}
+
+/// Refuse a manifest copy that is well-formed JSON yet does not decode as a
+/// [`Manifest`] (noetl/ehdb#439): that is a newer writer's format, not a torn
+/// write, and must not be silently skipped. Bytes that are not JSON at all
+/// (torn, truncated, garbage) return `Ok(())` so the caller's fallback runs.
+fn refuse_if_newer_format(bytes: &[u8], at: &str, err: &serde_json::Error) -> Result<()> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Ok(());
+    };
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "?".to_owned(), |v| v.to_string());
+    Err(EhdbError::Storage(format!(
+        "durable manifest {at} (version {version}) is well-formed but this build \
+         cannot decode it ({err}): it was most likely written by a newer EHDB \
+         format (e.g. a bloom scheme this build does not know). Refusing to open \
+         rather than fall back to an older snapshot and republish over it. \
+         (noetl/ehdb#439)"
+    )))
 }
 
 #[cfg(test)]
@@ -3319,6 +3358,120 @@ mod manifest_publication_tests {
             "a store whose manifest cannot be read must not open as empty"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- noetl/ehdb#439: a newer writer's format refuses, it never falls back.
+
+    /// A manifest at `version` holding one part whose execution bloom is in a
+    /// scheme this build does not know (`3`) — exactly what a scheme-2 manifest
+    /// is to a reader that predates scheme 2. Well-formed JSON, undecodable.
+    fn newer_format_bytes(version: u64) -> Vec<u8> {
+        use crate::bloom::{Bloom, BloomScheme};
+        use crate::catalog::{ReplicaLocation, SparseIndex};
+        let mut bloom = Bloom::for_expected_in(4, BloomScheme::Mixed);
+        bloom.insert("exec-1");
+        let mut m = manifest(version);
+        m.parts.push(PartMeta {
+            part_id: "p-new".into(),
+            partition: 0,
+            min_sequence: 1,
+            max_sequence: 1,
+            record_count: 1,
+            byte_size: 1,
+            replicas: vec![ReplicaLocation {
+                replica: "replica-0".into(),
+                key: "parts/p-new".into(),
+            }],
+            local_path: None,
+            sparse_index: SparseIndex {
+                granule_size: 1,
+                marks: vec![],
+            },
+            execution_bloom: Some(bloom),
+            granule_blooms: vec![],
+        });
+        let mut v = serde_json::to_value(&m).unwrap();
+        v["parts"][0]["execution_bloom"]["scheme"] = serde_json::json!(3);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(serde_json::from_slice::<Manifest>(&bytes).is_err());
+        bytes
+    }
+
+    /// Write `bytes` the way a newer writer would: snapshot first, then LATEST.
+    fn plant(r: &ReplicaTarget, version: u64, bytes: &[u8]) {
+        r.substrate
+            .put_overwrite(&manifest_version_key(DS, version), bytes)
+            .unwrap();
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), bytes)
+            .unwrap();
+    }
+
+    fn assert_refused(res: Result<Option<Manifest>>) {
+        match res {
+            Ok(m) => panic!(
+                "a newer-format manifest silently opened version {:?} (noetl/ehdb#439)",
+                m.map(|m| m.version)
+            ),
+            Err(e) => assert!(e.to_string().contains("#439"), "unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_bloom_scheme_refuses_instead_of_opening_an_older_snapshot() {
+        let root = dir("newer-bloom");
+        let r = replica("replica-0", &root);
+        let published = Mutex::new(0);
+        for v in 1..=3 {
+            publish(std::slice::from_ref(&r), &published, v);
+        }
+        plant(&r, 4, &newer_format_bytes(4));
+        assert_refused(load_durable_manifest(&[r], DS));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_manifest_field_refuses_instead_of_opening_an_older_snapshot() {
+        let root = dir("newer-field");
+        let r = replica("replica-0", &root);
+        let published = Mutex::new(0);
+        for v in 1..=3 {
+            publish(std::slice::from_ref(&r), &published, v);
+        }
+        let mut v = serde_json::to_value(manifest(4)).unwrap();
+        v["field_from_a_newer_writer"] = serde_json::json!(true);
+        plant(&r, 4, &serde_json::to_vec(&v).unwrap());
+        assert_refused(load_durable_manifest(&[r], DS));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_newer_format_snapshot_behind_a_torn_latest_refuses() {
+        let root = dir("newer-snap");
+        let r = replica("replica-0", &root);
+        let published = Mutex::new(0);
+        for v in 1..=3 {
+            publish(std::slice::from_ref(&r), &published, v);
+        }
+        r.substrate
+            .put_overwrite(&manifest_version_key(DS, 4), &newer_format_bytes(4))
+            .unwrap();
+        r.substrate
+            .put_overwrite(&manifest_latest_key(DS), b"\0\0torn")
+            .unwrap();
+        assert_refused(load_durable_manifest(&[r], DS));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_newer_format_on_one_replica_refuses_even_when_another_decodes() {
+        let (a, b) = (dir("newer-a"), dir("newer-b"));
+        let ra = replica("replica-0", &a);
+        let rb = replica("replica-1", &b);
+        publish(&[ra.clone(), rb.clone()], &Mutex::new(0), 4);
+        plant(&ra, 5, &newer_format_bytes(5));
+        assert_refused(load_durable_manifest(&[ra, rb], DS));
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
     }
 
     #[test]
