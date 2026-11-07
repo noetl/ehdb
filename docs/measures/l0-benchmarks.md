@@ -89,6 +89,33 @@ Control: lengths span 10x twice, cost must grow monotonically, and the read asse
 `got.len() == len` **inside** the timed closure — *a read that returns nothing is fast and
 worthless, and that is how a benchmark reports a great number for a broken path.*
 
+#### Past the knee, cost is per record, not per part — and merging does not buy it back
+
+`l0_read_index_vs_parts` (noetl/ai-meta#453). Each length on its own engine, sealed parts
+uploaded (`flush_and_wait_uploads`), read once **unmerged** and once after
+`run_pending_merges` drove every planned merge (positive control: the merged arm asserts a
+merge actually happened once a partition crosses 4 sealed parts).
+
+| records | parts before merge (⌈len/1024⌉, not counted) | unmerged ns/record | merged ns/record |
+| --: | --: | --: | --: |
+| 1 100 | 2 | 903 | 899 |
+| 4 400 | 5 | 934 | 913 |
+| 8 800 | 9 | 928 | 906 |
+| 17 600 | 18 | 921 | 908 |
+
+- The post-knee cost is **flat in part count**, ~0.9 µs/record from ~2 to ~18 parts.
+  The worry that it would degrade further with part count before a merge is planned is
+  **refuted** for this range.
+- Driving merges buys **1–2%**. The step is the cost of decoding a record from an on-disk
+  part, not the cost of visiting many parts.
+- **The rule for a chain-length decision:** ~55 ns/record up to 1024 records on a key, then
+  ~0.9 µs/record for every record — linear, predictable, and not improved by merging.
+
+As-of 2026-10-20, Apple M1 Max, rustc 1.99.0, `--warm-up-time 1 --measurement-time 3`,
+with unrelated background load on the host (load average ~3.5). Absolute figures are
+machine-specific; the flatness across part counts and the merged/unmerged ratio are the
+result.
+
 ### Partition scan (the follower / catch-up path)
 
 | records | time | ns/record |
