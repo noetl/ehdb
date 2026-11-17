@@ -221,15 +221,32 @@ where
         }
     }
 
-    fn now_ticks(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64
+    /// The shard's current tip, used to clamp a resumed cursor. Read without
+    /// parking a runtime worker on a contended engine lock (noetl/ai-meta#501).
+    async fn tip(&self) -> u64 {
+        let engine = self.writer.engine();
+        match engine.read_off_runtime(|e| e.global_sequence()).await {
+            Ok(tip) => tip,
+            // Only a runtime that is shutting down cancels the read; a wrong
+            // tip here would mis-clamp the cursor, so read it the slow way.
+            Err(_) => engine.read().global_sequence(),
+        }
     }
 
-    /// The shard's current tip, used to clamp a resumed cursor.
-    fn tip(&self) -> u64 {
-        let engine = self.writer.engine();
-        let e = engine.read();
-        e.global_sequence()
+    /// Records in this shard past `cursor`, counted off the runtime in bounded
+    /// holds (noetl/ai-meta#501).
+    async fn count_after(&self, cursor: u64) -> u64 {
+        self.writer
+            .engine()
+            .fold_after_off_runtime(
+                self.shard,
+                cursor,
+                crate::claim::LAG_SCAN_CHUNK,
+                0u64,
+                |n, _| *n += 1,
+            )
+            .await
+            .unwrap_or(0)
     }
 
     /// Get (or lazily create) the handle for `group`.
@@ -249,7 +266,7 @@ where
         // Clamp a stored cursor to the reopened tip: one above the tip (log
         // recreated / volume replaced) would silently skip every record below
         // it (noetl/ai-meta#208).
-        let tip = self.tip();
+        let tip = self.tip().await;
         let (from_cursor, origin) = match stored_cursor {
             Some(c) => (c.min(tip), CursorOrigin::Persisted),
             None => match self.fallback {
@@ -304,14 +321,17 @@ where
         let handle = self.handle(group).await;
         let mut tip_rx = self.writer.tip_receiver();
         loop {
-            let assigned = {
-                // Async lock FIRST (may await), then the engine's sync lock — no
-                // std guard is ever held across an await.
-                let mut g = handle.group.lock().await;
-                let engine = self.writer.engine();
-                let e = engine.read();
-                g.poll_assign(&e, &filter, member, self.now_ticks())
-            };
+            // Async group lock first, then the engine lock — taken on the
+            // blocking pool whenever it is contended, never parked on here
+            // (noetl/ai-meta#501).
+            let assigned = crate::claim::poll_assign_off_runtime(
+                &handle.group,
+                self.writer.engine(),
+                &filter,
+                member,
+                self.clock,
+            )
+            .await;
             match assigned {
                 Ok(Some(delivery)) => return delivery,
                 Ok(None) => {
@@ -354,10 +374,8 @@ where
     /// `group`'s backlog past its committed cursor (undelivered + in-flight).
     pub async fn lag(&self, group: &str) -> u64 {
         let handle = self.handle(group).await;
-        let g = handle.group.lock().await;
-        let engine = self.writer.engine();
-        let e = engine.read();
-        g.lag(&e).unwrap_or(0)
+        let cursor = handle.group.lock().await.committed_cursor();
+        self.count_after(cursor).await
     }
 
     /// `group`'s contiguous acked-through cursor.
@@ -379,10 +397,8 @@ where
         };
         let mut out = Vec::with_capacity(groups.len());
         for (name, handle) in groups {
-            let g = handle.group.lock().await;
-            let engine = self.writer.engine();
-            let e = engine.read();
-            out.push((name, g.committed_cursor(), g.lag(&e).unwrap_or(0)));
+            let committed = handle.group.lock().await.committed_cursor();
+            out.push((name, committed, self.count_after(committed).await));
         }
         out
     }
@@ -603,6 +619,8 @@ pub struct GroupClaimed<R> {
 /// competing with the other replicas that share its group **and** filter.
 pub struct GroupClaimClient {
     sock: TcpStream,
+    /// Every read on `sock` goes through here (cancel-safe; noetl/ehdb#426).
+    frames: crate::FrameReader,
     group: String,
     member: MemberId,
     filter: String,
@@ -656,6 +674,7 @@ impl GroupClaimClient {
         crate::configure_stream(&sock)?;
         Ok(Self {
             sock,
+            frames: crate::FrameReader::default(),
             group: group.into(),
             member,
             filter: filter.into(),
@@ -692,9 +711,9 @@ impl GroupClaimClient {
         write_frame(&mut self.sock, &req).await?;
         loop {
             let body = match self.read_deadline {
-                None => read_frame(&mut self.sock).await?,
+                None => self.frames.read(&mut self.sock).await?,
                 Some(deadline) => {
-                    match tokio::time::timeout(deadline, read_frame(&mut self.sock)).await {
+                    match tokio::time::timeout(deadline, self.frames.read(&mut self.sock)).await {
                         Ok(body) => body?,
                         Err(_) if self.peer_heartbeats => {
                             return Err(io_err(format!(
@@ -760,7 +779,7 @@ impl GroupClaimClient {
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
-        let _ = read_frame(&mut self.sock).await?;
+        let _ = self.frames.read(&mut self.sock).await?;
         Ok(())
     }
 
@@ -772,7 +791,7 @@ impl GroupClaimClient {
         })
         .map_err(io_err)?;
         write_frame(&mut self.sock, &req).await?;
-        let _ = read_frame(&mut self.sock).await?;
+        let _ = self.frames.read(&mut self.sock).await?;
         Ok(())
     }
 }

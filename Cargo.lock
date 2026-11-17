@@ -663,6 +663,7 @@ dependencies = [
 name = "ehdb-l0"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "criterion",
  "ehdb-core",
  "hex",

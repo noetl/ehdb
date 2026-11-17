@@ -186,7 +186,17 @@ pub fn encode_columnar(records: &[EventRecord]) -> Result<Vec<u8>> {
     let txn_col = encode_str_column(records.iter().map(|r| r.transaction_id.as_str()));
     let payload_col = encode_str_column(records.iter().map(|r| r.payload.as_str()));
 
-    let mut bloom = Bloom::for_expected(records.len());
+    // Distinct-key sizing under the mixed scheme; legacy is unchanged.
+    let scheme = crate::bloom::BloomScheme::for_writes();
+    let expected = match scheme {
+        crate::bloom::BloomScheme::Legacy => records.len(),
+        crate::bloom::BloomScheme::Mixed => records
+            .iter()
+            .map(|r| r.execution_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+    };
+    let mut bloom = Bloom::for_expected_in(expected, scheme);
     for r in records {
         bloom.insert(&r.execution_id);
     }

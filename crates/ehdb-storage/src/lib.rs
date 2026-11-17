@@ -480,14 +480,47 @@ impl ImmutableObjectStore for LocalObjectStore {
             fs::create_dir_all(parent).map_err(|err| EhdbError::Storage(err.to_string()))?;
         }
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
-
-        file.write_all(bytes)
-            .map_err(|err| EhdbError::Storage(err.to_string()))?;
+        // ⚠ Write a synced temp file, then publish it with `hard_link`
+        // (noetl/ehdb#426). This used to `create_new` the target and write into
+        // it unsynced: a crash mid-write left a short object at the final name,
+        // and because `create_new` then refuses that name, every later attempt
+        // to write the object failed — forever. `hard_link` keeps the
+        // create-once guarantee (it fails `AlreadyExists` atomically) while the
+        // name only ever points at complete bytes.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let storage = |err: std::io::Error| EhdbError::Storage(err.to_string());
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = target.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            #[cfg(test)]
+            if tests::FAIL_NEXT_WRITE_HALFWAY.with(|f| f.replace(false)) {
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                return Err(std::io::Error::other("injected crash mid-write (test)"));
+            }
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(err) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(storage(err));
+        }
+        let linked = fs::hard_link(&tmp, &target);
+        let _ = fs::remove_file(&tmp);
+        linked.map_err(storage)?;
+        #[cfg(unix)]
+        if let Some(parent) = target.parent() {
+            fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(storage)?;
+        }
 
         Ok(ObjectRef {
             path,
@@ -708,6 +741,50 @@ mod tests {
             b"arrow-ipc-placeholder"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    thread_local! {
+        /// Test-only seam: the next `put_if_absent` **on this thread** writes
+        /// half its bytes, then fails — what a crash mid-write leaves behind.
+        /// Thread-local so parallel tests cannot consume each other's arming.
+        pub(super) static FAIL_NEXT_WRITE_HALFWAY: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// noetl/ehdb#426: a write interrupted part-way must not poison the object
+    /// name. The old in-place write left the short prefix AT the final name, and
+    /// `create_new` then refused that name on every retry — the object could
+    /// never be written again.
+    #[test]
+    fn an_interrupted_write_does_not_block_the_object_forever() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+        let path = ObjectPath::new("tenant-a/system/executions/part-001.arrow").unwrap();
+        let payload = vec![0x5Au8; 4096];
+
+        FAIL_NEXT_WRITE_HALFWAY.with(|f| f.set(true));
+        assert!(store.put_if_absent(path.clone(), &payload).is_err());
+        assert!(
+            !FAIL_NEXT_WRITE_HALFWAY.with(|f| f.get()),
+            "the seam must have fired"
+        );
+        assert!(
+            store.get(&path).is_err(),
+            "a partial object is visible at its name"
+        );
+
+        let object = store
+            .put_if_absent(path.clone(), &payload)
+            .expect("the retry must succeed");
+        assert_eq!(store.get_verified(&object).unwrap(), payload);
+        // Create-once still holds, and nothing is left beside the object.
+        assert!(store.put_if_absent(path.clone(), b"other").is_err());
+        let names: Vec<String> = fs::read_dir(root.join("tenant-a/system/executions"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["part-001.arrow".to_string()]);
         fs::remove_dir_all(root).unwrap();
     }
 

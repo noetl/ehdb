@@ -144,9 +144,17 @@ where
 
     let mut feed = ChangeFeed::new(shard, cursor);
     loop {
+        // Never parked on the engine lock (noetl/ai-meta#501) — see `push_loop`.
         let batch = {
-            let engine = engine.read();
-            feed.poll(&engine).map_err(io_err)?
+            let (polled, result) = engine
+                .read_off_runtime(move |e| {
+                    let r = feed.poll(e);
+                    (feed, r)
+                })
+                .await
+                .map_err(io_err)?;
+            feed = polled;
+            result.map_err(io_err)?
         };
         if !batch.is_empty() {
             let mut frame = String::new();

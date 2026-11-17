@@ -165,6 +165,7 @@ fn a_fresh_engine_emits_every_series_pinned_at_zero() {
         manifest_versions_retained: 0,
         ingest_append_failed: 0,
         ingest_decode_failed: 0,
+        seal_failed: 0,
         recovered_active_records: 0,
         seals: 0,
         uploads: 0,

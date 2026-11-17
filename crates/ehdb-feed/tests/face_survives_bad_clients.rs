@@ -157,3 +157,26 @@ async fn the_liveness_predicate_itself_is_sound() {
         "the liveness predicate must pass on an unabused face"
     );
 }
+
+/// noetl/ehdb#426: the subscribe handshake is capped far below the general
+/// 64 MiB frame cap. A peer that names a 32 MiB first frame is cut off at once
+/// instead of being allocated for and waited on, and the face keeps serving.
+#[tokio::test]
+async fn an_oversized_handshake_is_refused_before_allocating() {
+    use tokio::io::AsyncReadExt;
+    let dir = unique_dir("handshake-cap");
+    let writer = open_writer(&dir);
+    let addr = wal_face(Arc::clone(&writer)).await;
+
+    let mut bad = TcpStream::connect(addr).await.unwrap();
+    bad.write_all(&(32u32 * 1024 * 1024).to_be_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), bad.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the writer kept a connection open after a 32 MiB handshake length: {closed:?}"
+    );
+    assert!(face_still_serves(addr, &writer).await);
+}

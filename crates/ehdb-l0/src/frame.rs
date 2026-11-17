@@ -123,6 +123,31 @@ pub fn iter_frames_from(bytes: &[u8], start_offset: u64) -> Result<Vec<DecodedFr
     Ok(frames)
 }
 
+/// Every frame in a buffer that must hold **only whole frames** — a sealed part,
+/// or a granule range cut at mark offsets (noetl/ehdb#426).
+///
+/// [`iter_frames_from`] treats a frame running past the end of the buffer as a
+/// torn tail and stops, which is right for an active part a crash interrupted.
+/// In a sealed part nothing was being appended, so the same shape can only be
+/// corruption — typically a damaged length field — and stopping there silently
+/// drops every record after it. Worst on merge: the shortened source becomes a
+/// merged part with fewer records, and the sources are then deleted. This
+/// variant reports it instead.
+pub fn iter_frames_exact(bytes: &[u8], start_offset: u64) -> Result<Vec<DecodedFrame<'_>>> {
+    let frames = iter_frames_from(bytes, start_offset)?;
+    let end = frames
+        .last()
+        .map_or(start_offset, |f| f.offset + f.frame_len);
+    if end != bytes.len() as u64 {
+        return Err(EhdbError::Storage(format!(
+            "l0 part: {} trailing bytes at offset {end} do not form a frame in a sealed part \
+             (corruption, not a torn tail)",
+            bytes.len() as u64 - end
+        )));
+    }
+    Ok(frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +210,27 @@ mod tests {
         let last = buf.len() - 1;
         buf[last] ^= 0xFF; // corrupt the body without fixing the CRC
         assert!(read_frame_at(&buf, 0).is_err());
+    }
+
+    /// noetl/ehdb#426: a damaged length field in a sealed part reads as a torn
+    /// tail to `iter_frames_from` and silently drops the rest; the exact variant
+    /// refuses it, and still accepts a clean buffer.
+    #[test]
+    fn a_bad_length_in_a_sealed_part_is_corruption_not_a_torn_tail() {
+        let mut buf = Vec::new();
+        for body in [&b"one"[..], b"two", b"three"] {
+            buf.extend_from_slice(&encode_frame(body).unwrap());
+        }
+        assert_eq!(iter_frames_exact(&buf, 0).unwrap().len(), 3);
+
+        // Inflate the second frame's length field past the end of the buffer.
+        let second = encode_frame(b"one").unwrap().len();
+        buf[second + 4..second + 8].copy_from_slice(&1_000u32.to_le_bytes());
+        assert_eq!(
+            iter_frames_from(&buf, 0).unwrap().len(),
+            1,
+            "the lenient reader stops quietly — the behaviour being guarded against"
+        );
+        assert!(iter_frames_exact(&buf, 0).is_err());
     }
 }
